@@ -1,6 +1,7 @@
 #include "engram/engram_sidecar.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -54,6 +55,8 @@ void EngramSidecar::free_gpu_buffers() noexcept {
         freep(hk.d_key);
         freep(hk.d_hmean);
         if (hk.h_engram_pin) cudaFreeHost(hk.h_engram_pin);
+        if (hk.ev_start) cudaEventDestroy(hk.ev_start);
+        if (hk.ev_stop)  cudaEventDestroy(hk.ev_stop);
     }
     hooks_.clear();
     layer_to_hook_.clear();
@@ -98,6 +101,8 @@ void EngramSidecar::init(const std::string & engram_path,
         }
         hk.d_hmean = dev_alloc<float>(hk.device, static_cast<size_t>(max_batch_) * d_host_);
         cuda_ok(cudaSetDevice(hk.device), "engram memset setDevice");
+        cuda_ok(cudaEventCreate(&hk.ev_start), "engram event start");
+        cuda_ok(cudaEventCreate(&hk.ev_stop),  "engram event stop");
         cuda_ok(cudaMemset(hk.d_engram_in, 0, static_cast<size_t>(max_batch_) * d_eng * sizeof(float)), "engram memset");
         layer_to_hook_[hk.target_host_layer] = static_cast<int>(i);
     }
@@ -106,9 +111,10 @@ void EngramSidecar::init(const std::string & engram_path,
                 hooks_.size(), d_eng, d_host_, global_scale_,
                 adapter_path.empty() ? "zero-shot-ortho" : adapter_path.c_str());
     for (size_t i = 0; i < hooks_.size(); ++i) {
-        std::printf("  hook[%zu]: engram_layer=%d -> host_layer=%d (GPU%d, rank=%d, gated=%s, scale=%.4f)\n",
+        std::printf("  hook[%zu]: engram_layer=%d -> host_layer=%d (GPU%d, rank=%d, gated=%s, centered=%s, scale=%.4f)\n",
                     i, hooks_[i].src_engram_layer, hooks_[i].target_host_layer, hooks_[i].device,
-                    hooks_[i].rank, hooks_[i].d_Ak ? "yes" : "no", hooks_[i].scale);
+                    hooks_[i].rank, hooks_[i].d_Ak ? "yes" : "no",
+                    hooks_[i].h_mu_e.empty() ? "no" : "yes", hooks_[i].scale);
     }
 }
 
@@ -183,9 +189,10 @@ void EngramSidecar::load_rkad_adapter(const std::string & adapter_path,
     const uint32_t rank     = hdr[4];
     const uint32_t has_gate = hdr[5];
 
-    if (version != 1 || static_cast<int>(d_engram) != table_.cfg().engram_dim() || static_cast<int>(d_host) != d_host_) {
+    if ((version != 1 && version != 2) || static_cast<int>(d_engram) != table_.cfg().engram_dim() || static_cast<int>(d_host) != d_host_) {
         std::fclose(fp);
-        throw std::runtime_error("RKAD adapter dimension mismatch (file d_engram=" + std::to_string(d_engram) +
+        throw std::runtime_error("RKAD adapter version/dimension mismatch (v" + std::to_string(version) +
+                                 ", d_engram=" + std::to_string(d_engram) +
                                  ", d_host=" + std::to_string(d_host) + ")");
     }
 
@@ -216,6 +223,15 @@ void EngramSidecar::load_rkad_adapter(const std::string & adapter_path,
         hk.device            = layer_to_device[hk.target_host_layer];
         hk.scale             = scale;
         hk.rank              = static_cast<int>(rank);
+        hk.h_mu_e.clear();
+
+        if (version >= 2) {
+            hk.h_mu_e.resize(d_engram);
+            if (std::fread(hk.h_mu_e.data(), sizeof(float), d_engram, fp) != d_engram) {
+                std::fclose(fp);
+                throw std::runtime_error("Unexpected EOF reading RKAD v2 mu_E vector");
+            }
+        }
 
         if (rank == 0) {
             hk.d_Av = read_upload(hk.device, static_cast<size_t>(d_host) * d_engram);
@@ -281,9 +297,155 @@ void EngramSidecar::close_calibration_dump() {
                 static_cast<unsigned long long>(dump_records_));
 }
 
+namespace {
+
+// Find a BPE pre-tokenizer-safe cut offset in [min_cut, max_cut] so encoding text[cut:]
+// produces exact suffix token IDs identical to encoding full text[0:].
+// Returns 0 if no safe boundary is found (caller falls back to full-sequence encode).
+size_t find_safe_bpe_cut(const std::string & text, size_t min_cut, size_t max_cut) {
+    if (min_cut == 0 || min_cut >= max_cut || max_cut >= text.size()) return 0;
+    auto is_ws = [](char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; };
+
+    // Pass 1: clean start-of-line right after '\n' (not followed by whitespace)
+    for (size_t p = min_cut; p <= max_cut; ++p) {
+        if (text[p - 1] == '\n' && !is_ws(text[p])) {
+            return p;
+        }
+    }
+    // Pass 2: single leading space before a non-whitespace token (GPT-2/Llama3/DeepSeek BPE attaches ' ' to next word)
+    for (size_t p = min_cut; p <= max_cut; ++p) {
+        if (text[p] == ' ' && !is_ws(text[p - 1]) && (p + 1 < text.size()) && !is_ws(text[p + 1])) {
+            return p;
+        }
+    }
+    return 0;
+}
+
+} // namespace
+
+bool EngramSidecar::verify_incremental_addressing(const std::vector<int32_t> & host_tokens,
+                                                  int & out_tokens_checked,
+                                                  int & out_src_tok_matches,
+                                                  int & out_hash_col_matches,
+                                                  int & out_hash_col_total,
+                                                  bool verbose) {
+    out_tokens_checked   = 0;
+    out_src_tok_matches  = 0;
+    out_hash_col_matches = 0;
+    out_hash_col_total   = 0;
+    if (!host_tok_ || !table_.has_tokenizer() || host_tokens.empty()) return false;
+
+    const int n_tok  = static_cast<int>(host_tokens.size());
+    const int n_cols = table_.cfg().n_cols;
+    const int n_eng  = std::max(1, table_.cfg().n_layers);
+
+    // 1. Reference: full-sequence decode -> single full encode with Engram source tokenizer
+    std::string full_text;
+    std::vector<size_t> host_ends(n_tok);
+    for (int i = 0; i < n_tok; ++i) {
+        full_text.append(host_tok_->decode_token(host_tokens[i]));
+        host_ends[i] = full_text.size();
+    }
+    const auto full_src = table_.tokenizer().encode(full_text, false, false);
+    std::vector<size_t> full_src_ends(full_src.size());
+    {
+        size_t cb = 0;
+        for (size_t j = 0; j < full_src.size(); ++j) {
+            cb += table_.tokenizer().decode_token(full_src[j]).size();
+            full_src_ends[j] = cb;
+        }
+    }
+    std::vector<int> full_aligned(n_tok, 0);
+    {
+        int j = 0;
+        for (int i = 0; i < n_tok; ++i) {
+            while (j + 1 < static_cast<int>(full_src.size()) && full_src_ends[j] < host_ends[i]) ++j;
+            full_aligned[i] = full_src.empty() ? 0 : j;
+        }
+    }
+
+    // 2. Incremental token-by-token simulation:
+    // Compare boundary-aware suffix-window decode (cut > 0) against exact CAUSAL full-prefix decode
+    // (encode(inc_text[0..inc_ends[i]])) — AND also track non-causal lookahead skew vs full_text!
+    std::string inc_text;
+    std::vector<size_t> inc_ends;
+    inc_ends.reserve(n_tok);
+
+    std::vector<int32_t> ref_ids, inc_ids;
+    std::vector<float>   ref_val, inc_val;
+    int shown_mismatches = 0;
+    int causal_cut_checks = 0;
+    int noncausal_skew_toks = 0;
+
+    for (int i = 0; i < n_tok; ++i) {
+        inc_text.append(host_tok_->decode_token(host_tokens[i]));
+        inc_ends.push_back(inc_text.size());
+
+        // Exact causal full-prefix oracle (what a 100% causal streaming tokenizer produces at step i)
+        const auto causal_full_src = table_.tokenizer().encode(inc_text, false, false);
+        const int  causal_idx      = std::max(0, static_cast<int>(causal_full_src.size()) - 1);
+
+        const int32_t full_nc_tok = full_src.empty()        ? -1 : full_src[full_aligned[i]];
+        const int32_t causal_tok  = causal_full_src.empty() ? -1 : causal_full_src[causal_idx];
+        if (full_nc_tok != causal_tok) ++noncausal_skew_toks;
+
+        constexpr size_t kMinLookback = 256;
+        constexpr size_t kMinGuard    = 96;
+        size_t cut = 0;
+        if (inc_text.size() > kMinLookback + kMinGuard) {
+            const size_t min_c = inc_text.size() - kMinLookback - kMinGuard;
+            const size_t max_c = inc_text.size() - kMinGuard;
+            cut = find_safe_bpe_cut(inc_text, min_c, max_c);
+        }
+        if (cut > 0) ++causal_cut_checks;
+
+        const auto win_src = (cut > 0)
+            ? table_.tokenizer().encode(inc_text.substr(cut), false, false)
+            : causal_full_src;
+        const int n_src = static_cast<int>(win_src.size());
+        size_t cur_b = 0;
+        int inc_idx = std::max(0, n_src - 1);
+        const size_t rel_end = inc_ends[i] - cut;
+        for (int j = 0; j < n_src; ++j) {
+            cur_b += table_.tokenizer().decode_token(win_src[j]).size();
+            if (cur_b >= rel_end) { inc_idx = j; break; }
+        }
+
+        ++out_tokens_checked;
+        const int32_t inc_tok = win_src.empty() ? -1 : win_src[inc_idx];
+        if (causal_tok == inc_tok) ++out_src_tok_matches;
+
+        // Compare exact N-gram hash row IDs across all Engram layers against the causal full-prefix oracle!
+        for (int e = 0; e < n_eng; ++e) {
+            table_.hash_tokens(e, causal_full_src, causal_idx, 1, ref_ids, ref_val);
+            table_.hash_tokens(e, win_src,         inc_idx,    1, inc_ids, inc_val);
+            for (int c = 0; c < n_cols; ++c) {
+                ++out_hash_col_total;
+                if (ref_ids[c] == inc_ids[c] && ref_val[c] == inc_val[c]) {
+                    ++out_hash_col_matches;
+                } else if (verbose && shown_mismatches < 10) {
+                    ++shown_mismatches;
+                    std::printf("  [MISMATCH] pos=%d layer=%d col=%d cut=%zu causal_tok=%d('%s') inc_tok=%d('%s') ref_row=%d inc_row=%d\n",
+                                i, e, c, cut, causal_tok, table_.tokenizer().decode_token(causal_tok).c_str(),
+                                inc_tok, table_.tokenizer().decode_token(inc_tok).c_str(), ref_ids[c], inc_ids[c]);
+                }
+            }
+        }
+    }
+
+    if (verbose) {
+        std::printf("  (boundary-cut active on %d / %d tokens; non-causal batched-prefill lookahead skew: %d / %d tokens = %.2f%%)\n",
+                    causal_cut_checks, n_tok, noncausal_skew_toks, n_tok, 100.0 * noncausal_skew_toks / std::max(1, n_tok));
+    }
+
+    return (out_src_tok_matches == out_tokens_checked) && (out_hash_col_matches == out_hash_col_total);
+}
+
 void EngramSidecar::prepare_step(const std::vector<int32_t> & host_tokens, int start_pos) {
     const int T = static_cast<int>(host_tokens.size());
     if (T <= 0 || hooks_.empty()) return;
+
+    const auto tp0 = std::chrono::steady_clock::now();
 
     // Reset rolling state on new sequence (start_pos == 0) or backtrack (e.g. MTP rejection!)
     if (start_pos == 0) {
@@ -303,24 +465,26 @@ void EngramSidecar::prepare_step(const std::vector<int32_t> & host_tokens, int s
     std::vector<int32_t> src_window_tokens;
 
     if (host_tok_ != nullptr && table_.has_tokenizer()) {
+        const size_t prev_bytes = rolling_text_.size();
         for (int i = 0; i < T; ++i) {
             rolling_text_.append(host_tok_->decode_token(host_tokens[i]));
             host_byte_ends_.push_back(rolling_text_.size());
         }
 
-        // For decode (T <= 4) on long contexts, only re-tokenize a bounded UTF-8 suffix (~128 bytes)
-        // since N-gram hash only needs the last `ngram_size` (~3-4) tokens!
-        constexpr size_t kMaxWindowBytes = 128;
-        if (T <= 4 && rolling_text_.size() > kMaxWindowBytes) {
-            size_t cut = rolling_text_.size() - kMaxWindowBytes;
-            // Advance cut to a UTF-8 codepoint boundary
-            while (cut < rolling_text_.size() && (static_cast<uint8_t>(rolling_text_[cut]) & 0xC0) == 0x80) {
-                ++cut;
-            }
-            const std::string suffix = rolling_text_.substr(cut);
-            src_window_tokens = table_.tokenizer().encode(suffix, false, false);
+        // For decode (T <= 4) on long contexts, re-tokenize only a boundary-aware suffix window
+        // anchored on a pre-tokenizer-safe boundary (newline or single leading space) >= 96B before new tokens.
+        constexpr size_t kMinLookback = 256;
+        constexpr size_t kMinGuard    = 96;
+        size_t cut = 0;
+        if (T <= 4 && prev_bytes > kMinLookback + kMinGuard) {
+            const size_t min_c = prev_bytes - kMinLookback - kMinGuard;
+            const size_t max_c = prev_bytes - kMinGuard;
+            cut = find_safe_bpe_cut(rolling_text_, min_c, max_c);
+        }
+
+        if (cut > 0) {
+            src_window_tokens = table_.tokenizer().encode(rolling_text_.substr(cut), false, false);
             const int n_src = static_cast<int>(src_window_tokens.size());
-            // Map the T new host tokens to the tail of src_window_tokens by byte progress
             size_t cur_bytes = 0;
             std::vector<size_t> src_byte_ends;
             src_byte_ends.reserve(n_src);
@@ -366,10 +530,10 @@ void EngramSidecar::prepare_step(const std::vector<int32_t> & host_tokens, int s
         src_window_tokens = src_seq_cache_;
     }
 
+    const auto tp1 = std::chrono::steady_clock::now();
+
     const int d_eng  = table_.cfg().engram_dim();
     const int n_cols = table_.cfg().n_cols;
-    std::vector<int32_t> row_ids;
-    std::vector<float>   valid_mask;
     std::vector<int32_t> single_ids;
     std::vector<float>   single_valid;
 
@@ -388,17 +552,40 @@ void EngramSidecar::prepare_step(const std::vector<int32_t> & host_tokens, int s
         table_.prefetch_rows(hook_rows[hi].data(), static_cast<int>(hook_rows[hi].size()));
     }
 
-    // 2. Gather + dequant into pinned host memory and upload to each hook's fixed GPU address
+    const auto tp2 = std::chrono::steady_clock::now();
+
+    // 2. Gather + dequant (+ optional RKAD v2 mean-centering) into pinned host memory
     for (size_t hi = 0; hi < hooks_.size(); ++hi) {
         auto & hk = hooks_[hi];
         table_.gather_dequant_f32(hook_rows[hi].data(), hook_valid[hi].data(), T, hk.h_engram_pin);
+        if (!hk.h_mu_e.empty()) {
+            const float * mu = hk.h_mu_e.data();
+            for (int t = 0; t < T; ++t) {
+                float * dst = hk.h_engram_pin + static_cast<size_t>(t) * d_eng;
+                for (int d = 0; d < d_eng; ++d) dst[d] -= mu[d];
+            }
+        }
+    }
 
+    const auto tp3 = std::chrono::steady_clock::now();
+
+    // 3. Upload to each hook's fixed GPU address
+    for (size_t hi = 0; hi < hooks_.size(); ++hi) {
+        auto & hk = hooks_[hi];
         cuda_ok(cudaSetDevice(hk.device), "engram upload setDevice");
         cuda_ok(cudaMemcpyAsync(hk.d_engram_in, hk.h_engram_pin,
                                 static_cast<size_t>(T) * d_eng * sizeof(float),
                                 cudaMemcpyHostToDevice, nullptr),
                 "engram H2D copy");
     }
+
+    const auto tp4 = std::chrono::steady_clock::now();
+    prof_.steps += 1;
+    prof_.tokens += static_cast<uint64_t>(T);
+    prof_.tokenize_align_us += std::chrono::duration<double, std::micro>(tp1 - tp0).count();
+    prof_.hash_prefetch_us  += std::chrono::duration<double, std::micro>(tp2 - tp1).count();
+    prof_.gather_dequant_us += std::chrono::duration<double, std::micro>(tp3 - tp2).count();
+    prof_.h2d_submit_us     += std::chrono::duration<double, std::micro>(tp4 - tp3).count();
 }
 
 void EngramSidecar::on_post_layer(int layer_idx, int device, float * d_inpL, int n_tokens, int n_embd, int hc, cudaStream_t stream) {
@@ -459,6 +646,8 @@ void EngramSidecar::on_post_layer(int layer_idx, int device, float * d_inpL, int
     const float eff_scale = global_scale_ * hk.scale;
     if (eff_scale == 0.0f) return;
 
+    if (gpu_profile_) cudaEventRecord(hk.ev_start, stream);
+
     // Project Engram vector -> host value vector d_val[T, n_embd]
     if (hk.rank == 0) {
         launch_engram_matvec_f32(hk.d_engram_in, hk.d_Av, hk.d_val, n_tokens, n_embd, d_eng, stream);
@@ -479,6 +668,15 @@ void EngramSidecar::on_post_layer(int layer_idx, int device, float * d_inpL, int
 
     launch_engram_gated_inject(d_inpL, hk.d_val, hk.d_key, hk.d_gatew,
                                eff_scale, n_tokens, n_embd, hc, 1e-6f, stream);
+
+    if (gpu_profile_) {
+        cudaEventRecord(hk.ev_stop, stream);
+        cudaEventSynchronize(hk.ev_stop);
+        float ms = 0.0f;
+        cudaEventElapsedTime(&ms, hk.ev_start, hk.ev_stop);
+        prof_.gpu_hook_us += static_cast<double>(ms) * 1000.0;
+        prof_.gpu_hook_calls += 1;
+    }
 }
 
 } // namespace rookery

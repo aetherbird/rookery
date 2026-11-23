@@ -29,8 +29,19 @@ __global__ void engram_matvec_f32_kernel(
     const float * wp = W + static_cast<size_t>(row) * K;
 
     float acc = 0.0f;
-    for (int k = lane; k < K; k += 32) {
-        acc += xp[k] * wp[k];
+    if ((K & 3) == 0) {
+        const float4 * xp4 = reinterpret_cast<const float4 *>(xp);
+        const float4 * wp4 = reinterpret_cast<const float4 *>(wp);
+        const int K4 = K >> 2;
+        for (int k = lane; k < K4; k += 32) {
+            const float4 xv = xp4[k];
+            const float4 wv = __ldg(&wp4[k]);
+            acc += xv.x * wv.x + xv.y * wv.y + xv.z * wv.z + xv.w * wv.w;
+        }
+    } else {
+        for (int k = lane; k < K; k += 32) {
+            acc += xp[k] * __ldg(&wp[k]);
+        }
     }
     acc = warp_sum(acc);
     if (lane == 0) y[static_cast<size_t>(t) * M + row] = acc;

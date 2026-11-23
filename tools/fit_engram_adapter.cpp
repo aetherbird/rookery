@@ -40,26 +40,31 @@ struct HookPairs {
 int main(int argc, char ** argv) {
     std::string pairs_path;
     std::string out_path;
-    int   rank   = 128;
-    float lam    = 0.1f;
-    float scale  = 0.02f;
-    bool  gated  = false;
-    int   device = 0;
+    int   rank     = 128;
+    float lam      = 0.1f;
+    float scale    = 0.02f;
+    bool  gated    = false;
+    bool  center   = true;
+    bool  auto_lam = false;
+    int   device   = 0;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&]() -> std::string { return (i + 1 < argc) ? argv[++i] : ""; };
-        if (a == "--pairs")       pairs_path = next();
-        else if (a == "--out")    out_path = next();
-        else if (a == "--rank")   rank = std::atoi(next().c_str());
-        else if (a == "--lam")    lam = std::strtof(next().c_str(), nullptr);
-        else if (a == "--scale")  scale = std::strtof(next().c_str(), nullptr);
-        else if (a == "--gated")  gated = true;
-        else if (a == "--device") device = std::atoi(next().c_str());
+        if (a == "--pairs")          pairs_path = next();
+        else if (a == "--out")       out_path = next();
+        else if (a == "--rank")      rank = std::atoi(next().c_str());
+        else if (a == "--lam")       lam = std::strtof(next().c_str(), nullptr);
+        else if (a == "--auto-lam")  auto_lam = true;
+        else if (a == "--scale")     scale = std::strtof(next().c_str(), nullptr);
+        else if (a == "--gated")     gated = true;
+        else if (a == "--center")    center = true;
+        else if (a == "--no-center") center = false;
+        else if (a == "--device")    device = std::atoi(next().c_str());
     }
 
     if (pairs_path.empty() || out_path.empty()) {
-        std::fprintf(stderr, "Usage: %s --pairs <in.rkpr> --out <out.rkad> [--rank 128] [--lam 0.1] [--scale 0.02] [--gated] [--device 0]\n", argv[0]);
+        std::fprintf(stderr, "Usage: %s --pairs <in.rkpr> --out <out.rkad> [--rank 128] [--lam 0.1 | --auto-lam] [--scale 0.02] [--gated] [--center|--no-center] [--device 0]\n", argv[0]);
         return 1;
     }
 
@@ -117,10 +122,11 @@ int main(int argc, char ** argv) {
 
     const int eff_rank = (rank > 0 && rank < static_cast<int>(std::min(d_engram, d_host))) ? rank : 0;
 
+    const uint32_t out_ver = center ? 2u : 1u;
     FILE * out = std::fopen(out_path.c_str(), "wb");
     if (!out) throw std::runtime_error("Cannot open output " + out_path);
     const char omagic[4] = {'R', 'K', 'A', 'D'};
-    uint32_t ohdr[6] = {1u, n_hooks, d_engram, d_host, static_cast<uint32_t>(eff_rank), gated ? 1u : 0u};
+    uint32_t ohdr[6] = {out_ver, n_hooks, d_engram, d_host, static_cast<uint32_t>(eff_rank), gated ? 1u : 0u};
     std::fwrite(omagic, 1, 4, out);
     std::fwrite(ohdr, sizeof(uint32_t), 6, out);
 
@@ -133,74 +139,133 @@ int main(int argc, char ** argv) {
         const int de = static_cast<int>(d_engram);
         const int dh = static_cast<int>(d_host);
 
+        // Hold out last 10% for out-of-sample Ridge R^2 sanity check (fit uses first N_tr, then refits on all N for export!)
+        const int N_val = (N >= 200) ? (N / 10) : 0;
+        const int N_tr  = N - N_val;
+
+        // Compute mean vectors mu_E and mu_H over training samples (for centering)
+        std::vector<float> mu_E(de, 0.0f);
+        std::vector<float> mu_H(dh, 0.0f);
+        if (center) {
+            std::vector<double> sum_e(de, 0.0), sum_h(dh, 0.0);
+            for (int n = 0; n < N; ++n) {
+                const float * ep = hp.E.data() + static_cast<size_t>(n) * de;
+                const float * hpv = hp.H.data() + static_cast<size_t>(n) * dh;
+                for (int j = 0; j < de; ++j) sum_e[j] += ep[j];
+                for (int d = 0; d < dh; ++d) sum_h[d] += hpv[d];
+            }
+            for (int j = 0; j < de; ++j) mu_E[j] = static_cast<float>(sum_e[j] / N);
+            for (int d = 0; d < dh; ++d) mu_H[d] = static_cast<float>(sum_h[d] / N);
+        }
+
+        std::vector<float> E_fit(hp.E.size());
+        std::vector<float> H_fit(hp.H.size());
+        for (int n = 0; n < N; ++n) {
+            const float * es = hp.E.data() + static_cast<size_t>(n) * de;
+            float *       ed = E_fit.data() + static_cast<size_t>(n) * de;
+            const float * hs = hp.H.data() + static_cast<size_t>(n) * dh;
+            float *       hd = H_fit.data() + static_cast<size_t>(n) * dh;
+            if (center) {
+                for (int j = 0; j < de; ++j) ed[j] = es[j] - mu_E[j];
+                for (int d = 0; d < dh; ++d) hd[d] = hs[d] - mu_H[d];
+            } else {
+                std::memcpy(ed, es, static_cast<size_t>(de) * sizeof(float));
+                std::memcpy(hd, hs, static_cast<size_t>(dh) * sizeof(float));
+            }
+        }
+
         float * d_E = nullptr, * d_H = nullptr, * d_EtE = nullptr, * d_EtH = nullptr;
         cuda_ok(cudaMalloc(&d_E,   static_cast<size_t>(N) * de * sizeof(float)), "malloc E");
         cuda_ok(cudaMalloc(&d_H,   static_cast<size_t>(N) * dh * sizeof(float)), "malloc H");
         cuda_ok(cudaMalloc(&d_EtE, static_cast<size_t>(de) * de * sizeof(float)), "malloc EtE");
         cuda_ok(cudaMalloc(&d_EtH, static_cast<size_t>(de) * dh * sizeof(float)), "malloc EtH");
-        cuda_ok(cudaMemcpy(d_E, hp.E.data(), static_cast<size_t>(N) * de * sizeof(float), cudaMemcpyHostToDevice), "copy E");
-        cuda_ok(cudaMemcpy(d_H, hp.H.data(), static_cast<size_t>(N) * dh * sizeof(float), cudaMemcpyHostToDevice), "copy H");
+        cuda_ok(cudaMemcpy(d_E, E_fit.data(), static_cast<size_t>(N) * de * sizeof(float), cudaMemcpyHostToDevice), "copy E");
+        cuda_ok(cudaMemcpy(d_H, H_fit.data(), static_cast<size_t>(N) * dh * sizeof(float), cudaMemcpyHostToDevice), "copy H");
 
-        // Column-major view: E_rm[N, de] is E_cm[de, N] (m=de, k=N).
-        // EtE [de, de] = E_cm * E_cm^T
-        // EtH [de, dh] = E_cm * H_cm^T  (where H_cm is [dh, N])
         const float alpha = 1.0f, beta = 0.0f;
-        cublas_ok(cublasSgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_T, de, de, N, &alpha, d_E, de, d_E, de, &beta, d_EtE, de), "EtE");
-        cublas_ok(cublasSgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_T, de, dh, N, &alpha, d_E, de, d_H, dh, &beta, d_EtH, de), "EtH");
-
-        // Add Ridge penalty `lam * mean(diag(EtE))` on host diagonal (tiny de*de copy)
         std::vector<float> h_EtE(static_cast<size_t>(de) * de);
-        cuda_ok(cudaMemcpy(h_EtE.data(), d_EtE, h_EtE.size() * sizeof(float), cudaMemcpyDeviceToHost), "EtE D2H");
-        double diag_sum = 0.0;
-        for (int j = 0; j < de; ++j) diag_sum += h_EtE[static_cast<size_t>(j) * de + j];
-        const float reg = std::max(1e-5f, lam * static_cast<float>(diag_sum / de));
-        for (int j = 0; j < de; ++j) h_EtE[static_cast<size_t>(j) * de + j] += reg;
-        cuda_ok(cudaMemcpy(d_EtE, h_EtE.data(), h_EtE.size() * sizeof(float), cudaMemcpyHostToDevice), "EtE H2D");
-
-        // Cholesky factorization & solve: (EtE) * W_cm = EtH  -> d_EtH becomes W_cm [de, dh] (which is W^T [dh, de] row-major!!)
         int lwork_chol = 0;
         cusolver_ok(cusolverDnSpotrf_bufferSize(cusolver, CUBLAS_FILL_MODE_LOWER, de, d_EtE, de, &lwork_chol), "potrf buf");
         float * d_work = nullptr;
         cuda_ok(cudaMalloc(&d_work, static_cast<size_t>(lwork_chol) * sizeof(float)), "malloc chol work");
-        cusolver_ok(cusolverDnSpotrf(cusolver, CUBLAS_FILL_MODE_LOWER, de, d_EtE, de, d_work, lwork_chol, d_info), "potrf");
-        cusolver_ok(cusolverDnSpotrs(cusolver, CUBLAS_FILL_MODE_LOWER, de, dh, d_EtE, de, d_EtH, de, d_info), "potrs");
+
+        auto solve_ridge = [&](int n_rows, float use_lam) {
+            cublas_ok(cublasSgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_T, de, de, n_rows, &alpha, d_E, de, d_E, de, &beta, d_EtE, de), "EtE");
+            cublas_ok(cublasSgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_T, de, dh, n_rows, &alpha, d_E, de, d_H, dh, &beta, d_EtH, de), "EtH");
+            cuda_ok(cudaMemcpy(h_EtE.data(), d_EtE, h_EtE.size() * sizeof(float), cudaMemcpyDeviceToHost), "EtE D2H");
+            double diag_sum = 0.0;
+            for (int j = 0; j < de; ++j) diag_sum += h_EtE[static_cast<size_t>(j) * de + j];
+            const float reg = std::max(1e-5f, use_lam * static_cast<float>(diag_sum / de));
+            for (int j = 0; j < de; ++j) h_EtE[static_cast<size_t>(j) * de + j] += reg;
+            cuda_ok(cudaMemcpy(d_EtE, h_EtE.data(), h_EtE.size() * sizeof(float), cudaMemcpyHostToDevice), "EtE H2D");
+            cusolver_ok(cusolverDnSpotrf(cusolver, CUBLAS_FILL_MODE_LOWER, de, d_EtE, de, d_work, lwork_chol, d_info), "potrf");
+            cusolver_ok(cusolverDnSpotrs(cusolver, CUBLAS_FILL_MODE_LOWER, de, dh, d_EtE, de, d_EtH, de, d_info), "potrs");
+        };
+
+        auto compute_r2 = [&](int row_start, int n_rows) -> double {
+            float * d_pred = nullptr;
+            cuda_ok(cudaMalloc(&d_pred, static_cast<size_t>(n_rows) * dh * sizeof(float)), "malloc pred");
+            cublas_ok(cublasSgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, dh, n_rows, de,
+                                  &alpha, d_EtH, de, d_E + static_cast<size_t>(row_start) * de, de, &beta, d_pred, dh), "pred");
+            std::vector<float> h_pred(static_cast<size_t>(n_rows) * dh);
+            cuda_ok(cudaMemcpy(h_pred.data(), d_pred, h_pred.size() * sizeof(float), cudaMemcpyDeviceToHost), "pred D2H");
+            cudaFree(d_pred);
+
+            std::vector<double> hm(dh, 0.0);
+            for (int n = 0; n < n_rows; ++n)
+                for (int d = 0; d < dh; ++d) hm[d] += H_fit[static_cast<size_t>(row_start + n) * dh + d];
+            for (int d = 0; d < dh; ++d) hm[d] /= n_rows;
+
+            double ss_res = 0.0, ss_tot = 0.0;
+            for (int n = 0; n < n_rows; ++n) {
+                for (int d = 0; d < dh; ++d) {
+                    const double hv = H_fit[static_cast<size_t>(row_start + n) * dh + d];
+                    const double pv = h_pred[static_cast<size_t>(n) * dh + d];
+                    ss_res += (hv - pv) * (hv - pv);
+                    ss_tot += (hv - hm[d]) * (hv - hm[d]);
+                }
+            }
+            return 1.0 - ss_res / std::max(ss_tot, 1e-12);
+        };
+
+        float best_lam = lam;
+        double val_r2 = 0.0;
+        if (auto_lam && N_val > 0) {
+            const float grid[] = {0.5f, 2.0f, 5.0f, 15.0f, 50.0f};
+            val_r2 = -1e9;
+            for (float cand : grid) {
+                solve_ridge(N_tr, cand);
+                double vr = compute_r2(N_tr, N_val);
+                if (vr > val_r2) {
+                    val_r2 = vr;
+                    best_lam = cand;
+                }
+            }
+        } else if (N_val > 0) {
+            solve_ridge(N_tr, best_lam);
+            val_r2 = compute_r2(N_tr, N_val);
+        }
+        solve_ridge(N, best_lam);
+        const double r2 = compute_r2(0, N);
         cudaFree(d_work);
 
-        // Compute explained variance R^2 on GPU: pred_cm[dh, N] = W_cm^T[dh, de] * E_cm[de, N]
-        float * d_pred = nullptr;
-        cuda_ok(cudaMalloc(&d_pred, static_cast<size_t>(N) * dh * sizeof(float)), "malloc pred");
-        cublas_ok(cublasSgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, dh, N, de, &alpha, d_EtH, de, d_E, de, &beta, d_pred, dh), "pred");
-
-        std::vector<float> h_pred(static_cast<size_t>(N) * dh);
-        cuda_ok(cudaMemcpy(h_pred.data(), d_pred, h_pred.size() * sizeof(float), cudaMemcpyDeviceToHost), "pred D2H");
-        cudaFree(d_pred);
-
-        double ss_res = 0.0, ss_tot = 0.0;
-        std::vector<double> h_mean(dh, 0.0);
-        for (int n = 0; n < N; ++n)
-            for (int d = 0; d < dh; ++d) h_mean[d] += hp.H[static_cast<size_t>(n) * dh + d];
-        for (int d = 0; d < dh; ++d) h_mean[d] /= N;
-        for (int n = 0; n < N; ++n) {
-            for (int d = 0; d < dh; ++d) {
-                const double hv = hp.H[static_cast<size_t>(n) * dh + d];
-                const double pv = h_pred[static_cast<size_t>(n) * dh + d];
-                ss_res += (hv - pv) * (hv - pv);
-                ss_tot += (hv - h_mean[d]) * (hv - h_mean[d]);
-            }
-        }
-        const double r2 = 1.0 - ss_res / std::max(ss_tot, 1e-12);
+        // Auto-gate off hooks whose held-out validation R^2 <= 0 when --auto-lam is enabled!
+        const float hook_scale = (auto_lam && N_val > 0 && val_r2 <= 0.0) ? 0.0f : scale;
 
         // W_cm[de, dh] IS Wt_rm[dh, de] in row-major!
-        // Write hook header
+        // Write hook header (+ mu_E[de] for RKAD v2)
         int32_t hmeta[2] = {hp.target_layer, hp.src_layer};
         std::fwrite(hmeta, sizeof(int32_t), 2, out);
-        std::fwrite(&scale, sizeof(float), 1, out);
+        std::fwrite(&hook_scale, sizeof(float), 1, out);
+        if (center) {
+            std::fwrite(mu_E.data(), sizeof(float), de, out);
+        }
 
         if (eff_rank == 0) {
             std::vector<float> h_Wt(static_cast<size_t>(dh) * de);
             cuda_ok(cudaMemcpy(h_Wt.data(), d_EtH, h_Wt.size() * sizeof(float), cudaMemcpyDeviceToHost), "Wt D2H");
-            std::printf("  hook[%u] src=%d -> host_layer=%d: Ridge R^2=%.4f (full dense %dx%d)\n",
-                        hi, hp.src_layer, hp.target_layer, r2, dh, de);
+            std::printf("  hook[%u] src=%d -> host_layer=%d: train R^2=%.4f, val(10%%) R^2=%.4f (full dense %dx%d, centered=%s)\n",
+                        hi, hp.src_layer, hp.target_layer, r2, val_r2, dh, de, center ? "yes" : "no");
             std::fwrite(h_Wt.data(), sizeof(float), h_Wt.size(), out);
             if (gated) {
                 std::fwrite(h_Wt.data(), sizeof(float), h_Wt.size(), out);
@@ -278,8 +343,9 @@ int main(int argc, char ** argv) {
                 }
             }
 
-            std::printf("  hook[%u] src=%d -> host_layer=%d: Ridge R^2=%.4f, rank-%d spectral energy=%.1f%%\n",
-                        hi, hp.src_layer, hp.target_layer, r2, eff_rank, 100.0 * kept_e / std::max(tot_e, 1e-12));
+            std::printf("  hook[%u] src=%d -> host_layer=%d: lam=%.1f, train R^2=%.4f, val(10%%) R^2=%.4f, rank-%d spectral energy=%.1f%% (centered=%s, scale=%.4f%s)\n",
+                        hi, hp.src_layer, hp.target_layer, best_lam, r2, val_r2, eff_rank, 100.0 * kept_e / std::max(tot_e, 1e-12),
+                        center ? "yes" : "no", hook_scale, hook_scale == 0.0f ? " [AUTO-DISABLED]" : "");
 
             std::fwrite(A_v.data(), sizeof(float), A_v.size(), out);
             std::fwrite(B_v.data(), sizeof(float), B_v.size(), out);
@@ -303,7 +369,7 @@ int main(int argc, char ** argv) {
     cublasDestroy(cublas);
 
     const auto t1 = std::chrono::steady_clock::now();
-    std::printf("Wrote RKAD v1 adapter -> %s in %.2f s\n",
-                out_path.c_str(), std::chrono::duration<double>(t1 - t0).count());
+    std::printf("Wrote RKAD v%u adapter -> %s in %.2f s\n",
+                out_ver, out_path.c_str(), std::chrono::duration<double>(t1 - t0).count());
     return 0;
 }

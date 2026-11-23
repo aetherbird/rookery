@@ -24,11 +24,25 @@ void launch_engram_gated_inject(
 void launch_engram_mean_streams(
     const float * d_inpL, float * d_out, int T, int d_host, int hc, cudaStream_t stream);
 
+struct EngramProfileStats {
+    uint64_t steps             = 0;
+    uint64_t tokens            = 0;
+    double   tokenize_align_us = 0.0;
+    double   hash_prefetch_us  = 0.0;
+    double   gather_dequant_us = 0.0;
+    double   h2d_submit_us     = 0.0;
+    double   gpu_hook_us       = 0.0;
+    uint64_t gpu_hook_calls    = 0;
+};
+
 struct EngramHookSpec {
     int   target_host_layer = 0;  // backbone layer index on host model (e.g. Maxwell 1, 11, 21, 31)
     int   src_engram_layer  = 0;  // index into EngramTable's layers (0..n_layers-1)
     int   device            = 0;  // GPU owning target_host_layer
     float scale             = 0.0f;
+
+    // Optional RKAD v2 mean-centering vector mu_E[d_engram] subtracted on CPU staging buffer before H2D
+    std::vector<float> h_mu_e;
 
     // Projection weights on `device`:
     // If rank == 0: dense W_v[d_host, d_engram]
@@ -47,6 +61,10 @@ struct EngramHookSpec {
     float * d_val        = nullptr; // [max_batch, d_host]
     float * d_key        = nullptr; // [max_batch, d_host] (if gated)
     float * d_hmean      = nullptr; // [max_batch, d_host] (for calibration dumps)
+
+    // Optional CUDA events for stage-by-stage GPU hook profiling (only when gpu_profile_ == true, non-graph)
+    cudaEvent_t ev_start = nullptr;
+    cudaEvent_t ev_stop  = nullptr;
 };
 
 // Decoupled, model-agnostic Engram Sidecar implementing `LayerHook`.
@@ -85,6 +103,20 @@ public:
     const EngramTable & table() const { return table_; }
     size_t num_hooks() const { return hooks_.size(); }
 
+    void set_gpu_profiling(bool enable) { gpu_profile_ = enable; }
+    void reset_profile() { prof_ = EngramProfileStats{}; }
+    const EngramProfileStats & profile() const { return prof_; }
+
+    // Verifies that incremental token-by-token rolling-window tokenization + hashing produces
+    // identical source token IDs and N-gram hash row IDs as full-sequence source tokenization.
+    // Returns true iff 100% of tokens and hash columns match exactly.
+    bool verify_incremental_addressing(const std::vector<int32_t> & host_tokens,
+                                       int & out_tokens_checked,
+                                       int & out_src_tok_matches,
+                                       int & out_hash_col_matches,
+                                       int & out_hash_col_total,
+                                       bool verbose = false);
+
     // Call BEFORE each host `forward` / `forward_decode_*` / `decode_mtp_greedy_step`!
     // Translates host tokens -> source Engram tokens (via rolling UTF-8 text bridge),
     // computes exact N-gram hashes, gathers+dequantizes from mmap'd table into pinned RAM,
@@ -106,6 +138,8 @@ private:
     int                     hc_           = 4;
     int                     max_batch_    = 512;
     float                   global_scale_ = 0.0f;
+    bool                    gpu_profile_  = false;
+    EngramProfileStats      prof_{};
 
     std::vector<EngramHookSpec> hooks_;
     std::vector<int>            layer_to_hook_; // [n_host_layers] -> index into hooks_ or -1

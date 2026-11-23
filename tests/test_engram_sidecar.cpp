@@ -122,6 +122,8 @@ int main(int argc, char ** argv) {
     uint64_t shuffle_salt = 0;
     bool     table_only   = false;
     bool     dump_delta   = false;
+    bool     verify_addr  = false;
+    bool     bench_mode   = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -143,11 +145,65 @@ int main(int argc, char ** argv) {
         else if (a == "--split")                    split = parse_csv_floats(next());
         else if (a == "--gen")                      n_gen = std::atoi(next().c_str());
         else if (a == "--table-only")               table_only = true;
+        else if (a == "--verify-addressing")        verify_addr = true;
+        else if (a == "--bench")                    bench_mode = true;
     }
 
     if (engram_path.empty()) {
-        std::fprintf(stderr, "Usage: %s --engram <table.gguf> [-m <host.gguf>] [--engram-adapter <a.rkad>] [--engram-scale 0.0] [--scale-sweep 0,0.25,0.5,1] [--dump-pairs <p.rkpr>] [--dump-delta] [--eval-ppl <txt>] [--shuffle-salt 0] [--table-only]\n", argv[0]);
+        std::fprintf(stderr, "Usage: %s --engram <table.gguf> [-m <host.gguf>] [--engram-adapter <a.rkad>] [--engram-scale 0.0] [--scale-sweep 0,0.25,0.5,1] [--dump-pairs <p.rkpr>] [--dump-delta] [--eval-ppl <txt>] [--shuffle-salt 0] [--verify-addressing] [--bench] [--table-only]\n", argv[0]);
         return 1;
+    }
+
+    // 0. Fast exact incremental-vs-full source addressing verification (no host GPU weights needed!)
+    if (verify_addr) {
+        if (model_path.empty()) {
+            std::fprintf(stderr, "--verify-addressing requires -m <host.gguf> to load the host tokenizer\n");
+            return 1;
+        }
+        rookery::BpeTokenizer host_tok;
+        {
+            auto gguf = rookery::GgufFile::open(model_path);
+            host_tok.load(gguf);
+        }
+        rookery::EngramSidecar sidecar;
+        std::vector<int> dummy_devs(48, 0);
+        sidecar.init(engram_path, &host_tok, dummy_devs, 2048, 4, 512, "", 0.0f, {});
+
+        std::string sample;
+        if (!corpus_path.empty()) {
+            sample = read_text_file(corpus_path);
+        } else {
+            sample =
+                "The capital of France is Paris, and Rayleigh scattering makes the daytime sky appear blue. "
+                "Electromagnetic radiation spans wavelengths from gamma rays (1e-12 m) to long radio waves.\n"
+                "In C++20, `std::vector<int32_t> aligned_src_pos(T, 0);` avoids dynamic reallocations.\n"
+                "JSON payload: {\"model\": \"maxwell-v1\", \"temperature\": 0.7, \"stop\": [\"\\n\\n\", \"<|im_end|>\"]}\n"
+                "Multi-byte UTF-8 test — em-dash, curly quote \xE2\x80\x99, CJK \xE4\xBD\xA0\xE5\xA5\xBD\xE4\xB8\x96\xE7\x95\x8C, "
+                "rocket \xF0\x9F\x9A\x80, and URL https://example.org/v2/items?id=42&sort=desc.\n"
+                "Repeat to exceed 512 bytes so boundary-aware suffix slicing triggers across every single decode step: "
+                "1234567890 9876543210 supercalifragilisticexpialidocious internationalization electroencephalography. "
+                "The Treaty of Westphalia (1648) ended the Thirty Years' War in Europe. "
+                "Marie Curie won Nobel Prizes in Physics (1903) and Chemistry (1911) for her pioneering research on radioactivity.\n"
+                "def fibonacci(n: int) -> int:\n    a, b = 0, 1\n    for _ in range(n):\n        a, b = b, a + b\n    return a\n";
+            // Repeat 3x with slight variation to test deep (>1500 byte) rolling context
+            sample = sample + "\n" + sample + "\n" + sample;
+        }
+
+        auto host_ids = host_tok.encode(sample, false, false);
+        if (static_cast<int>(host_ids.size()) > max_toks) host_ids.resize(max_toks);
+
+        int tok_chk = 0, tok_ok = 0, hash_ok = 0, hash_tot = 0;
+        const auto t0 = std::chrono::steady_clock::now();
+        bool pass = sidecar.verify_incremental_addressing(host_ids, tok_chk, tok_ok, hash_ok, hash_tot, true);
+        const auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+        std::printf("\n=== INCREMENTAL ADDRESSING PARITY TEST ===\n");
+        std::printf("Checked %d host tokens (%zu bytes) in %.1f ms\n", tok_chk, sample.size(), ms);
+        std::printf("Exact source token match: %d / %d (%.2f%%)\n", tok_ok, tok_chk, 100.0 * tok_ok / std::max(1, tok_chk));
+        std::printf("Exact N-gram hash match:  %d / %d (%.2f%%)\n", hash_ok, hash_tot, 100.0 * hash_ok / std::max(1, hash_tot));
+        std::printf("Result: %s\n", pass ? "PASS (100% exact)" : "FAIL");
+        return pass ? 0 : 1;
     }
 
     // 1. Fast standalone EngramTable lookup & latency test
@@ -238,31 +294,162 @@ int main(int argc, char ** argv) {
         return 0;
     }
 
-    // Mode B: Held-Out Perplexity & Top-1/Top-5 Accuracy Sweep (+ Shuffled-Table Control!)
+    // Mode B: Held-Out Perplexity & Top-1/Top-5 Accuracy Sweep (4-way: Base, Disabled, Real, Shuffled!)
     if (!eval_path.empty()) {
         std::string text = read_text_file(eval_path);
         auto ids = host_tok.encode(text, true, false);
         if (static_cast<int>(ids.size()) > eval_toks + 1) ids.resize(eval_toks + 1);
         std::printf("Held-out eval file: %s (%zu tokens evaluated)\n", eval_path.c_str(), ids.size() - 1);
 
-        if (scale_sweep.empty()) scale_sweep = {0.0f, 0.25f, 0.5f, 1.0f, 2.0f};
+        if (scale_sweep.empty()) scale_sweep = {0.25f, 0.5f, 1.0f, 2.0f};
+
+        // Control 1: Pure Base (no LayerHook, no prepare_step)
+        sidecar.set_global_scale(0.0f);
+        sidecar.set_shuffle_salt(0);
+        model.set_layer_hook(nullptr);
+        model.warmup_decode_graphs();
+        auto base_res = eval_token_ppl(model, nullptr, ids);
+        std::printf("  [BASE    ] (no hook)          | NLL=%.5f | PPL=%7.3f | top1=%5.2f%% | top5=%5.2f%% (%.1f tok/s)\n",
+                    base_res.nll, base_res.ppl, base_res.top1, base_res.top5, base_res.count * 1000.0 / base_res.ms);
+
+        // Control 2: Bridge-Disabled (hook attached & prepare_step runs, scale=0.0)
+        sidecar.set_global_scale(0.0f);
+        sidecar.set_shuffle_salt(0);
+        model.set_layer_hook(&sidecar);
+        model.warmup_decode_graphs();
+        auto dis_res = eval_token_ppl(model, &sidecar, ids);
+        std::printf("  [DISABLED] global_scale= 0.000 | NLL=%.5f | PPL=%7.3f | top1=%5.2f%% | top5=%5.2f%% (delta vs base=%+.6f)\n",
+                    dis_res.nll, dis_res.ppl, dis_res.top1, dis_res.top5, dis_res.ppl - base_res.ppl);
 
         for (float s : scale_sweep) {
+            if (s <= 0.0f) continue;
             sidecar.set_global_scale(s);
             sidecar.set_shuffle_salt(0);
-            model.set_layer_hook(s == 0.0f ? nullptr : &sidecar);
+            model.set_layer_hook(&sidecar);
             model.warmup_decode_graphs();
-            auto res = eval_token_ppl(model, s == 0.0f ? nullptr : &sidecar, ids);
-            std::printf("  [REAL    ] global_scale=%6.3f | NLL=%.5f | PPL=%7.3f | top1=%5.2f%% | top5=%5.2f%% (%.1f tok/s)\n",
-                        s, res.nll, res.ppl, res.top1, res.top5, res.count * 1000.0 / res.ms);
+            auto res = eval_token_ppl(model, &sidecar, ids);
+            std::printf("  [REAL    ] global_scale=%6.3f | NLL=%.5f | PPL=%7.3f | top1=%5.2f%% | top5=%5.2f%% (vs base=%+.4f, %.1f tok/s)\n",
+                        s, res.nll, res.ppl, res.top1, res.top5, res.ppl - base_res.ppl, res.count * 1000.0 / res.ms);
 
-            if (s > 0.0f && shuffle_salt != 0) {
+            if (shuffle_salt != 0) {
                 sidecar.set_shuffle_salt(shuffle_salt);
                 auto ctl = eval_token_ppl(model, &sidecar, ids);
-                std::printf("  [SHUFFLED] global_scale=%6.3f | NLL=%.5f | PPL=%7.3f | top1=%5.2f%% | top5=%5.2f%% (delta_PPL vs real=%+.4f)\n",
+                std::printf("  [SHUFFLED] global_scale=%6.3f | NLL=%.5f | PPL=%7.3f | top1=%5.2f%% | top5=%5.2f%% (shuf-real=%+.4f)\n",
                             s, ctl.nll, ctl.ppl, ctl.top1, ctl.top5, ctl.ppl - res.ppl);
             }
         }
+        return 0;
+    }
+
+    // Mode B2: Stage-by-Stage Latency & Throughput Profiling (Base vs Disabled vs Active, tg128 + pp1024)
+    if (bench_mode) {
+        const std::string prompt_str =
+            "In computer architecture, memory-bandwidth-bound autoregressive decoding benefits from coalesced quantized "
+            "loads, static CUDA graphs, and asynchronous host-to-device prefetching. The capital of France is";
+        const auto prompt_ids = host_tok.encode(prompt_str, true, false);
+        std::vector<int32_t> ppos(prompt_ids.size());
+        std::iota(ppos.begin(), ppos.end(), 0);
+        std::vector<float> logits;
+
+        auto run_decode_bench = [&](const char * label, bool use_hook, bool call_prep, float sc, bool use_graph, bool gpu_prof) {
+            model.set_use_cuda_graphs(use_graph);
+            sidecar.set_global_scale(sc);
+            sidecar.set_shuffle_salt(0);
+            sidecar.set_gpu_profiling(gpu_prof);
+            model.set_layer_hook(use_hook ? &sidecar : nullptr);
+            if (use_graph) model.warmup_decode_graphs();
+
+            // Prime prompt
+            if (call_prep) sidecar.prepare_step(prompt_ids, 0);
+            model.forward(prompt_ids, ppos, logits);
+            int32_t cur = static_cast<int32_t>(std::max_element(logits.begin(), logits.end()) - logits.begin());
+            int32_t pos = static_cast<int32_t>(prompt_ids.size());
+
+            // Warmup 8 steps
+            for (int w = 0; w < 8; ++w) {
+                if (call_prep) sidecar.prepare_step({cur}, pos);
+                cur = model.forward_decode_greedy(cur, pos++);
+            }
+
+            // Timed N steps
+            const int N = std::max(64, n_gen);
+            sidecar.reset_profile();
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int s = 0; s < N; ++s) {
+                if (call_prep) sidecar.prepare_step({cur}, pos);
+                cur = model.forward_decode_greedy(cur, pos++);
+            }
+            const auto t1 = std::chrono::steady_clock::now();
+            const double tot_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            const double us_tok = (tot_ms * 1000.0) / N;
+            const double tps    = N * 1000.0 / tot_ms;
+            const auto & pr = sidecar.profile();
+            std::printf("  %-34s | %6.2f tok/s | %8.1f us/tok", label, tps, us_tok);
+            if (call_prep && pr.steps > 0) {
+                std::printf(" | prep: tok=%.1f hash=%.1f gath=%.1f h2d=%.1f us",
+                            pr.tokenize_align_us / pr.steps, pr.hash_prefetch_us / pr.steps,
+                            pr.gather_dequant_us / pr.steps, pr.h2d_submit_us / pr.steps);
+            }
+            if (gpu_prof && pr.gpu_hook_calls > 0) {
+                const double gpu_per_tok = pr.gpu_hook_us / N;
+                std::printf(" | gpu_hooks=%.1f us/tok", gpu_per_tok);
+            }
+            std::printf("\n");
+            return us_tok;
+        };
+
+        std::printf("\n=== ENGRAM STAGE-BY-STAGE DECODE BENCHMARK (tg%d, CUDA Graph ON) ===\n", std::max(64, n_gen));
+        const double base_us = run_decode_bench("1. Base (no hook)",                false, false, 0.0f, true, false);
+        const double dis_us  = run_decode_bench("2. Disabled (hook+prep, scale=0)", true,  true,  0.0f, true, false);
+        const double act_us  = run_decode_bench("3. Active (hook+prep, scale>0)",   true,  true,  scale > 0.0f ? scale : 0.5f, true, false);
+        std::printf("  Overhead vs Base: disabled=%+.1f us/tok (%+.2f%%) | active=%+.1f us/tok (%+.2f%%)\n",
+                    dis_us - base_us, 100.0 * (dis_us - base_us) / base_us,
+                    act_us - base_us, 100.0 * (act_us - base_us) / base_us);
+
+        std::printf("\n=== GPU HOOK ISOLATION (non-graph CUDA events, tg%d) ===\n", std::max(64, n_gen));
+        run_decode_bench("4. Active (non-graph + CUDA events)", true, true, scale > 0.0f ? scale : 0.5f, false, true);
+
+        // Prefill pp1024 comparison
+        std::vector<int32_t> pp_ids;
+        while (pp_ids.size() < 1024) {
+            for (int32_t id : prompt_ids) {
+                if (pp_ids.size() >= 1024) break;
+                pp_ids.push_back(id);
+            }
+        }
+        std::vector<int32_t> pp_pos(pp_ids.size());
+        std::iota(pp_pos.begin(), pp_pos.end(), 0);
+
+        auto run_pp_bench = [&](const char * label, bool use_hook, float sc) {
+            sidecar.set_global_scale(sc);
+            sidecar.set_gpu_profiling(false);
+            model.set_layer_hook(use_hook ? &sidecar : nullptr);
+            sidecar.reset_profile();
+            const auto t0 = std::chrono::steady_clock::now();
+            for (size_t off = 0; off < pp_ids.size(); off += 256) {
+                size_t len = std::min<size_t>(256, pp_ids.size() - off);
+                std::vector<int32_t> pt(pp_ids.begin() + off, pp_ids.begin() + off + len);
+                std::vector<int32_t> pp(pp_pos.begin() + off, pp_pos.begin() + off + len);
+                if (use_hook) sidecar.prepare_step(pt, static_cast<int>(off));
+                model.forward(pt, pp, logits);
+            }
+            const auto t1 = std::chrono::steady_clock::now();
+            double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            const auto & pr = sidecar.profile();
+            std::printf("  %-34s | %7.1f tok/s | %7.2f ms", label, pp_ids.size() * 1000.0 / ms, ms);
+            if (use_hook && pr.steps > 0) {
+                std::printf(" | prep total: tok=%.2f hash=%.2f gath=%.2f h2d=%.2f ms",
+                            pr.tokenize_align_us / 1000.0, pr.hash_prefetch_us / 1000.0,
+                            pr.gather_dequant_us / 1000.0, pr.h2d_submit_us / 1000.0);
+            }
+            std::printf("\n");
+            return ms;
+        };
+
+        std::printf("\n=== PREFILL BENCHMARK (pp1024, chunk=256) ===\n");
+        const double pp_base = run_pp_bench("1. Base (no hook)", false, 0.0f);
+        const double pp_act  = run_pp_bench("2. Active (hook+prep, scale>0)", true, scale > 0.0f ? scale : 0.5f);
+        std::printf("  Prefill overhead vs Base: %+.2f ms (%+.2f%%)\n", pp_act - pp_base, 100.0 * (pp_act - pp_base) / pp_base);
         return 0;
     }
 
