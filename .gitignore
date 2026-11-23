@@ -1,0 +1,39 @@
+# Model weights & large data
+*.gguf
+*.ggml
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.onnx
+*.ftw
+/models/
+/weights/
+
+# Build artifacts
+build/
+target/
+zig-out/
+.zig-cache/
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+*.cubin
+*.ptx
+*.fatbin
+compile_commands.json
+
+# Python / tooling
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# Local bench outputs & logs
+*.log
+*.prof
+*.nsys-rep
+*.ncu-rep
+.DS_Store
