@@ -206,6 +206,7 @@ private:
     void run_layer(DevRuntime & rt, int il, int ip, int T, int & n_blocks, bool has_messages, int kv_len_max);
     void run_prelude(int T, int kv_len_max);
     void run_core(int T, int kv_len_max);
+    void run_postlude_prefix(int T, int kv_len_max);
     void run_postlude_and_head(int T, bool run_argmax, int kv_len_max);
     void run_single_gpu_all(int T, bool run_argmax, int kv_len_max);
     void capture_decode_graphs();
@@ -227,12 +228,14 @@ private:
     std::vector<float *> conv_ffn_;
 
     // 1-GPU: runtimes_.size() == 1 (all layers on rt[0], 1 single CUDA Graph)
-    // 2-GPU: runtimes_.size() == 2 (rt[0] = prelude + postlude + embd/out, rt[1] = looped core, 3 CUDA Graphs)
+    // 2-GPU symmetric (postlude_split_ip_ < 0): rt[0] = prelude + postlude + embd/out, rt[1] = looped core (3 CUDA Graphs)
+    // 2-GPU asymmetric (postlude_split_ip_ >= core_end): rt[0] = embd + [0, postlude_split_ip_), rt[1] = [postlude_split_ip_, n_phys) + out (2 CUDA Graphs, 1 hop)
     std::vector<DevRuntime> runtimes_;
-    cudaGraphExec_t         graph_all_      = nullptr; // 1-GPU
-    cudaGraphExec_t         graph_prelude_  = nullptr; // 2-GPU GPU0
-    cudaGraphExec_t         graph_core_     = nullptr; // 2-GPU GPU1
-    cudaGraphExec_t         graph_postlude_ = nullptr; // 2-GPU GPU0
+    int                     postlude_split_ip_ = -1;
+    cudaGraphExec_t         graph_all_         = nullptr; // 1-GPU
+    cudaGraphExec_t         graph_prelude_     = nullptr; // 2-GPU GPU0 (prelude, or prelude+core+postlude_prefix when asymmetric)
+    cudaGraphExec_t         graph_core_        = nullptr; // 2-GPU GPU1 (symmetric mode only)
+    cudaGraphExec_t         graph_postlude_    = nullptr; // 2-GPU postlude+head (GPU0 symmetric, GPU1 asymmetric)
 
     int         max_batch_       = 256;
     bool        use_cuda_graphs_ = true;

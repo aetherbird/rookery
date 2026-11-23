@@ -54,15 +54,23 @@ int read_first_int_or_u64(const ShardedGguf & sg, const std::string & key, int d
 } // namespace
 
 void Inkling2LoopModel::invalidate_graphs() noexcept {
+    const bool asym = (postlude_split_ip_ >= 0);
     if (!runtimes_.empty()) {
         cudaSetDevice(runtimes_[0].device);
-        if (graph_all_)      { cudaGraphExecDestroy(graph_all_);      graph_all_      = nullptr; }
-        if (graph_prelude_)  { cudaGraphExecDestroy(graph_prelude_);  graph_prelude_  = nullptr; }
-        if (graph_postlude_) { cudaGraphExecDestroy(graph_postlude_); graph_postlude_ = nullptr; }
+        if (graph_all_)     { cudaGraphExecDestroy(graph_all_);     graph_all_     = nullptr; }
+        if (graph_prelude_) { cudaGraphExecDestroy(graph_prelude_); graph_prelude_ = nullptr; }
+        if (!asym && graph_postlude_) {
+            cudaGraphExecDestroy(graph_postlude_);
+            graph_postlude_ = nullptr;
+        }
     }
     if (runtimes_.size() >= 2) {
         cudaSetDevice(runtimes_[1].device);
-        if (graph_core_)     { cudaGraphExecDestroy(graph_core_);     graph_core_     = nullptr; }
+        if (graph_core_) { cudaGraphExecDestroy(graph_core_); graph_core_ = nullptr; }
+        if (asym && graph_postlude_) {
+            cudaGraphExecDestroy(graph_postlude_);
+            graph_postlude_ = nullptr;
+        }
     }
     graphs_ready_ = false;
 }
@@ -159,13 +167,83 @@ void Inkling2LoopModel::load(const std::string & gguf_path,
         cfg_.n_slots    = cfg_.n_phys;
     }
 
-    // 1-GPU: all on gpu_ids[0]. 2+-GPU: loop-resident 2-GPU split (GPU0 = prelude+postlude+embd/out, GPU1 = entire looped core!).
+    // 1-GPU: all on gpu_ids[0].
+    // 2+-GPU:
+    //   - symmetric (postlude_split_ip_ < 0): GPU0 = prelude + postlude + embd/out, GPU1 = entire looped core
+    //   - asymmetric (postlude_split_ip_ >= core_end): when GPU1 cannot fit the looped core (e.g. 16 GiB P100 +
+    //     6 GiB GTX 1060), keep embd + prelude + looped core + [core_end, postlude_split_ip_) on GPU0 and place
+    //     [postlude_split_ip_, n_phys) + output head on GPU1 (only 1 GPU-to-GPU hop per token!).
     const bool two_gpu = (gpu_ids.size() >= 2 && cfg_.n_passes > 1);
+    postlude_split_ip_ = -1;
     runtimes_.resize(two_gpu ? 2 : 1);
     runtimes_[0].device = gpu_ids[0];
     if (two_gpu) runtimes_[1].device = gpu_ids[1];
 
+    const int d_kv = cfg_.n_head_kv * cfg_.head_dim; // 1024
+    auto kv_bytes_for = [&](int cap) -> size_t {
+        if (kv_q8_0) return static_cast<size_t>(cap) * (d_kv / 32) * sizeof(BlockQ8_0);
+        return static_cast<size_t>(cap) * d_kv * sizeof(uint16_t);
+    };
+
     if (two_gpu) {
+        auto tbytes = [&](const std::string & name) -> size_t {
+            auto loc = sg.find_tensor(name);
+            return loc.info ? loc.info->nbytes : 0;
+        };
+        std::vector<size_t> layer_b(cfg_.n_phys, 0);
+        for (int ip = 0; ip < cfg_.n_phys; ++ip) {
+            const std::string p = "blk." + std::to_string(ip) + ".";
+            size_t b = 12ULL * 1024 * 1024; // norms/convs/loop-ctrl overhead
+            b += tbytes(p + "ffn_gate_up_exps.weight") + tbytes(p + "ffn_down_exps.weight");
+            b += tbytes(p + "attn_q.weight") + tbytes(p + "attn_k.weight") + tbytes(p + "attn_v.weight");
+            b += tbytes(p + "attn_output.weight") + tbytes(p + "attn_gate.weight");
+            layer_b[ip] = b;
+        }
+        const size_t embd_b = tbytes("token_embd.weight");
+        const size_t out_b  = tbytes("output.weight");
+        size_t core_b = 0;
+        for (int ip = cfg_.core_start; ip < cfg_.core_end; ++ip) core_b += layer_b[ip];
+
+        size_t free0 = 0, tot0 = 0, free1 = 0, tot1 = 0;
+        cudaSetDevice(runtimes_[0].device); cudaMemGetInfo(&free0, &tot0);
+        cudaSetDevice(runtimes_[1].device); cudaMemGetInfo(&free1, &tot1);
+        const size_t core_margin = 1400ULL * 1024 * 1024;
+        if (free1 < core_b + core_margin) {
+            // Pick largest split_ip in [core_end, n_phys-1] that fits both GPUs with SoA staging + KV headroom
+            const size_t headroom0 = 1536ULL * 1024 * 1024;
+            const size_t headroom1 = 1280ULL * 1024 * 1024;
+            int best_s = -1;
+            for (int s = cfg_.n_phys - 1; s >= cfg_.core_end; --s) {
+                size_t g0 = embd_b, g1 = out_b;
+                for (int ip = 0; ip < s; ++ip) g0 += layer_b[ip];
+                for (int ip = s; ip < cfg_.n_phys; ++ip) g1 += layer_b[ip];
+                size_t kv0 = 0, kv1 = 0;
+                for (int il = 0; il < cfg_.n_slots; ++il) {
+                    const int ip = (il < cfg_.n_phys)
+                        ? il : (cfg_.core_start + (il - cfg_.n_phys) % (cfg_.core_end - cfg_.core_start));
+                    const size_t kb = 2 * kv_bytes_for(cfg_.is_swa[ip] ? cfg_.swa_cap : cfg_.max_ctx);
+                    if (ip < s) kv0 += kb; else kv1 += kb;
+                }
+                if (g0 + kv0 + headroom0 <= free0 && g1 + kv1 + headroom1 <= free1) {
+                    best_s = s;
+                    break;
+                }
+            }
+            if (best_s < 0) {
+                // Fallback: minimize max fraction of free VRAM across the two GPUs
+                double best_ratio = 1e9;
+                for (int s = cfg_.core_end; s < cfg_.n_phys; ++s) {
+                    size_t g0 = embd_b, g1 = out_b;
+                    for (int ip = 0; ip < s; ++ip) g0 += layer_b[ip];
+                    for (int ip = s; ip < cfg_.n_phys; ++ip) g1 += layer_b[ip];
+                    const double r = std::max(static_cast<double>(g0) / std::max<size_t>(1, free0),
+                                              static_cast<double>(g1) / std::max<size_t>(1, free1));
+                    if (r < best_ratio) { best_ratio = r; best_s = s; }
+                }
+            }
+            postlude_split_ip_ = best_s;
+        }
+
         int can01 = 0, can10 = 0;
         cudaDeviceCanAccessPeer(&can01, runtimes_[0].device, runtimes_[1].device);
         cudaDeviceCanAccessPeer(&can10, runtimes_[1].device, runtimes_[0].device);
@@ -173,8 +251,14 @@ void Inkling2LoopModel::load(const std::string & gguf_path,
         if (can10) { cudaSetDevice(runtimes_[1].device); cudaDeviceEnablePeerAccess(runtimes_[0].device, 0); cudaGetLastError(); }
     }
 
+    const bool asym = (two_gpu && postlude_split_ip_ >= 0);
+    const size_t head_rt_idx = asym ? 1 : 0;
+
     auto phys_dev = [&](int ip) -> int {
         if (!two_gpu) return runtimes_[0].device;
+        if (asym) {
+            return (ip >= postlude_split_ip_) ? runtimes_[1].device : runtimes_[0].device;
+        }
         return (ip >= cfg_.core_start && ip < cfg_.core_end) ? runtimes_[1].device : runtimes_[0].device;
     };
 
@@ -186,12 +270,6 @@ void Inkling2LoopModel::load(const std::string & gguf_path,
     conv_v_.assign(cfg_.n_slots, nullptr);
     conv_attn_.assign(cfg_.n_slots, nullptr);
     conv_ffn_.assign(cfg_.n_slots, nullptr);
-
-    const int d_kv = cfg_.n_head_kv * cfg_.head_dim; // 1024
-    auto kv_bytes_for = [&](int cap) -> size_t {
-        if (kv_q8_0) return static_cast<size_t>(cap) * (d_kv / 32) * sizeof(BlockQ8_0);
-        return static_cast<size_t>(cap) * d_kv * sizeof(uint16_t);
-    };
 
     // Parallel weight upload across the 1 or 2 active GPUs
     std::vector<std::thread> load_threads;
@@ -205,6 +283,8 @@ void Inkling2LoopModel::load(const std::string & gguf_path,
                 if (gi == 0) {
                     tok_embd_         = pool_.upload(sg, "token_embd.weight",       dev, false);
                     tok_norm_         = pool_.upload(sg, "token_embd_norm.weight",  dev, false);
+                }
+                if (gi == head_rt_idx) {
                     output_res_query_ = pool_.upload(sg, "output_res_query.weight", dev, false);
                     output_norm_      = pool_.upload(sg, "output_norm.weight",      dev, false);
                     output_           = pool_.upload(sg, "output.weight",           dev, false);
@@ -357,6 +437,8 @@ void Inkling2LoopModel::load(const std::string & gguf_path,
         rt.d_pos        = dev_alloc<int32_t>(dev, B);
         if (gi == 0) {
             rt.d_tokens = dev_alloc<int32_t>(dev, B);
+        }
+        if (gi == head_rt_idx) {
             rt.d_logits = dev_alloc<float>(dev, cfg_.n_vocab_padded);
             rt.d_argmax = dev_alloc<int32_t>(dev, 1);
         }
@@ -375,6 +457,13 @@ void Inkling2LoopModel::load(const std::string & gguf_path,
     for (size_t gi = 0; gi < runtimes_.size(); ++gi) {
         std::printf(" GPU%d(%.2f GiB weights)", runtimes_[gi].device,
                     pool_.bytes_on_device(runtimes_[gi].device) / (1024.0 * 1024.0 * 1024.0));
+    }
+    if (runtimes_.size() >= 2) {
+        if (postlude_split_ip_ >= 0) {
+            std::printf(" [asym:0..%d->%d..%d]", postlude_split_ip_ - 1, postlude_split_ip_, cfg_.n_phys - 1);
+        } else {
+            std::printf(" [sym:core-on-gpu1]");
+        }
     }
     std::printf(" | ctx=%d (SWA cap=%d, KV=%s)\n", cfg_.max_ctx, cfg_.swa_cap, kv_q8_0 ? "Q8_0" : "F16");
 }
@@ -622,7 +711,7 @@ void Inkling2LoopModel::run_prelude(int T, int kv_len_max) {
 }
 
 void Inkling2LoopModel::run_core(int T, int kv_len_max) {
-    auto & rt = (runtimes_.size() >= 2) ? runtimes_[1] : runtimes_[0];
+    auto & rt = (runtimes_.size() >= 2 && postlude_split_ip_ < 0) ? runtimes_[1] : runtimes_[0];
     cudaSetDevice(rt.device);
     const int H = cfg_.n_embd;
     const size_t TH_bytes = static_cast<size_t>(T) * H * sizeof(float);
@@ -648,13 +737,25 @@ void Inkling2LoopModel::run_core(int T, int kv_len_max) {
     }
 }
 
-void Inkling2LoopModel::run_postlude_and_head(int T, bool run_argmax, int kv_len_max) {
+void Inkling2LoopModel::run_postlude_prefix(int T, int kv_len_max) {
+    if (postlude_split_ip_ <= cfg_.core_end) return;
     auto & rt = runtimes_[0];
     cudaSetDevice(rt.device);
-    const int H = cfg_.n_embd;
-    int n_blocks = cfg_.core_end / cfg_.attn_res_block_size; // 3 for core_end=18
+    int n_blocks = cfg_.core_end / cfg_.attn_res_block_size;
+    for (int ip = cfg_.core_end; ip < postlude_split_ip_; ++ip) {
+        run_layer(rt, ip, ip, T, n_blocks, false, kv_len_max);
+    }
+}
 
-    for (int ip = cfg_.core_end; ip < cfg_.n_phys; ++ip) {
+void Inkling2LoopModel::run_postlude_and_head(int T, bool run_argmax, int kv_len_max) {
+    const bool asym = (runtimes_.size() >= 2 && postlude_split_ip_ >= 0);
+    auto & rt = asym ? runtimes_[1] : runtimes_[0];
+    cudaSetDevice(rt.device);
+    const int H = cfg_.n_embd;
+    const int start_ip = asym ? postlude_split_ip_ : cfg_.core_end;
+    int n_blocks = (start_ip + cfg_.attn_res_block_size - 1) / cfg_.attn_res_block_size;
+
+    for (int ip = start_ip; ip < cfg_.n_phys; ++ip) {
         run_layer(rt, ip, ip, T, n_blocks, false, kv_len_max);
     }
 
@@ -693,6 +794,31 @@ void Inkling2LoopModel::capture_decode_graphs() {
         cuda_ok(cudaStreamEndCapture(rt.stream, &g), "end capture all");
         cuda_ok(cudaGraphInstantiate(&graph_all_, g, nullptr, nullptr, 0), "instantiate all");
         cudaGraphDestroy(g);
+    } else if (postlude_split_ip_ >= 0) {
+        auto & rt0 = runtimes_[0];
+        auto & rt1 = runtimes_[1];
+        cuda_ok(cudaSetDevice(rt0.device), "capture 2gpu-asym rt0");
+        cuda_ok(cudaStreamSynchronize(rt0.stream), "sync rt0");
+        {
+            cudaGraph_t g = nullptr;
+            cuda_ok(cudaStreamBeginCapture(rt0.stream, cudaStreamCaptureModeRelaxed), "begin prelude+core");
+            run_prelude(1, 0);
+            run_core(1, 0);
+            run_postlude_prefix(1, 0);
+            cuda_ok(cudaStreamEndCapture(rt0.stream, &g), "end prelude+core");
+            cuda_ok(cudaGraphInstantiate(&graph_prelude_, g, nullptr, nullptr, 0), "inst prelude+core");
+            cudaGraphDestroy(g);
+        }
+        cuda_ok(cudaSetDevice(rt1.device), "capture 2gpu-asym rt1");
+        cuda_ok(cudaStreamSynchronize(rt1.stream), "sync rt1");
+        {
+            cudaGraph_t g = nullptr;
+            cuda_ok(cudaStreamBeginCapture(rt1.stream, cudaStreamCaptureModeRelaxed), "begin postlude");
+            run_postlude_and_head(1, true, 0);
+            cuda_ok(cudaStreamEndCapture(rt1.stream, &g), "end postlude");
+            cuda_ok(cudaGraphInstantiate(&graph_postlude_, g, nullptr, nullptr, 0), "inst postlude");
+            cudaGraphDestroy(g);
+        }
     } else {
         auto & rt0 = runtimes_[0];
         auto & rt1 = runtimes_[1];
@@ -755,6 +881,29 @@ void Inkling2LoopModel::forward(const std::vector<int32_t> & tokens,
 
     if (runtimes_.size() == 1) {
         run_single_gpu_all(T, false, kv_len_max);
+    } else if (postlude_split_ip_ >= 0) {
+        auto & rt1 = runtimes_[1];
+        const size_t TH_bytes = static_cast<size_t>(T) * cfg_.n_embd * sizeof(float);
+        const int n_total_blk = (postlude_split_ip_ + cfg_.attn_res_block_size - 1) / cfg_.attn_res_block_size;
+
+        cuda_ok(cudaSetDevice(rt1.device), "fwd asym setDevice1");
+        cuda_ok(cudaMemcpyAsync(rt1.d_pos, positions.data(), T * sizeof(int32_t), cudaMemcpyHostToDevice, rt1.stream), "copy pos1");
+
+        // Stage 0: Prelude + Looped Core (all 3 passes!) + Postlude prefix on GPU 0
+        run_prelude(T, kv_len_max);
+        run_core(T, kv_len_max);
+        run_postlude_prefix(T, kv_len_max);
+        cuda_ok(cudaStreamSynchronize(rt0.stream), "sync pre+core");
+
+        // Single Hop: GPU0 -> GPU1 (cur, blocks[0..n_total_blk-1])
+        cuda_ok(cudaSetDevice(rt1.device), "asym hop setDevice1");
+        cuda_ok(cudaMemcpyPeerAsync(rt1.d_cur, rt1.device, rt0.d_cur, rt0.device, TH_bytes, rt1.stream), "asym hop cur");
+        for (int b = 0; b < n_total_blk; ++b) {
+            cuda_ok(cudaMemcpyPeerAsync(rt1.d_blocks[b], rt1.device, rt0.d_blocks[b], rt0.device, TH_bytes, rt1.stream), "asym hop blk");
+        }
+
+        // Stage 1: Postlude tail + Output Head on GPU 1
+        run_postlude_and_head(T, false, kv_len_max);
     } else {
         auto & rt1 = runtimes_[1];
         const size_t TH_bytes = static_cast<size_t>(T) * cfg_.n_embd * sizeof(float);
@@ -792,12 +941,13 @@ void Inkling2LoopModel::forward(const std::vector<int32_t> & tokens,
         run_postlude_and_head(T, false, kv_len_max);
     }
 
+    auto & head_rt = (runtimes_.size() >= 2 && postlude_split_ip_ >= 0) ? runtimes_[1] : runtimes_[0];
     out_logits.resize(cfg_.n_vocab_unpadded);
-    cuda_ok(cudaSetDevice(rt0.device), "fwd readout setDevice0");
-    cuda_ok(cudaMemcpyAsync(out_logits.data(), rt0.d_logits,
+    cuda_ok(cudaSetDevice(head_rt.device), "fwd readout setDevice");
+    cuda_ok(cudaMemcpyAsync(out_logits.data(), head_rt.d_logits,
                             static_cast<size_t>(cfg_.n_vocab_unpadded) * sizeof(float),
-                            cudaMemcpyDeviceToHost, rt0.stream), "copy logits");
-    cuda_ok(cudaStreamSynchronize(rt0.stream), "fwd sync");
+                            cudaMemcpyDeviceToHost, head_rt.stream), "copy logits");
+    cuda_ok(cudaStreamSynchronize(head_rt.stream), "fwd sync");
 }
 
 int32_t Inkling2LoopModel::forward_decode_greedy(int32_t token, int32_t pos) {
@@ -815,6 +965,35 @@ int32_t Inkling2LoopModel::forward_decode_greedy(int32_t token, int32_t pos) {
             cuda_ok(cudaGraphLaunch(graph_all_, rt0.stream), "launch graph_all");
         } else {
             run_single_gpu_all(1, true, pos + 1);
+        }
+    } else if (postlude_split_ip_ >= 0) {
+        auto & rt1 = runtimes_[1];
+        const size_t H_bytes  = static_cast<size_t>(cfg_.n_embd) * sizeof(float);
+        const int n_total_blk = (postlude_split_ip_ + cfg_.attn_res_block_size - 1) / cfg_.attn_res_block_size;
+
+        cuda_ok(cudaSetDevice(rt1.device), "dec asym setDevice1");
+        cuda_ok(cudaMemcpyAsync(rt1.d_pos, &pos, sizeof(int32_t), cudaMemcpyHostToDevice, rt1.stream), "dec pos1");
+
+        cuda_ok(cudaSetDevice(rt0.device), "dec asym stage0");
+        if (graphs_ready_ && graph_prelude_) {
+            cuda_ok(cudaGraphLaunch(graph_prelude_, rt0.stream), "launch pre+core");
+        } else {
+            run_prelude(1, pos + 1);
+            run_core(1, pos + 1);
+            run_postlude_prefix(1, pos + 1);
+        }
+        cuda_ok(cudaEventRecord(rt0.done_event, rt0.stream), "rec pre+core");
+
+        cuda_ok(cudaSetDevice(rt1.device), "dec asym stage1");
+        cuda_ok(cudaStreamWaitEvent(rt1.stream, rt0.done_event, 0), "wait pre+core");
+        cuda_ok(cudaMemcpyPeerAsync(rt1.d_cur, rt1.device, rt0.d_cur, rt0.device, H_bytes, rt1.stream), "dec asym cur");
+        for (int b = 0; b < n_total_blk; ++b) {
+            cuda_ok(cudaMemcpyPeerAsync(rt1.d_blocks[b], rt1.device, rt0.d_blocks[b], rt0.device, H_bytes, rt1.stream), "dec asym blk");
+        }
+        if (graphs_ready_ && graph_postlude_) {
+            cuda_ok(cudaGraphLaunch(graph_postlude_, rt1.stream), "launch postlude");
+        } else {
+            run_postlude_and_head(1, true, pos + 1);
         }
     } else {
         auto & rt1 = runtimes_[1];
@@ -852,22 +1031,23 @@ int32_t Inkling2LoopModel::forward_decode_greedy(int32_t token, int32_t pos) {
         else run_postlude_and_head(1, true, pos + 1);
     }
 
+    auto & head_rt = (runtimes_.size() >= 2 && postlude_split_ip_ >= 0) ? runtimes_[1] : runtimes_[0];
     int32_t next_tok = 0;
-    cuda_ok(cudaSetDevice(rt0.device), "dec readout");
-    cuda_ok(cudaMemcpyAsync(&next_tok, rt0.d_argmax, sizeof(int32_t), cudaMemcpyDeviceToHost, rt0.stream), "copy argmax");
-    cuda_ok(cudaStreamSynchronize(rt0.stream), "dec sync");
+    cuda_ok(cudaSetDevice(head_rt.device), "dec readout");
+    cuda_ok(cudaMemcpyAsync(&next_tok, head_rt.d_argmax, sizeof(int32_t), cudaMemcpyDeviceToHost, head_rt.stream), "copy argmax");
+    cuda_ok(cudaStreamSynchronize(head_rt.stream), "dec sync");
     return next_tok;
 }
 
 void Inkling2LoopModel::forward_decode_logits(int32_t token, int32_t pos, std::vector<float> & out_logits) {
     forward_decode_greedy(token, pos);
-    auto & rt0 = runtimes_[0];
+    auto & head_rt = (runtimes_.size() >= 2 && postlude_split_ip_ >= 0) ? runtimes_[1] : runtimes_[0];
     out_logits.resize(cfg_.n_vocab_unpadded);
-    cuda_ok(cudaSetDevice(rt0.device), "dec logits setDevice0");
-    cuda_ok(cudaMemcpyAsync(out_logits.data(), rt0.d_logits,
+    cuda_ok(cudaSetDevice(head_rt.device), "dec logits setDevice");
+    cuda_ok(cudaMemcpyAsync(out_logits.data(), head_rt.d_logits,
                             static_cast<size_t>(cfg_.n_vocab_unpadded) * sizeof(float),
-                            cudaMemcpyDeviceToHost, rt0.stream), "dec copy logits");
-    cuda_ok(cudaStreamSynchronize(rt0.stream), "dec logits sync");
+                            cudaMemcpyDeviceToHost, head_rt.stream), "dec copy logits");
+    cuda_ok(cudaStreamSynchronize(head_rt.stream), "dec logits sync");
 }
 
 } // namespace rookery

@@ -2745,6 +2745,113 @@ __global__ void inkling2_moe_gate_up_situ_q6_k_soa_kernel(
     }
 }
 
+__device__ __forceinline__ float dot_iq4_nl_row_q8_1(
+    const uint8_t *       __restrict__ row_ptr,
+    const BlockQ8_1_Act * __restrict__ s_x,
+    int K_blocks, int lane) {
+
+    float acc = 0.0f;
+    for (int b = lane; b < K_blocks; b += 32) {
+        const uint8_t * blk = row_ptr + static_cast<size_t>(b) * 18;
+        const uint16_t * p16 = reinterpret_cast<const uint16_t *>(blk);
+        const float d = half_bits_to_f32(__ldg(&p16[0]));
+        const int * x32 = reinterpret_cast<const int *>(s_x[b].qs);
+
+        int sum = 0;
+        #pragma unroll
+        for (int g = 0; g < 4; ++g) {
+            const uint32_t q4 = static_cast<uint32_t>(__ldg(&p16[1 + g * 2]))
+                              | (static_cast<uint32_t>(__ldg(&p16[2 + g * 2])) << 16);
+            const int w0 = static_cast<int>(
+                  static_cast<uint32_t>(static_cast<uint8_t>(__ldg(&kvalues_iq4nl_d[(q4 >>  0) & 0xFu])))
+                | (static_cast<uint32_t>(static_cast<uint8_t>(__ldg(&kvalues_iq4nl_d[(q4 >>  8) & 0xFu]))) << 8)
+                | (static_cast<uint32_t>(static_cast<uint8_t>(__ldg(&kvalues_iq4nl_d[(q4 >> 16) & 0xFu]))) << 16)
+                | (static_cast<uint32_t>(static_cast<uint8_t>(__ldg(&kvalues_iq4nl_d[(q4 >> 24) & 0xFu]))) << 24));
+            const int w1 = static_cast<int>(
+                  static_cast<uint32_t>(static_cast<uint8_t>(__ldg(&kvalues_iq4nl_d[(q4 >>  4) & 0xFu])))
+                | (static_cast<uint32_t>(static_cast<uint8_t>(__ldg(&kvalues_iq4nl_d[(q4 >> 12) & 0xFu]))) << 8)
+                | (static_cast<uint32_t>(static_cast<uint8_t>(__ldg(&kvalues_iq4nl_d[(q4 >> 20) & 0xFu]))) << 16)
+                | (static_cast<uint32_t>(static_cast<uint8_t>(__ldg(&kvalues_iq4nl_d[(q4 >> 28) & 0xFu]))) << 24));
+            sum = dp4a_s32(w0, x32[g], sum);
+            sum = dp4a_s32(w1, x32[4 + g], sum);
+        }
+        acc += (d * s_x[b].d) * static_cast<float>(sum);
+    }
+    return warp_sum(acc);
+}
+
+__global__ void inkling2_moe_gate_up_situ_iq4_nl_kernel(
+    const uint8_t *       __restrict__ gu_exps,
+    const BlockQ8_1_Act * __restrict__ x_q8,
+    const int32_t *       __restrict__ top_ids,
+    float *               __restrict__ act,
+    int ff, int K, int k_used, float beta, float lb) {
+
+    extern __shared__ BlockQ8_1_Act s_x[];
+    const int slot     = blockIdx.y;
+    const int t        = blockIdx.z;
+    const int K_blocks = K >> 5;
+    const int tid      = threadIdx.y * 32 + threadIdx.x;
+    const int nthr     = blockDim.y * 32;
+
+    const int n_i4 = (K_blocks * static_cast<int>(sizeof(BlockQ8_1_Act))) / 16;
+    const int4 * sx_in  = reinterpret_cast<const int4 *>(x_q8 + static_cast<size_t>(t) * K_blocks);
+    int4 *       sx_out = reinterpret_cast<int4 *>(s_x);
+    for (int i = tid; i < n_i4; i += nthr) sx_out[i] = sx_in[i];
+    __syncthreads();
+
+    const int row = blockIdx.x * blockDim.y + threadIdx.y;
+    if (row >= ff) return;
+
+    const int lane = threadIdx.x;
+    const int eid  = top_ids[static_cast<size_t>(t) * k_used + slot];
+    const size_t row_bytes = static_cast<size_t>(K_blocks) * 18;
+    const uint8_t * g_row = gu_exps + (static_cast<size_t>(eid) * (2 * ff) + row)      * row_bytes;
+    const uint8_t * u_row = gu_exps + (static_cast<size_t>(eid) * (2 * ff) + ff + row) * row_bytes;
+
+    const float ag = dot_iq4_nl_row_q8_1(g_row, s_x, K_blocks, lane);
+    const float au = dot_iq4_nl_row_q8_1(u_row, s_x, K_blocks, lane);
+    if (lane == 0) {
+        act[(static_cast<size_t>(t) * k_used + slot) * ff + row] = inkling_situ_act(ag, au, beta, lb);
+    }
+}
+
+__global__ void inkling2_moe_down_iq4_nl_kernel(
+    const uint8_t *       __restrict__ dn_exps,
+    const BlockQ8_1_Act * __restrict__ act_q8,
+    const int32_t *       __restrict__ top_ids,
+    const float *         __restrict__ top_w,
+    float *               __restrict__ out,
+    int K, int ff, int k_used) {
+
+    extern __shared__ BlockQ8_1_Act s_a[];
+    const int t       = blockIdx.y;
+    const int row     = blockIdx.x * blockDim.y + threadIdx.y;
+    const int ff_blks = ff >> 5;
+    const int tid     = threadIdx.y * 32 + threadIdx.x;
+    const int nthr    = blockDim.y * 32;
+    const int lane    = threadIdx.x;
+    const int n_i4    = (ff_blks * static_cast<int>(sizeof(BlockQ8_1_Act))) / 16;
+    const size_t row_bytes = static_cast<size_t>(ff_blks) * 18;
+
+    float total = 0.0f;
+    for (int slot = 0; slot < k_used; ++slot) {
+        const int4 * src = reinterpret_cast<const int4 *>(act_q8 + (static_cast<size_t>(t) * k_used + slot) * ff_blks);
+        int4 *       dst = reinterpret_cast<int4 *>(s_a);
+        for (int i = tid; i < n_i4; i += nthr) dst[i] = src[i];
+        __syncthreads();
+
+        if (row < K) {
+            const int   eid = top_ids[static_cast<size_t>(t) * k_used + slot];
+            const float ew  = top_w  [static_cast<size_t>(t) * k_used + slot];
+            const uint8_t * d_row = dn_exps + (static_cast<size_t>(eid) * K + row) * row_bytes;
+            total += ew * dot_iq4_nl_row_q8_1(d_row, s_a, ff_blks, lane);
+        }
+        __syncthreads();
+    }
+    if (row < K && lane == 0) out[static_cast<size_t>(t) * K + row] = total;
+}
+
 __global__ void inkling2_moe_down_q8_0_soa_kernel(
     const int4 *          __restrict__ dn_q,
     const uint16_t *      __restrict__ dn_s,
@@ -2825,7 +2932,10 @@ void launch_inkling2_moe_ffn_kquant(
             gup, xq8, d_top_ids, act, ff, K, k_used, situ_beta, situ_linear_beta);
     };
 
-    if (gate_up_exps.dtype == DType::Q6_K && gate_up_exps.is_soa) {
+    if (gate_up_exps.dtype == DType::IQ4_NL) {
+        inkling2_moe_gate_up_situ_iq4_nl_kernel<<<gu_grid, dim3(32, wpb), gu_smem, stream>>>(
+            gup, xq8, d_top_ids, act, ff, K, k_used, situ_beta, situ_linear_beta);
+    } else if (gate_up_exps.dtype == DType::Q6_K && gate_up_exps.is_soa) {
         inkling2_moe_gate_up_situ_q6_k_soa_kernel<<<gu_grid, dim3(32, wpb), gu_smem, stream>>>(
             static_cast<const int4 *>(gate_up_exps.ptr), static_cast<const int4 *>(gate_up_exps.aux_ptr),
             static_cast<const int8_t *>(gate_up_exps.scales_ptr), static_cast<const uint16_t *>(gate_up_exps.d_ptr),
@@ -2854,7 +2964,10 @@ void launch_inkling2_moe_ffn_kquant(
             dp, nullptr, nullptr, nullptr, nullptr, aq8, nullptr, d_top_ids, d_top_w, d_out, K, ff, 0, k_used);
     };
 
-    if (down_exps.dtype == DType::Q8_0 && down_exps.is_soa) {
+    if (down_exps.dtype == DType::IQ4_NL) {
+        inkling2_moe_down_iq4_nl_kernel<<<dn_grid, dim3(32, wpb), dn_smem, stream>>>(
+            dp, aq8, d_top_ids, d_top_w, d_out, K, ff, k_used);
+    } else if (down_exps.dtype == DType::Q8_0 && down_exps.is_soa) {
         inkling2_moe_down_q8_0_soa_kernel<<<dn_grid, dim3(32, wpb), dn_smem, stream>>>(
             static_cast<const int4 *>(down_exps.ptr), static_cast<const uint16_t *>(down_exps.scales_ptr),
             aq8, d_top_ids, d_top_w, d_out, K, ff, k_used);
