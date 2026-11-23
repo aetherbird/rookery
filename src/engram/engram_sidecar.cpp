@@ -37,6 +37,7 @@ T * pin_alloc(size_t n) {
 
 EngramSidecar::~EngramSidecar() {
     close_calibration_dump();
+    close_tail_ce_dump();
     free_gpu_buffers();
 }
 
@@ -298,6 +299,66 @@ void EngramSidecar::close_calibration_dump() {
 }
 
 namespace {
+inline uint16_t f32_to_f16_bits(float v) {
+    uint32_t x;
+    std::memcpy(&x, &v, 4);
+    uint32_t sign = (x >> 16) & 0x8000u;
+    int32_t  exp  = static_cast<int32_t>((x >> 23) & 0xFFu) - 127 + 15;
+    uint32_t mant = x & 0x7FFFFFu;
+    if (exp <= 0) {
+        if (exp < -10) return static_cast<uint16_t>(sign);
+        mant |= 0x800000u;
+        uint32_t t = 14 - exp;
+        uint32_t half_m = (mant + (1u << (t - 1))) >> t;
+        return static_cast<uint16_t>(sign | half_m);
+    }
+    if (exp >= 31) return static_cast<uint16_t>(sign | 0x7BFFu); // clamp finite max
+    uint32_t rounded = (mant + 0x00000FFFu + ((mant >> 13) & 1u));
+    if (rounded & 0x00800000u) { rounded = 0; ++exp; if (exp >= 31) return static_cast<uint16_t>(sign | 0x7BFFu); }
+    return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp) << 10) | (rounded >> 13));
+}
+} // namespace
+
+void EngramSidecar::enable_tail_ce_dump(const std::string & out_path, int target_host_layer) {
+    close_tail_ce_dump();
+    ce_target_layer_ = target_host_layer;
+    ce_tokens_       = 0;
+    ce_rolling_text_.clear();
+    ce_host_ends_.clear();
+
+    ce_fp_ = std::fopen(out_path.c_str(), "wb");
+    if (!ce_fp_) throw std::runtime_error("Failed to open tail-CE dump path: " + out_path);
+
+    // "RKCE" v1 header:
+    // magic[4], version(u32=1), n_eng_layers(u32), d_engram(u32), d_host(u32), hc(u32), target_layer(i32), n_tokens(u64)
+    const char magic[4] = {'R', 'K', 'C', 'E'};
+    uint32_t hdr[6] = {
+        1u,
+        static_cast<uint32_t>(std::max(1, table_.cfg().n_layers)),
+        static_cast<uint32_t>(table_.cfg().engram_dim()),
+        static_cast<uint32_t>(d_host_),
+        static_cast<uint32_t>(hc_),
+        static_cast<uint32_t>(target_host_layer)
+    };
+    uint64_t zero_tok = 0;
+    std::fwrite(magic, 1, 4, ce_fp_);
+    std::fwrite(hdr, sizeof(uint32_t), 6, ce_fp_);
+    std::fwrite(&zero_tok, sizeof(uint64_t), 1, ce_fp_);
+    std::printf("EngramSidecar tail-CE dump enabled (layer=%d, n_eng_layers=%u, d_engram=%u, hc=%u, d_host=%u) -> %s\n",
+                target_host_layer, hdr[1], hdr[2], hdr[4], hdr[3], out_path.c_str());
+}
+
+void EngramSidecar::close_tail_ce_dump() {
+    if (!ce_fp_) return;
+    std::fseek(ce_fp_, 28, SEEK_SET);
+    std::fwrite(&ce_tokens_, sizeof(uint64_t), 1, ce_fp_);
+    std::fclose(ce_fp_);
+    ce_fp_ = nullptr;
+    std::printf("EngramSidecar tail-CE dump closed (%llu tokens written)\n",
+                static_cast<unsigned long long>(ce_tokens_));
+}
+
+namespace {
 
 // Find a BPE pre-tokenizer-safe cut offset in [min_cut, max_cut] so encoding text[cut:]
 // produces exact suffix token IDs identical to encoding full text[0:].
@@ -322,6 +383,60 @@ size_t find_safe_bpe_cut(const std::string & text, size_t min_cut, size_t max_cu
 }
 
 } // namespace
+
+void EngramSidecar::set_tail_ce_targets(const std::vector<int32_t> & targets,
+                                        const std::vector<int32_t> & host_tokens,
+                                        int start_pos) {
+    if (!ce_fp_) return;
+    const int T      = static_cast<int>(host_tokens.size());
+    const int n_eng  = std::max(1, table_.cfg().n_layers);
+    const int d_eng  = table_.cfg().engram_dim();
+    const int n_cols = table_.cfg().n_cols;
+
+    ce_cur_targets_ = targets;
+    if (start_pos == 0) {
+        ce_rolling_text_.clear();
+        ce_host_ends_.clear();
+    }
+
+    // Strictly causal per-token source addressing (100% parity with autoregressive decode!)
+    std::vector<std::vector<int32_t>> layer_rows(n_eng, std::vector<int32_t>(static_cast<size_t>(T) * n_cols));
+    std::vector<std::vector<float>>   layer_val(n_eng,  std::vector<float>(static_cast<size_t>(T) * n_cols));
+    std::vector<int32_t> s_ids;
+    std::vector<float>   s_val;
+
+    for (int i = 0; i < T; ++i) {
+        ce_rolling_text_.append(host_tok_->decode_token(host_tokens[i]));
+        ce_host_ends_.push_back(ce_rolling_text_.size());
+
+        constexpr size_t kMinLookback = 256;
+        constexpr size_t kMinGuard    = 96;
+        size_t cut = 0;
+        if (ce_rolling_text_.size() > kMinLookback + kMinGuard) {
+            cut = find_safe_bpe_cut(ce_rolling_text_,
+                                    ce_rolling_text_.size() - kMinLookback - kMinGuard,
+                                    ce_rolling_text_.size() - kMinGuard);
+        }
+        const auto win_src = (cut > 0)
+            ? table_.tokenizer().encode(ce_rolling_text_.substr(cut), false, false)
+            : table_.tokenizer().encode(ce_rolling_text_, false, false);
+        const int src_idx = std::max(0, static_cast<int>(win_src.size()) - 1);
+
+        for (int e = 0; e < n_eng; ++e) {
+            table_.hash_tokens(e, win_src, src_idx, 1, s_ids, s_val);
+            std::memcpy(layer_rows[e].data() + static_cast<size_t>(i) * n_cols, s_ids.data(), n_cols * sizeof(int32_t));
+            std::memcpy(layer_val[e].data()  + static_cast<size_t>(i) * n_cols, s_val.data(), n_cols * sizeof(float));
+        }
+    }
+
+    ce_cur_e_f16_.assign(n_eng, std::vector<uint16_t>(static_cast<size_t>(T) * d_eng));
+    std::vector<float> tmp_e(static_cast<size_t>(T) * d_eng);
+    for (int e = 0; e < n_eng; ++e) {
+        table_.prefetch_rows(layer_rows[e].data(), static_cast<int>(layer_rows[e].size()));
+        table_.gather_dequant_f32(layer_rows[e].data(), layer_val[e].data(), T, tmp_e.data());
+        for (size_t k = 0; k < tmp_e.size(); ++k) ce_cur_e_f16_[e][k] = f32_to_f16_bits(tmp_e[k]);
+    }
+}
 
 bool EngramSidecar::verify_incremental_addressing(const std::vector<int32_t> & host_tokens,
                                                   int & out_tokens_checked,
@@ -592,6 +707,26 @@ void EngramSidecar::on_post_layer(int layer_idx, int device, float * d_inpL, int
     if (layer_idx < 0 || static_cast<size_t>(layer_idx) >= layer_to_hook_.size()) return;
 
     const int d_eng = table_.cfg().engram_dim();
+
+    // Optional RKCE tail-CE dump at target layer (full [T, hc, d_host] FP16 + causal e_raw for all Engram layers)
+    if (ce_fp_ != nullptr && layer_idx == ce_target_layer_) {
+        const size_t n_h = static_cast<size_t>(n_tokens) * hc * n_embd;
+        ce_h_tmp_.resize(n_h);
+        cuda_ok(cudaMemcpyAsync(ce_h_tmp_.data(), d_inpL, n_h * sizeof(float), cudaMemcpyDeviceToHost, stream), "engram ce D2H");
+        cuda_ok(cudaStreamSynchronize(stream), "engram ce sync");
+
+        std::vector<uint16_t> h_f16(n_h);
+        for (size_t k = 0; k < n_h; ++k) h_f16[k] = f32_to_f16_bits(ce_h_tmp_[k]);
+
+        const int32_t nt = n_tokens;
+        std::fwrite(&nt, sizeof(int32_t), 1, ce_fp_);
+        std::fwrite(ce_cur_targets_.data(), sizeof(int32_t), n_tokens, ce_fp_);
+        std::fwrite(h_f16.data(), sizeof(uint16_t), n_h, ce_fp_);
+        for (const auto & ef : ce_cur_e_f16_) {
+            std::fwrite(ef.data(), sizeof(uint16_t), ef.size(), ce_fp_);
+        }
+        ce_tokens_ += static_cast<uint64_t>(n_tokens);
+    }
 
     // If dump_delta_ is active and this layer is L+1 for some hook, compute H_{L+1} - H_L and write pair!
     if (dump_fp_ != nullptr && dump_delta_ &&

@@ -90,8 +90,41 @@ Evaluated with the auto-gated RKAD v2 adapter (`L1` active at `lam=2.0`, `L14` a
 
 ---
 
+## 5. Level-3 Supervised Gated Bridge (`L44` CE + Host-KL) & Factual QA Eval
+
+Trained a tiny gated RKAD v2 bridge (`src_layer=0 → host L44`, right before `hc_head + output_norm + lm_head`, `rank=128`, `has_gate=1`, `centered=yes`, ~4.2M params) via `scripts/train_engram_bridge.py` on `45,000` strictly-causal tokens (`RKCE v1` dump from technical/open-source docs, **zero factual QA overlap**), optimizing `CE(next_token) + 0.5 * KL(p_base || p_grafted)` in `45.8 s` on a single RTX 3090:
+
+- **Validation comparison (4,498 held-out tokens):**
+  - `src_layer=0 → L44` (DeepSeek L1): `val PPL 3.090 → 3.068` (`-0.021`, `top1 79.52% → 79.84%`, `SHUF − REAL = +0.048` at epoch 2)
+  - `src_layer=1 → L44` (DeepSeek L14): `val PPL 3.090 → 3.086` (`-0.004`, `SHUF − REAL = +0.016`) — independently confirming DeepSeek's L1 table transfers ~4× more strongly than L14.
+
+### 4-Way `rookery_engram_test` Results (`src_layer=0 → L44`, Gated RKAD v2)
+
+#### A. `EVAL_FACTUAL` (60 held-out factual QA items — capitals, elements, constants, history, literature, science)
+
+| Condition | `global_scale` | `ans_NLL` | **`ans_PPL`** | vs Base | Exact First-Tok Top-1 | Answer Tok Top-1 | Shuffled − Real PPL |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `[BASE]` (no hook) | — | `0.33659` | `1.400` | — | `91.7%` (`55/60`) | `94.3%` | — |
+| `[DISABLED]` | `0.00` | `0.33659` | `1.400` | `+0.000000` | `91.7%` | `94.3%` | — |
+| `[REAL]` | `0.50` | `0.33044` | `1.392` | `-0.0086` | `91.7%` | `94.3%` | **`+0.0111`** (Real wins) |
+| `[REAL]` | `1.00` | `0.32826` | `1.389` | `-0.0116` | `91.7%` | `94.3%` | **`+0.0245`** (Real wins) |
+| `[REAL]` | `1.50` | `0.32367` | **`1.382`** | **`-0.0180`** | **`93.3%`** (`56/60`) | **`95.2%`** | **`+0.0396`** (Real wins) |
+
+*(Shuffled `ans_PPL` degraded monotonically: `1.403 → 1.413 → 1.422`, staying at `91.7%` / `94.3%`.)*
+
+#### B. `EVAL_TECH` & `EVAL_PROSE` (2,048 tokens each, apples-to-apples vs Level-2 Ridge)
+
+| Eval Corpus | `[BASE]` PPL | Level-2 `L1` Ridge Best | Level-3 `L44` Gated (`scale=0.5 / 1.0`) | Level-3 `[SHUFFLED]` | Notes |
+|---|---:|---:|---:|---:|---|
+| **`EVAL_TECH`** (2,048 tok) | `12.746` | **`12.571`** (`-0.175`) | **`12.631`** (`-0.115`, `top5 76.51%`) | `12.709` (`+0.078` gap) | Beats Base & Shuffled at `0.5` & `1.0` |
+| **`EVAL_PROSE`** (OOD, 2,048 tok) | `4.759` | **`4.725`** (`-0.034`, `top1 +0.63%`) | `4.776` (`+0.017`) | `4.771` (`-0.005`) | Tech-only 45K train set + `dropout=0` overfit prose |
+
+---
+
 ## Honest Takeaways
 
-1. **Mechanical & latency viability is proven on real hardware:** 100.00% causal addressing parity, exact `0.000000` disabled-hook invariance, and **1.14% decode / 1.24% prefill** measured overhead (`~0.5%` with 1 active hook) against a 103 GiB `mmap` table.
-2. **Real cross-model transfer is verified at Layer 1, not Layer 14:** With mean-centering + held-out validation auto-gating, `L1` generalizes (`val R² = +0.134`), beats both `Base` and `Shuffled` across all 4 scales on 2,048 unseen tech tokens (up to `+0.644` PPL separation vs shuffled), and improves both PPL (`4.759 → 4.725`) and Top-1 (`72.51% → 73.14%`) on 2,048 OOD prose tokens at `scale=0.5`.
-3. **Clear boundary of linear Level-2 calibration:** Un-gated linear Ridge has a narrow safe operating range on OOD text (`scale ~ 0.5`; pushing `scale >= 1.0` hurts OOD PPL) and produces modest PPL gains (`-0.03` to `-0.18`). Moving beyond this requires **supervised gated bridge training** (next-token CE + host-KL regularization) with learned context-dependent gating so the bridge suppresses OOD noise while extracting stronger factual/domain signal.
+1. **Mechanical & latency viability is proven on real hardware:** 100.00% causal addressing parity, exact `0.000000` disabled-hook invariance, and **1.14% decode / 1.24% prefill** measured overhead (`~0.5%–1.08%` with 1 active hook) against a 103 GiB `mmap` table.
+2. **Real cross-model transfer is verified in BOTH Level-2 (`L1`) and Level-3 (`L44`):**
+   - Level-2 centered/auto-gated `L1` Ridge improves `EVAL_TECH` (`12.746 → 12.571`) and `EVAL_PROSE` (`4.759 → 4.725`, `top1 +0.63%`).
+   - Level-3 supervised gated `L44` CE+KL improves completely zero-shot **factual QA** monotonically across all scales (`ans_PPL 1.400 → 1.382`, exact answer accuracy `91.7% → 93.3%`, `SHUF − REAL = +0.040`) while shuffled degrades monotonically.
+3. **Clear next levers for stronger Level-3 generalization:** The 45K tech-only training corpus with `dropout=0` began memorizing after epoch 2 (`tr_CE 1.69 → 0.72`) and slightly regressed OOD prose (`+0.017` PPL). Scaling the training mix to `200K+` multi-domain tokens (prose + encyclopedic + tech) with `--dropout 0.3` and combining `L1` (early feature bridge) + `L44` (gated output bridge) is the clear next step before wiring `N × M` models.

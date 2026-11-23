@@ -2401,6 +2401,14 @@ void launch_embedding_kquant(
         embedding_kquant_generic_kernel<DType::Q4_K><<<grid, 32, 0, stream>>>(tbl, d_tokens, d_out, n_embd, hc_mult);
         return;
     }
+    if (tok_embd.dtype == DType::Q3_K) {
+        embedding_kquant_generic_kernel<DType::Q3_K><<<grid, 32, 0, stream>>>(tbl, d_tokens, d_out, n_embd, hc_mult);
+        return;
+    }
+    if (tok_embd.dtype == DType::IQ4_XS) {
+        embedding_kquant_generic_kernel<DType::IQ4_XS><<<grid, 32, 0, stream>>>(tbl, d_tokens, d_out, n_embd, hc_mult);
+        return;
+    }
     throw std::runtime_error("launch_embedding_kquant: unsupported tok_embd dtype");
 }
 
@@ -2626,6 +2634,246 @@ void launch_moe_ffn_kquant_with_shared(
         launch_linear(cublas, down_shexp, sh_g, sh_out, T, sh_rem, sh_rem_b, stream);
         launch_add_inplace(d_out, sh_out, static_cast<int64_t>(T) * K, stream);
     }
+}
+
+namespace {
+
+__device__ __forceinline__ float inkling_situ_act(float g, float u, float beta, float lb) {
+    const float a = beta * tanhf(g / beta) * (1.0f / (1.0f + expf(-g)));
+    const float b = (lb > 0.0f) ? (lb * tanhf(u / lb)) : u;
+    return a * b;
+}
+
+template <DType DT>
+__global__ void inkling2_moe_gate_up_situ_kquant_kernel(
+    const uint8_t *       __restrict__ gu_exps, // [n_expert, 2*ff, K]
+    const BlockQ8_1_Act * __restrict__ x_q8,    // [T, K/32]
+    const int32_t *       __restrict__ top_ids, // [T, k_used]
+    float *               __restrict__ act,     // [T, k_used, ff]
+    int ff, int K, int k_used, float beta, float lb) {
+
+    extern __shared__ BlockQ8_1_Act s_x[];
+    __shared__ uint64_t s_iq2_grid[DT == DType::IQ2_S ? 1024 : (DT == DType::IQ2_XXS ? 256 : 1)];
+
+    const int slot     = blockIdx.y;
+    const int t        = blockIdx.z;
+    const int K_blocks = K >> 5;
+    const int nb       = K >> 8;
+    const int tid      = threadIdx.y * 32 + threadIdx.x;
+    const int nthr     = blockDim.y * 32;
+
+    const BlockQ8_1_Act * x_row = x_q8 + static_cast<size_t>(t) * K_blocks;
+    const int n_i4 = (K_blocks * static_cast<int>(sizeof(BlockQ8_1_Act))) / 16;
+    const int4 * sx_in  = reinterpret_cast<const int4 *>(x_row);
+    int4 *       sx_out = reinterpret_cast<int4 *>(s_x);
+    for (int i = tid; i < n_i4; i += nthr) sx_out[i] = sx_in[i];
+
+    if constexpr (DT == DType::IQ2_S) {
+        for (int i = tid; i < 1024; i += nthr) s_iq2_grid[i] = __ldg(&iq2s_grid_d[i]);
+    } else if constexpr (DT == DType::IQ2_XXS) {
+        for (int i = tid; i < 256; i += nthr) s_iq2_grid[i] = __ldg(&iq2xxs_grid_d[i]);
+    }
+    __syncthreads();
+
+    const int row = blockIdx.x * blockDim.y + threadIdx.y;
+    if (row >= ff) return;
+
+    const int lane = threadIdx.x;
+    const int eid  = top_ids[static_cast<size_t>(t) * k_used + slot];
+    constexpr size_t B = block_bytes_of<DT>();
+    const size_t row_bytes = static_cast<size_t>(nb) * B;
+    const uint8_t * g_row = gu_exps + (static_cast<size_t>(eid) * (2 * ff) + row)      * row_bytes;
+    const uint8_t * u_row = gu_exps + (static_cast<size_t>(eid) * (2 * ff) + ff + row) * row_bytes;
+
+    float ag = 0.0f, au = 0.0f;
+    #pragma unroll 2
+    for (int bi = 0; bi < nb; ++bi) {
+        const BlockQ8_1_Act * xb = s_x + bi * 8;
+        if constexpr (DT == DType::IQ2_S) {
+            ag += dot_iq2_s_sgrid(g_row + static_cast<size_t>(bi) * B, xb, s_iq2_grid, lane);
+            au += dot_iq2_s_sgrid(u_row + static_cast<size_t>(bi) * B, xb, s_iq2_grid, lane);
+        } else if constexpr (DT == DType::IQ2_XXS) {
+            ag += dot_iq2_xxs_sgrid(g_row + static_cast<size_t>(bi) * B, xb, s_iq2_grid, lane);
+            au += dot_iq2_xxs_sgrid(u_row + static_cast<size_t>(bi) * B, xb, s_iq2_grid, lane);
+        } else {
+            ag += dot_kblock_q8_1<DT>(g_row + static_cast<size_t>(bi) * B, xb, lane);
+            au += dot_kblock_q8_1<DT>(u_row + static_cast<size_t>(bi) * B, xb, lane);
+        }
+    }
+    ag = warp_sum(ag);
+    au = warp_sum(au);
+    if (lane == 0) {
+        act[(static_cast<size_t>(t) * k_used + slot) * ff + row] = inkling_situ_act(ag, au, beta, lb);
+    }
+}
+
+__global__ void inkling2_moe_gate_up_situ_q6_k_soa_kernel(
+    const int4 *          __restrict__ W_ql,
+    const int4 *          __restrict__ W_qh,
+    const int8_t *        __restrict__ W_sc,
+    const uint16_t *      __restrict__ W_d,
+    const BlockQ8_1_Act * __restrict__ x_q8,
+    const int32_t *       __restrict__ top_ids,
+    float *               __restrict__ act,
+    int ff, int K, int k_used, float beta, float lb) {
+
+    extern __shared__ BlockQ8_1_Act s_x[];
+    const int slot     = blockIdx.y;
+    const int t        = blockIdx.z;
+    const int K_blocks = K >> 5;
+    const int nb       = K >> 8;
+    const int tid      = threadIdx.y * 32 + threadIdx.x;
+    const int nthr     = blockDim.y * 32;
+
+    const int n_i4 = (K_blocks * static_cast<int>(sizeof(BlockQ8_1_Act))) / 16;
+    const int4 * sx_in  = reinterpret_cast<const int4 *>(x_q8 + static_cast<size_t>(t) * K_blocks);
+    int4 *       sx_out = reinterpret_cast<int4 *>(s_x);
+    for (int i = tid; i < n_i4; i += nthr) sx_out[i] = sx_in[i];
+    __syncthreads();
+
+    const int row = blockIdx.x * blockDim.y + threadIdx.y;
+    if (row >= ff) return;
+
+    const int lane = threadIdx.x;
+    const int eid  = top_ids[static_cast<size_t>(t) * k_used + slot];
+    const size_t g_blk = (static_cast<size_t>(eid) * (2 * ff) + row)      * nb;
+    const size_t u_blk = (static_cast<size_t>(eid) * (2 * ff) + ff + row) * nb;
+    const float ag = dot_q6_k_soa_row_q8_1(W_ql + g_blk * 8, W_qh + g_blk * 4, W_sc + g_blk * 16, W_d + g_blk, s_x, nb, lane);
+    const float au = dot_q6_k_soa_row_q8_1(W_ql + u_blk * 8, W_qh + u_blk * 4, W_sc + u_blk * 16, W_d + u_blk, s_x, nb, lane);
+    if (lane == 0) {
+        act[(static_cast<size_t>(t) * k_used + slot) * ff + row] = inkling_situ_act(ag, au, beta, lb);
+    }
+}
+
+__global__ void inkling2_moe_down_q8_0_soa_kernel(
+    const int4 *          __restrict__ dn_q,
+    const uint16_t *      __restrict__ dn_s,
+    const BlockQ8_1_Act * __restrict__ act_q8,
+    const int32_t *       __restrict__ top_ids,
+    const float *         __restrict__ top_w,
+    float *               __restrict__ out,
+    int K, int ff, int k_used) {
+
+    extern __shared__ BlockQ8_1_Act s_a[];
+    const int t       = blockIdx.y;
+    const int row     = blockIdx.x * blockDim.y + threadIdx.y;
+    const int ff_blks = ff >> 5;
+    const int tid     = threadIdx.y * 32 + threadIdx.x;
+    const int nthr    = blockDim.y * 32;
+    const int lane    = threadIdx.x;
+    const int blk_w   = lane >> 1;
+    const int half    = lane & 1;
+    const int n_i4    = (ff_blks * static_cast<int>(sizeof(BlockQ8_1_Act))) / 16;
+
+    float total = 0.0f;
+    for (int slot = 0; slot < k_used; ++slot) {
+        const int4 * src = reinterpret_cast<const int4 *>(act_q8 + (static_cast<size_t>(t) * k_used + slot) * ff_blks);
+        int4 *       dst = reinterpret_cast<int4 *>(s_a);
+        for (int i = tid; i < n_i4; i += nthr) dst[i] = src[i];
+        __syncthreads();
+
+        if (row < K) {
+            const int   eid = top_ids[static_cast<size_t>(t) * k_used + slot];
+            const float ew  = top_w  [static_cast<size_t>(t) * k_used + slot];
+            const size_t roff = (static_cast<size_t>(eid) * K + row) * ff_blks;
+            const int4 *     dq = dn_q + roff * 2;
+            const uint16_t * ds = dn_s + roff;
+            float acc = 0.0f;
+            for (int b = blk_w; b < ff_blks; b += 16) {
+                const int4 w4 = __ldg(&dq[b * 2 + half]);
+                const int4 a4 = reinterpret_cast<const int4 *>(s_a[b].qs)[half];
+                int si = dp4a_s32(w4.x, a4.x, dp4a_s32(w4.y, a4.y, dp4a_s32(w4.z, a4.z, dp4a_s32(w4.w, a4.w, 0))));
+                __half dh; *reinterpret_cast<uint16_t *>(&dh) = __ldg(&ds[b]);
+                acc += (__half2float(dh) * s_a[b].d) * static_cast<float>(si);
+            }
+            total += ew * warp_sum(acc);
+        }
+        __syncthreads();
+    }
+    if (row < K && lane == 0) out[static_cast<size_t>(t) * K + row] = total;
+}
+
+} // namespace
+
+void launch_inkling2_moe_ffn_kquant(
+    const DeviceTensor & gate_up_exps, const DeviceTensor & down_exps,
+    const float * d_x, const int32_t * d_top_ids, const float * d_top_w,
+    float * d_out, void * d_scratch, size_t scratch_bytes,
+    int T, int k_used, float situ_beta, float situ_linear_beta, cudaStream_t stream) {
+
+    const int K  = static_cast<int>(gate_up_exps.ne[0]);
+    const int ff = static_cast<int>(gate_up_exps.ne[1]) / 2;
+
+    auto align256 = [](size_t n) { return (n + 255) & ~size_t(255); };
+    auto * base = static_cast<uint8_t *>(d_scratch);
+    size_t off = 0;
+    auto * xq8 = reinterpret_cast<BlockQ8_1_Act *>(base + off); off += align256(static_cast<size_t>(T) * (K >> 5) * sizeof(BlockQ8_1_Act));
+    auto * act = reinterpret_cast<float *>        (base + off); off += align256(static_cast<size_t>(T) * k_used * ff * sizeof(float));
+    auto * aq8 = reinterpret_cast<BlockQ8_1_Act *>(base + off); off += align256(static_cast<size_t>(T) * k_used * (ff >> 5) * sizeof(BlockQ8_1_Act));
+    (void) scratch_bytes;
+
+    launch_quantize_q8_1(d_x, xq8, K, T, stream);
+
+    constexpr int wpb = 8;
+    const size_t gu_smem = static_cast<size_t>(K >> 5) * sizeof(BlockQ8_1_Act);
+    dim3 gu_grid((ff + wpb - 1) / wpb, k_used, T);
+    const auto * gup = static_cast<const uint8_t *>(gate_up_exps.ptr);
+
+    auto run_gu = [&](auto dt_tag) {
+        constexpr DType DTG = decltype(dt_tag)::value;
+        inkling2_moe_gate_up_situ_kquant_kernel<DTG><<<gu_grid, dim3(32, wpb), gu_smem, stream>>>(
+            gup, xq8, d_top_ids, act, ff, K, k_used, situ_beta, situ_linear_beta);
+    };
+
+    if (gate_up_exps.dtype == DType::Q6_K && gate_up_exps.is_soa) {
+        inkling2_moe_gate_up_situ_q6_k_soa_kernel<<<gu_grid, dim3(32, wpb), gu_smem, stream>>>(
+            static_cast<const int4 *>(gate_up_exps.ptr), static_cast<const int4 *>(gate_up_exps.aux_ptr),
+            static_cast<const int8_t *>(gate_up_exps.scales_ptr), static_cast<const uint16_t *>(gate_up_exps.d_ptr),
+            xq8, d_top_ids, act, ff, K, k_used, situ_beta, situ_linear_beta);
+    }
+    else if (gate_up_exps.dtype == DType::Q2_K)    run_gu(std::integral_constant<DType, DType::Q2_K>{});
+    else if (gate_up_exps.dtype == DType::Q3_K)    run_gu(std::integral_constant<DType, DType::Q3_K>{});
+    else if (gate_up_exps.dtype == DType::Q4_K)    run_gu(std::integral_constant<DType, DType::Q4_K>{});
+    else if (gate_up_exps.dtype == DType::Q5_K)    run_gu(std::integral_constant<DType, DType::Q5_K>{});
+    else if (gate_up_exps.dtype == DType::IQ4_XS)  run_gu(std::integral_constant<DType, DType::IQ4_XS>{});
+    else if (gate_up_exps.dtype == DType::IQ3_S)   run_gu(std::integral_constant<DType, DType::IQ3_S>{});
+    else if (gate_up_exps.dtype == DType::IQ3_XXS) run_gu(std::integral_constant<DType, DType::IQ3_XXS>{});
+    else if (gate_up_exps.dtype == DType::IQ2_S)   run_gu(std::integral_constant<DType, DType::IQ2_S>{});
+    else if (gate_up_exps.dtype == DType::IQ2_XXS) run_gu(std::integral_constant<DType, DType::IQ2_XXS>{});
+    else throw std::runtime_error("launch_inkling2_moe_ffn_kquant: unsupported gate_up_exps dtype");
+
+    launch_quantize_q8_1(act, aq8, k_used * ff, T, stream);
+
+    dim3 dn_grid((K + wpb - 1) / wpb, T);
+    const size_t dn_smem = static_cast<size_t>(ff >> 5) * sizeof(BlockQ8_1_Act);
+    const auto * dp = static_cast<const uint8_t *>(down_exps.ptr);
+
+    auto run_dn = [&](auto dt_tag) {
+        constexpr DType DTD = decltype(dt_tag)::value;
+        moe_down_kquant_q8_1_kernel<DTD><<<dn_grid, dim3(32, wpb), dn_smem, stream>>>(
+            dp, nullptr, nullptr, nullptr, nullptr, aq8, nullptr, d_top_ids, d_top_w, d_out, K, ff, 0, k_used);
+    };
+
+    if (down_exps.dtype == DType::Q8_0 && down_exps.is_soa) {
+        inkling2_moe_down_q8_0_soa_kernel<<<dn_grid, dim3(32, wpb), dn_smem, stream>>>(
+            static_cast<const int4 *>(down_exps.ptr), static_cast<const uint16_t *>(down_exps.scales_ptr),
+            aq8, d_top_ids, d_top_w, d_out, K, ff, k_used);
+    } else if (down_exps.dtype == DType::Q6_K && down_exps.is_soa) {
+        moe_down_q6_k_soa_kernel<<<dn_grid, dim3(32, wpb), dn_smem, stream>>>(
+            static_cast<const int4 *>(down_exps.ptr), static_cast<const int4 *>(down_exps.aux_ptr),
+            static_cast<const int8_t *>(down_exps.scales_ptr), static_cast<const uint16_t *>(down_exps.d_ptr),
+            nullptr, nullptr, nullptr, nullptr, aq8, nullptr, d_top_ids, d_top_w, d_out, K, ff, 0, k_used);
+    }
+    else if (down_exps.dtype == DType::Q2_K)    run_dn(std::integral_constant<DType, DType::Q2_K>{});
+    else if (down_exps.dtype == DType::Q3_K)    run_dn(std::integral_constant<DType, DType::Q3_K>{});
+    else if (down_exps.dtype == DType::Q4_K)    run_dn(std::integral_constant<DType, DType::Q4_K>{});
+    else if (down_exps.dtype == DType::Q5_K)    run_dn(std::integral_constant<DType, DType::Q5_K>{});
+    else if (down_exps.dtype == DType::IQ4_XS)  run_dn(std::integral_constant<DType, DType::IQ4_XS>{});
+    else if (down_exps.dtype == DType::IQ3_S)   run_dn(std::integral_constant<DType, DType::IQ3_S>{});
+    else if (down_exps.dtype == DType::IQ3_XXS) run_dn(std::integral_constant<DType, DType::IQ3_XXS>{});
+    else if (down_exps.dtype == DType::IQ2_S)   run_dn(std::integral_constant<DType, DType::IQ2_S>{});
+    else if (down_exps.dtype == DType::IQ2_XXS) run_dn(std::integral_constant<DType, DType::IQ2_XXS>{});
+    else throw std::runtime_error("launch_inkling2_moe_ffn_kquant: unsupported down_exps dtype");
 }
 
 } // namespace rookery

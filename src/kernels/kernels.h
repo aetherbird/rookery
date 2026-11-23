@@ -421,6 +421,12 @@ void launch_inkling2_moe_ffn(
     void * d_scratch, size_t scratch_bytes,
     int T, int k_used, float situ_beta, float situ_linear_beta, cudaStream_t stream);
 
+void launch_inkling2_moe_ffn_kquant(
+    const DeviceTensor & gate_up_exps, const DeviceTensor & down_exps,
+    const float * d_x, const int32_t * d_top_ids, const float * d_top_w,
+    float * d_out, void * d_scratch, size_t scratch_bytes,
+    int T, int k_used, float situ_beta, float situ_linear_beta, cudaStream_t stream);
+
 void launch_inkling2_logit_softcap(
     float * d_logits, int64_t n, float cap, cudaStream_t stream);
 

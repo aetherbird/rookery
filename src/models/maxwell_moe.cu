@@ -447,11 +447,24 @@ void MaxwellMoeModel::run_gpu_segment(size_t gi, int T, bool run_argmax, bool lo
                 rt.d_router, static_cast<const float *>(L.ffn_exp_probs_b.ptr),
                 rt.d_top_ids, rt.d_top_w,
                 T, cfg_.n_expert, cfg_.n_expert_used, cfg_.expert_weights_norm, cfg_.expert_weights_scale, rt.stream);
-            launch_moe_ffn_q8_0_with_shared(
-                L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps,
-                L.ffn_gate_shexp, L.ffn_up_shexp, L.ffn_down_shexp,
-                rt.d_x_norm, rt.d_top_ids, rt.d_top_w, rt.d_sub_out,
-                rt.d_scratch, T, cfg_.n_expert_used, rt.stream);
+            const bool use_q8_moe =
+                (L.ffn_gate_exps.dtype == DType::Q8_0 && L.ffn_up_exps.dtype == DType::Q8_0 &&
+                 L.ffn_down_exps.dtype == DType::Q8_0 && L.ffn_gate_shexp.dtype == DType::Q8_0 &&
+                 L.ffn_up_shexp.dtype  == DType::Q8_0 && L.ffn_down_shexp.dtype == DType::Q8_0);
+            if (use_q8_moe) {
+                launch_moe_ffn_q8_0_with_shared(
+                    L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps,
+                    L.ffn_gate_shexp, L.ffn_up_shexp, L.ffn_down_shexp,
+                    rt.d_x_norm, rt.d_top_ids, rt.d_top_w, rt.d_sub_out,
+                    rt.d_scratch, T, cfg_.n_expert_used, rt.stream);
+            } else {
+                launch_moe_ffn_kquant_with_shared(
+                    rt.cublas,
+                    L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps,
+                    L.ffn_gate_shexp, L.ffn_up_shexp, L.ffn_down_shexp,
+                    rt.d_x_norm, rt.d_top_ids, rt.d_top_w, rt.d_sub_out,
+                    rt.d_scratch, rt.scratch_bytes, T, cfg_.n_expert_used, 0.0f, 0.0f, rt.stream);
+            }
         }
 
         launch_hc_post(rt.d_sub_out, rt.d_inpL_alt, rt.d_post, rt.d_comb, rt.d_inpL, cfg_.n_embd, T, rt.stream);
@@ -716,11 +729,24 @@ int32_t MaxwellMoeModel::run_mtp_on_last_gpu(const int32_t * h_tokens,
         rt.d_router, static_cast<const float *>(L.ffn_exp_probs_b.ptr),
         rt.d_top_ids, rt.d_top_w,
         T_mtp, cfg_.n_expert, cfg_.n_expert_used, cfg_.expert_weights_norm, cfg_.expert_weights_scale, rt.stream);
-    launch_moe_ffn_q8_0_with_shared(
-        L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps,
-        L.ffn_gate_shexp, L.ffn_up_shexp, L.ffn_down_shexp,
-        rt.d_x_norm, rt.d_top_ids, rt.d_top_w, rt.d_sub_out,
-        rt.d_scratch, T_mtp, cfg_.n_expert_used, rt.stream);
+    const bool use_q8_mtp_moe =
+        (L.ffn_gate_exps.dtype == DType::Q8_0 && L.ffn_up_exps.dtype == DType::Q8_0 &&
+         L.ffn_down_exps.dtype == DType::Q8_0 && L.ffn_gate_shexp.dtype == DType::Q8_0 &&
+         L.ffn_up_shexp.dtype  == DType::Q8_0 && L.ffn_down_shexp.dtype == DType::Q8_0);
+    if (use_q8_mtp_moe) {
+        launch_moe_ffn_q8_0_with_shared(
+            L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps,
+            L.ffn_gate_shexp, L.ffn_up_shexp, L.ffn_down_shexp,
+            rt.d_x_norm, rt.d_top_ids, rt.d_top_w, rt.d_sub_out,
+            rt.d_scratch, T_mtp, cfg_.n_expert_used, rt.stream);
+    } else {
+        launch_moe_ffn_kquant_with_shared(
+            rt.cublas,
+            L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps,
+            L.ffn_gate_shexp, L.ffn_up_shexp, L.ffn_down_shexp,
+            rt.d_x_norm, rt.d_top_ids, rt.d_top_w, rt.d_sub_out,
+            rt.d_scratch, rt.scratch_bytes, T_mtp, cfg_.n_expert_used, 0.0f, 0.0f, rt.stream);
+    }
 
     launch_hc_post(rt.d_sub_out, rt.d_mtp_alt, rt.d_post, rt.d_comb, rt.d_mtp_inpL, cfg_.n_embd, T_mtp, rt.stream);
 

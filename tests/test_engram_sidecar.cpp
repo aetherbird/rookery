@@ -109,8 +109,10 @@ int main(int argc, char ** argv) {
     std::string engram_path;
     std::string adapter_path;
     std::string dump_path;
+    std::string dump_ce_path;
     std::string corpus_path;
     std::string eval_path;
+    std::string factual_path;
     std::vector<int>   gpus = {0, 1};
     std::vector<float> split = {24.0f, 32.0f};
     std::vector<int>   engram_layers;
@@ -119,6 +121,8 @@ int main(int argc, char ** argv) {
     int      n_gen        = 64;
     int      max_toks     = 20000;
     int      eval_toks    = 768;
+    int      ce_layer     = 44;
+    int      doc_ctx      = 4096;
     uint64_t shuffle_salt = 0;
     bool     table_only   = false;
     bool     dump_delta   = false;
@@ -135,9 +139,13 @@ int main(int argc, char ** argv) {
         else if (a == "--scale-sweep")              scale_sweep = parse_csv_floats(next());
         else if (a == "--engram-layers")            engram_layers = parse_csv_ints(next());
         else if (a == "--dump-pairs")               dump_path = next();
+        else if (a == "--dump-tail-ce")             dump_ce_path = next();
+        else if (a == "--ce-layer")                 ce_layer = std::atoi(next().c_str());
+        else if (a == "--doc-ctx")                  doc_ctx = std::atoi(next().c_str());
         else if (a == "--dump-delta")               dump_delta = true;
         else if (a == "--corpus")                   corpus_path = next();
         else if (a == "--eval-ppl")                 eval_path = next();
+        else if (a == "--eval-factual")             factual_path = next();
         else if (a == "--max-tokens")               max_toks = std::atoi(next().c_str());
         else if (a == "--eval-tokens")              eval_toks = std::atoi(next().c_str());
         else if (a == "--shuffle-salt")             shuffle_salt = std::strtoull(next().c_str(), nullptr, 0);
@@ -254,7 +262,9 @@ int main(int argc, char ** argv) {
         host_tok.load(gguf);
     }
 
-    const int ctx_need = std::max(8192, std::max(max_toks, eval_toks) + 128);
+    const int ctx_need = dump_ce_path.empty()
+        ? std::max(8192, std::max(max_toks, eval_toks) + 128)
+        : std::max(4096, doc_ctx + 128);
     rookery::MaxwellMoeModel model;
     model.load(model_path, gpus, split, ctx_need, true, false);
 
@@ -291,6 +301,148 @@ int main(int argc, char ** argv) {
             model.forward(pt, pp, logits);
         }
         sidecar.close_calibration_dump();
+        return 0;
+    }
+
+    // Mode A2: Tail-CE Supervised Bridge Dataset Dump ("RKCE" v1, strictly causal addressing, doc-windowed!)
+    if (!dump_ce_path.empty()) {
+        std::string text = corpus_path.empty() ? "The capital of France is Paris." : read_text_file(corpus_path);
+        auto ids = host_tok.encode(text, true, false);
+        if (static_cast<int>(ids.size()) > max_toks) ids.resize(max_toks);
+        std::printf("Tail-CE dump corpus: %zu host tokens (layer=%d, doc_ctx=%d)\n", ids.size(), ce_layer, doc_ctx);
+
+        sidecar.set_global_scale(0.0f);
+        sidecar.enable_tail_ce_dump(dump_ce_path, ce_layer);
+        model.set_layer_hook(&sidecar);
+
+        std::vector<float> logits;
+        const size_t chunk = 256;
+        // Process in non-overlapping windows of up to doc_ctx tokens (resets position to 0 each window to keep KV small)
+        for (size_t win_start = 0; win_start + 1 < ids.size(); win_start += static_cast<size_t>(doc_ctx)) {
+            const size_t win_end = std::min(ids.size(), win_start + static_cast<size_t>(doc_ctx));
+            const size_t win_len = win_end - win_start;
+            for (size_t off = 0; off < win_len; off += chunk) {
+                const size_t len = std::min(chunk, win_len - off);
+                std::vector<int32_t> pt(ids.begin() + win_start + off, ids.begin() + win_start + off + len);
+                std::vector<int32_t> pp(len);
+                std::iota(pp.begin(), pp.end(), static_cast<int32_t>(off));
+                std::vector<int32_t> tgts(len, -1);
+                for (size_t k = 0; k < len; ++k) {
+                    if (off + k + 1 < win_len) tgts[k] = ids[win_start + off + k + 1];
+                }
+                sidecar.set_tail_ce_targets(tgts, pt, static_cast<int>(off));
+                model.forward(pt, pp, logits);
+            }
+        }
+        sidecar.close_tail_ce_dump();
+        return 0;
+    }
+
+    // Mode B3: Held-Out Factual QA Probe (file format: one "prompt\tanswer" per line; 4-way Base/Disabled/Real/Shuffled!)
+    if (!factual_path.empty()) {
+        std::ifstream ifs(factual_path);
+        if (!ifs) throw std::runtime_error("Cannot open factual QA file: " + factual_path);
+        std::vector<std::pair<std::string, std::string>> qa_pairs;
+        std::string line;
+        while (std::getline(ifs, line)) {
+            auto tab = line.find('\t');
+            if (tab == std::string::npos) continue;
+            std::string q = line.substr(0, tab);
+            std::string a = line.substr(tab + 1);
+            if (!q.empty() && !a.empty()) qa_pairs.emplace_back(std::move(q), std::move(a));
+        }
+        std::printf("Held-out factual QA file: %s (%zu items)\n", factual_path.c_str(), qa_pairs.size());
+
+        auto eval_factual_run = [&](rookery::EngramSidecar * sc) {
+            double sum_nll = 0.0;
+            int total_ans_toks = 0, hit1 = 0, hit5 = 0, exact_first1 = 0, exact_first5 = 0;
+            std::vector<float> logits;
+            for (const auto & [q, a] : qa_pairs) {
+                auto q_ids = host_tok.encode(q, true, false);
+                auto a_ids = host_tok.encode(a, false, false);
+                if (q_ids.empty() || a_ids.empty()) continue;
+
+                // Prefill prompt causally
+                if (sc) {
+                    for (size_t i = 0; i < q_ids.size(); ++i) {
+                        sc->prepare_step({q_ids[i]}, static_cast<int>(i));
+                        model.forward_decode_logits(q_ids[i], static_cast<int>(i), logits);
+                    }
+                } else {
+                    for (size_t i = 0; i < q_ids.size(); ++i) {
+                        model.forward_decode_logits(q_ids[i], static_cast<int>(i), logits);
+                    }
+                }
+
+                // Score answer tokens
+                for (size_t k = 0; k < a_ids.size(); ++k) {
+                    const int32_t target = a_ids[k];
+                    const float tl = logits[target];
+                    float max_l = logits[0];
+                    for (float v : logits) if (v > max_l) max_l = v;
+                    double sum_exp = 0.0;
+                    int better = 0;
+                    for (float v : logits) {
+                        sum_exp += std::exp(static_cast<double>(v - max_l));
+                        if (v > tl) ++better;
+                    }
+                    sum_nll -= static_cast<double>(tl - max_l) - std::log(sum_exp);
+                    ++total_ans_toks;
+                    if (better == 0) ++hit1;
+                    if (better < 5)  ++hit5;
+                    if (k == 0) {
+                        if (better == 0) ++exact_first1;
+                        if (better < 5)  ++exact_first5;
+                    }
+                    if (k + 1 < a_ids.size()) {
+                        int pos = static_cast<int>(q_ids.size() + k);
+                        if (sc) sc->prepare_step({target}, pos);
+                        model.forward_decode_logits(target, pos, logits);
+                    }
+                }
+            }
+            struct FRes { double nll, ppl, tok1, tok5, q1, q5; int n_tok, n_q; };
+            double nll = sum_nll / std::max(1, total_ans_toks);
+            return FRes{nll, std::exp(nll),
+                        100.0 * hit1 / std::max(1, total_ans_toks),
+                        100.0 * hit5 / std::max(1, total_ans_toks),
+                        100.0 * exact_first1 / std::max<int>(1, static_cast<int>(qa_pairs.size())),
+                        100.0 * exact_first5 / std::max<int>(1, static_cast<int>(qa_pairs.size())),
+                        total_ans_toks, static_cast<int>(qa_pairs.size())};
+        };
+
+        if (scale_sweep.empty()) scale_sweep = {0.5f, 1.0f, 1.5f};
+
+        sidecar.set_global_scale(0.0f);
+        sidecar.set_shuffle_salt(0);
+        model.set_layer_hook(nullptr);
+        model.warmup_decode_graphs();
+        auto base = eval_factual_run(nullptr);
+        std::printf("  [BASE    ] (no hook)          | ans_NLL=%.5f | ans_PPL=%7.3f | first_top1=%5.1f%% | tok_top1=%5.1f%% | tok_top5=%5.1f%%\n",
+                    base.nll, base.ppl, base.q1, base.tok1, base.tok5);
+
+        model.set_layer_hook(&sidecar);
+        model.warmup_decode_graphs();
+        auto dis = eval_factual_run(&sidecar);
+        std::printf("  [DISABLED] global_scale= 0.000 | ans_NLL=%.5f | ans_PPL=%7.3f | delta vs base=%+.6f\n",
+                    dis.nll, dis.ppl, dis.ppl - base.ppl);
+
+        for (float s : scale_sweep) {
+            if (s <= 0.0f) continue;
+            sidecar.set_global_scale(s);
+            sidecar.set_shuffle_salt(0);
+            model.set_layer_hook(&sidecar);
+            model.warmup_decode_graphs();
+            auto res = eval_factual_run(&sidecar);
+            std::printf("  [REAL    ] global_scale=%6.3f | ans_NLL=%.5f | ans_PPL=%7.3f | first_top1=%5.1f%% | tok_top1=%5.1f%% | tok_top5=%5.1f%% (vs base=%+.4f)\n",
+                        s, res.nll, res.ppl, res.q1, res.tok1, res.tok5, res.ppl - base.ppl);
+            if (shuffle_salt != 0) {
+                sidecar.set_shuffle_salt(shuffle_salt);
+                auto ctl = eval_factual_run(&sidecar);
+                std::printf("  [SHUFFLED] global_scale=%6.3f | ans_NLL=%.5f | ans_PPL=%7.3f | first_top1=%5.1f%% | tok_top1=%5.1f%% | tok_top5=%5.1f%% (shuf-real=%+.4f)\n",
+                            s, ctl.nll, ctl.ppl, ctl.q1, ctl.tok1, ctl.tok5, ctl.ppl - res.ppl);
+            }
+        }
         return 0;
     }
 

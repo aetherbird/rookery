@@ -97,6 +97,14 @@ public:
     void enable_calibration_dump(const std::string & out_path, bool dump_delta = false);
     void close_calibration_dump();
 
+    // Optional: enable "RKCE" v1 tail-CE dump at a target host layer (e.g. L44 right before hc_head+output_norm+lm_head).
+    // Records strictly-causal e_raw for ALL Engram table layers + full hc-stream hidden state [T, hc, d_host] (FP16) + target next token!
+    void enable_tail_ce_dump(const std::string & out_path, int target_host_layer);
+    void set_tail_ce_targets(const std::vector<int32_t> & targets,
+                             const std::vector<int32_t> & host_tokens,
+                             int start_pos);
+    void close_tail_ce_dump();
+
     void set_shuffle_salt(uint64_t salt) { table_.set_shuffle_salt(salt); }
     void set_global_scale(float s) { global_scale_ = s; }
     float global_scale() const { return global_scale_; }
@@ -156,6 +164,16 @@ private:
     std::vector<float>   dump_h_tmp_;
     std::vector<int>     delta_next_to_hook_; // [n_host_layers] -> hook idx waiting for L+1 delta, or -1
     std::vector<std::vector<float>> dump_h_prev_; // [n_hooks] cached h_L for L+1 delta
+
+    // Optional tail-CE dump file ("RKCE" v1)
+    FILE *               ce_fp_            = nullptr;
+    int                  ce_target_layer_  = -1;
+    uint64_t             ce_tokens_        = 0;
+    std::vector<int32_t> ce_cur_targets_;
+    std::vector<std::vector<uint16_t>> ce_cur_e_f16_; // [n_eng_layers][T * d_engram]
+    std::vector<float>   ce_h_tmp_;
+    std::string          ce_rolling_text_;
+    std::vector<size_t>  ce_host_ends_;
 };
 
 } // namespace rookery

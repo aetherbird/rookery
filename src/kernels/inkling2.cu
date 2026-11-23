@@ -1334,7 +1334,10 @@ void launch_inkling2_moe_ffn(
 
     if (gate_up_exps.dtype != DType::Q8_0 || !gate_up_exps.is_soa ||
         down_exps.dtype != DType::Q8_0 || !down_exps.is_soa) {
-        throw std::runtime_error("launch_inkling2_moe_ffn: currently expects Q8_0 SoA expert tensors");
+        launch_inkling2_moe_ffn_kquant(
+            gate_up_exps, down_exps, d_x, d_top_ids, d_top_w,
+            d_out, d_scratch, scratch_bytes, T, k_used, situ_beta, situ_linear_beta, stream);
+        return;
     }
 
     const int K        = static_cast<int>(gate_up_exps.ne[0]);
