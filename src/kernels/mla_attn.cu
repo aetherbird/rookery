@@ -1,3 +1,4 @@
+#include "core/device.h"
 #include "kernels/kernels.h"
 #include "kernels/q8_1_act.cuh"
 
@@ -5,6 +6,7 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdint>
+#include <type_traits>
 
 namespace rookery {
 
@@ -253,23 +255,37 @@ __global__ void mla_mqa_d512_reduce_kernel(
     }
 }
 
-__global__ void dequant_q8_0_soa_f16_mla_kernel(
+template <typename TMat>
+__device__ __forceinline__ TMat mla_f32_to_mat(float v) {
+    if constexpr (std::is_same_v<TMat, __half>) return __float2half_rn(v);
+    else return v;
+}
+
+template <typename TMat>
+__device__ __forceinline__ TMat mla_f16_to_mat(__half h) {
+    if constexpr (std::is_same_v<TMat, __half>) return h;
+    else return __half2float(h);
+}
+
+template <typename TMat>
+__global__ void dequant_q8_0_soa_mla_kernel(
     const int8_t *   __restrict__ qs,
     const uint16_t * __restrict__ scales,
-    __half *         __restrict__ dst,
+    TMat *           __restrict__ dst,
     int64_t n_blocks) {
     const int64_t b = static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
     if (b >= n_blocks) return;
     const int lane = threadIdx.x;
     __half dh;
     *reinterpret_cast<uint16_t *>(&dh) = __ldg(&scales[b]);
-    dst[b * 32 + lane] = __float2half_rn(__half2float(dh) * static_cast<float>(__ldg(&qs[b * 32 + lane])));
+    dst[b * 32 + lane] = mla_f32_to_mat<TMat>(__half2float(dh) * static_cast<float>(__ldg(&qs[b * 32 + lane])));
 }
 
-// Transpose [T, H, D] F32 -> [H, T, D] F16 for strided batched cuBLAS HGEMM!
-__global__ void transpose_thd_to_htd_f16_kernel(
+// Transpose [T, H, D] F32 -> [H, T, D] F16/F32 for strided batched cuBLAS HGEMM/SGEMM!
+template <typename TMat>
+__global__ void transpose_thd_to_htd_kernel(
     const float * __restrict__ src,
-    __half *      __restrict__ dst,
+    TMat *        __restrict__ dst,
     int T, int H, int D) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int tot = T * H * D;
@@ -277,7 +293,7 @@ __global__ void transpose_thd_to_htd_f16_kernel(
     const int d = idx % D;
     const int h = (idx / D) % H;
     const int t = idx / (H * D);
-    dst[(static_cast<size_t>(h) * T + t) * D + d] = __float2half_rn(src[idx]);
+    dst[(static_cast<size_t>(h) * T + t) * D + d] = mla_f32_to_mat<TMat>(src[idx]);
 }
 
 // Transpose [H, T, D] F32 -> [T, H, D] F32
@@ -550,10 +566,11 @@ __global__ __launch_bounds__(512) void mla_mqa_d512_decode_shared_t2_kernel(
 // Uses cublasGemmEx FP16 Tensor Cores on shared 512-dim latent KV cache:
 //   Tile K_tile=512: S = Q_scaled @ K_tile^T -> online softmax + causal mask -> O = alpha*O + P @ K_tile
 // ============================================================================
-__global__ void mla_scale_cast_f32_to_f16_kernel(
-    const float * __restrict__ src, __half * __restrict__ dst, int64_t n, float scale) {
+template <typename TMat>
+__global__ void mla_scale_cast_kernel(
+    const float * __restrict__ src, TMat * __restrict__ dst, int64_t n, float scale) {
     const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i < n) dst[i] = __float2half_rn(src[i] * scale);
+    if (i < n) dst[i] = mla_f32_to_mat<TMat>(src[i] * scale);
 }
 
 __global__ void mla_init_flash_state_kernel(float * __restrict__ m, float * __restrict__ l, int M) {
@@ -561,10 +578,10 @@ __global__ void mla_init_flash_state_kernel(float * __restrict__ m, float * __re
     if (i < M) { m[i] = -FLT_MAX; l[i] = 0.0f; }
 }
 
-template <bool KV_Q8_0>
-__global__ void mla_dequant_kv_tile_f16_kernel(
+template <bool KV_Q8_0, typename TMat>
+__global__ void mla_dequant_kv_tile_kernel(
     const void * __restrict__ kv_cache,
-    __half *     __restrict__ dst, // [kc, 512]
+    TMat *       __restrict__ dst, // [kc, 512]
     int k0, int kc) {
     const int c = blockIdx.y;
     if (c >= kc) return;
@@ -577,21 +594,22 @@ __global__ void mla_dequant_kv_tile_f16_kernel(
         __half dh;
         *reinterpret_cast<uint16_t *>(&dh) = __ldg(&kb.d);
         const float d = __half2float(dh);
-        dst[static_cast<size_t>(c) * 512 + b * 32 + lane] = __float2half_rn(d * static_cast<float>(__ldg(&kb.qs[lane])));
+        dst[static_cast<size_t>(c) * 512 + b * 32 + lane] = mla_f32_to_mat<TMat>(d * static_cast<float>(__ldg(&kb.qs[lane])));
     } else {
         const int d = blockIdx.x * blockDim.x + threadIdx.x;
         if (d < 512) {
-            dst[static_cast<size_t>(c) * 512 + d] = static_cast<const __half *>(kv_cache)[static_cast<size_t>(p) * 512 + d];
+            dst[static_cast<size_t>(c) * 512 + d] = mla_f16_to_mat<TMat>(static_cast<const __half *>(kv_cache)[static_cast<size_t>(p) * 512 + d]);
         }
     }
 }
 
 // 1 block of 128 threads per row r = t * n_heads + h (M = T * n_heads rows):
-// Applies causal mask (k0 + c <= pos[t]), updates online (m[r], l[r]), writes P_tile[r, c] in F16,
+// Applies causal mask (k0 + c <= pos[t]), updates online (m[r], l[r]), writes P_tile[r, c] in TMat,
 // AND rescales d_out[r, 0..511] *= alpha in-place (zero extra memory pass!).
+template <typename TMat>
 __global__ void mla_flash_online_softmax_rescale_kernel(
     const float *   __restrict__ s_tile, // [M, kc]
-    __half *        __restrict__ p_tile, // [M, kc]
+    TMat *          __restrict__ p_tile, // [M, kc]
     const int32_t * __restrict__ pos,    // [T]
     float *         __restrict__ m_buf,  // [M]
     float *         __restrict__ l_buf,  // [M]
@@ -606,11 +624,11 @@ __global__ void mla_flash_online_softmax_rescale_kernel(
     const int warp = tid >> 5;
 
     const float * s_row = s_tile + static_cast<size_t>(r) * kc;
-    __half *      p_row = p_tile + static_cast<size_t>(r) * kc;
+    TMat *        p_row = p_tile + static_cast<size_t>(r) * kc;
 
     // Fast path: entire tile is strictly beyond causal limit pos[t]
     if (k0 > maxp) {
-        for (int c = tid; c < kc; c += blockDim.x) p_row[c] = __float2half(0.0f);
+        for (int c = tid; c < kc; c += blockDim.x) p_row[c] = mla_f32_to_mat<TMat>(0.0f);
         return;
     }
 
@@ -637,15 +655,15 @@ __global__ void mla_flash_online_softmax_rescale_kernel(
     const float m_new = fmaxf(m_old, m_tile);
     const float alpha = (m_old == -FLT_MAX) ? 0.0f : expf(m_old - m_new);
 
-    // 2. Compute exp(s - m_new), cast to F16, accumulate tile sum
+    // 2. Compute exp(s - m_new), cast to TMat, accumulate tile sum
     float local_l = 0.0f;
     for (int c = tid; c < kc; c += blockDim.x) {
         if (c < valid_c) {
             const float e = expf(s_row[c] - m_new);
-            p_row[c] = __float2half_rn(e);
+            p_row[c] = mla_f32_to_mat<TMat>(e);
             local_l += e;
         } else {
-            p_row[c] = __float2half(0.0f);
+            p_row[c] = mla_f32_to_mat<TMat>(0.0f);
         }
     }
     local_l = warp_sum(local_l);
@@ -691,43 +709,81 @@ void launch_batched_head_proj_q8_0(
     const int M       = static_cast<int>(W.ne[1]);
     const int n_heads = static_cast<int>(W.ne[2]);
 
-    // Fast Tensor Core strided batched HGEMM for prefill (T >= 8)!
+    // Fast strided batched GEMM for prefill (T >= 8): FP16 Tensor Core (sm>=70) or FP32 SGEMM (<sm_70)!
     if (T >= 8 && W.is_soa && cublas != nullptr && d_scratch != nullptr) {
+        const bool use_tc = device_has_tensor_cores(W.device);
         auto align256 = [](size_t n) { return (n + 255) & ~size_t(255); };
-        const size_t w_bytes = align256(static_cast<size_t>(n_heads) * M * K * sizeof(__half));
-        const size_t x_bytes = align256(static_cast<size_t>(n_heads) * T * K * sizeof(__half));
-        const size_t y_bytes = align256(static_cast<size_t>(n_heads) * T * M * sizeof(float));
-        if (w_bytes + x_bytes + y_bytes <= scratch_bytes) {
-            auto * base  = static_cast<uint8_t *>(d_scratch);
-            auto * d_w16 = reinterpret_cast<__half *>(base);
-            auto * d_x16 = reinterpret_cast<__half *>(base + w_bytes);
-            auto * d_yh  = reinterpret_cast<float  *>(base + w_bytes + x_bytes);
+        if (use_tc) {
+            const size_t w_bytes = align256(static_cast<size_t>(n_heads) * M * K * sizeof(__half));
+            const size_t x_bytes = align256(static_cast<size_t>(n_heads) * T * K * sizeof(__half));
+            const size_t y_bytes = align256(static_cast<size_t>(n_heads) * T * M * sizeof(float));
+            if (w_bytes + x_bytes + y_bytes <= scratch_bytes) {
+                auto * base  = static_cast<uint8_t *>(d_scratch);
+                auto * d_w16 = reinterpret_cast<__half *>(base);
+                auto * d_x16 = reinterpret_cast<__half *>(base + w_bytes);
+                auto * d_yh  = reinterpret_cast<float  *>(base + w_bytes + x_bytes);
 
-            const int64_t nblk = (static_cast<int64_t>(n_heads) * M * K) / 32;
-            constexpr int wpb = 8;
-            dequant_q8_0_soa_f16_mla_kernel<<<(nblk + wpb - 1) / wpb, dim3(32, wpb), 0, stream>>>(
-                static_cast<const int8_t *>(W.ptr), static_cast<const uint16_t *>(W.scales_ptr), d_w16, nblk);
+                const int64_t nblk = (static_cast<int64_t>(n_heads) * M * K) / 32;
+                constexpr int wpb = 8;
+                dequant_q8_0_soa_mla_kernel<__half><<<(nblk + wpb - 1) / wpb, dim3(32, wpb), 0, stream>>>(
+                    static_cast<const int8_t *>(W.ptr), static_cast<const uint16_t *>(W.scales_ptr), d_w16, nblk);
 
-            const int tot_x = T * n_heads * K;
-            transpose_thd_to_htd_f16_kernel<<<(tot_x + 255) / 256, 256, 0, stream>>>(d_x, d_x16, T, n_heads, K);
+                const int tot_x = T * n_heads * K;
+                transpose_thd_to_htd_kernel<__half><<<(tot_x + 255) / 256, 256, 0, stream>>>(d_x, d_x16, T, n_heads, K);
 
-            const float alpha = 1.0f, beta = 0.0f;
-            cublasSetStream(cublas, stream);
-            cublasGemmStridedBatchedEx(
-                cublas,
-                CUBLAS_OP_T, CUBLAS_OP_N,
-                M, T, K,
-                &alpha,
-                d_w16, CUDA_R_16F, K, static_cast<long long>(M) * K,
-                d_x16, CUDA_R_16F, K, static_cast<long long>(T) * K,
-                &beta,
-                d_yh,  CUDA_R_32F, M, static_cast<long long>(T) * M,
-                n_heads,
-                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                const float alpha = 1.0f, beta = 0.0f;
+                cublasSetStream(cublas, stream);
+                cublasGemmStridedBatchedEx(
+                    cublas,
+                    CUBLAS_OP_T, CUBLAS_OP_N,
+                    M, T, K,
+                    &alpha,
+                    d_w16, CUDA_R_16F, K, static_cast<long long>(M) * K,
+                    d_x16, CUDA_R_16F, K, static_cast<long long>(T) * K,
+                    &beta,
+                    d_yh,  CUDA_R_32F, M, static_cast<long long>(T) * M,
+                    n_heads,
+                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 
-            const int tot_y = T * n_heads * M;
-            transpose_htd_to_thd_f32_kernel<<<(tot_y + 255) / 256, 256, 0, stream>>>(d_yh, d_y, T, n_heads, M);
-            return;
+                const int tot_y = T * n_heads * M;
+                transpose_htd_to_thd_f32_kernel<<<(tot_y + 255) / 256, 256, 0, stream>>>(d_yh, d_y, T, n_heads, M);
+                return;
+            }
+        } else {
+            const size_t w_bytes = align256(static_cast<size_t>(n_heads) * M * K * sizeof(float));
+            const size_t x_bytes = align256(static_cast<size_t>(n_heads) * T * K * sizeof(float));
+            const size_t y_bytes = align256(static_cast<size_t>(n_heads) * T * M * sizeof(float));
+            if (w_bytes + x_bytes + y_bytes <= scratch_bytes) {
+                auto * base  = static_cast<uint8_t *>(d_scratch);
+                auto * d_w32 = reinterpret_cast<float *>(base);
+                auto * d_x32 = reinterpret_cast<float *>(base + w_bytes);
+                auto * d_yh  = reinterpret_cast<float *>(base + w_bytes + x_bytes);
+
+                const int64_t nblk = (static_cast<int64_t>(n_heads) * M * K) / 32;
+                constexpr int wpb = 8;
+                dequant_q8_0_soa_mla_kernel<float><<<(nblk + wpb - 1) / wpb, dim3(32, wpb), 0, stream>>>(
+                    static_cast<const int8_t *>(W.ptr), static_cast<const uint16_t *>(W.scales_ptr), d_w32, nblk);
+
+                const int tot_x = T * n_heads * K;
+                transpose_thd_to_htd_kernel<float><<<(tot_x + 255) / 256, 256, 0, stream>>>(d_x, d_x32, T, n_heads, K);
+
+                const float alpha = 1.0f, beta = 0.0f;
+                cublasSetStream(cublas, stream);
+                cublasSgemmStridedBatched(
+                    cublas,
+                    CUBLAS_OP_T, CUBLAS_OP_N,
+                    M, T, K,
+                    &alpha,
+                    d_w32, K, static_cast<long long>(M) * K,
+                    d_x32, K, static_cast<long long>(T) * K,
+                    &beta,
+                    d_yh,  M, static_cast<long long>(T) * M,
+                    n_heads);
+
+                const int tot_y = T * n_heads * M;
+                transpose_htd_to_thd_f32_kernel<<<(tot_y + 255) / 256, 256, 0, stream>>>(d_yh, d_y, T, n_heads, M);
+                return;
+            }
         }
     }
 
@@ -756,74 +812,136 @@ void launch_mla_attn_d512(
     int T, int n_heads, float scale, cudaStream_t stream,
     cublasHandle_t cublas, size_t scratch_bytes, int kv_len_max) {
 
-    // Fast Tiled Tensor Core FlashMLA Prefill (T >= 8): ~20-30x faster at 32K+ context!
+    // Fast Tiled FlashMLA Prefill (T >= 8): FP16 Tensor Core (sm>=70) or FP32 SGEMM (<sm_70)!
     if (T >= 8 && cublas != nullptr && kv_len_max > 0) {
+        const bool use_tc = device_has_tensor_cores(-1);
         const int M = T * n_heads;
-        constexpr int K_TILE = 512;
         auto align256 = [](size_t n) { return (n + 255) & ~size_t(255); };
-        const size_t q16_b = align256(static_cast<size_t>(M) * 512 * sizeof(__half));
-        const size_t k16_b = align256(static_cast<size_t>(K_TILE) * 512 * sizeof(__half));
-        const size_t s32_b = align256(static_cast<size_t>(M) * K_TILE * sizeof(float));
-        const size_t p16_b = align256(static_cast<size_t>(M) * K_TILE * sizeof(__half));
-        const size_t ml_b  = align256(static_cast<size_t>(M) * sizeof(float));
-        const size_t need  = q16_b + k16_b + s32_b + p16_b + 2 * ml_b;
 
-        if (need <= scratch_bytes) {
-            auto * base = static_cast<uint8_t *>(d_scratch);
-            size_t off = 0;
-            auto * d_q16 = reinterpret_cast<__half *>(base + off); off += q16_b;
-            auto * d_k16 = reinterpret_cast<__half *>(base + off); off += k16_b;
-            auto * d_s32 = reinterpret_cast<float  *>(base + off); off += s32_b;
-            auto * d_p16 = reinterpret_cast<__half *>(base + off); off += p16_b;
-            auto * d_m   = reinterpret_cast<float  *>(base + off); off += ml_b;
-            auto * d_l   = reinterpret_cast<float  *>(base + off);
+        if (use_tc) {
+            constexpr int K_TILE = 512;
+            const size_t q16_b = align256(static_cast<size_t>(M) * 512 * sizeof(__half));
+            const size_t k16_b = align256(static_cast<size_t>(K_TILE) * 512 * sizeof(__half));
+            const size_t s32_b = align256(static_cast<size_t>(M) * K_TILE * sizeof(float));
+            const size_t p16_b = align256(static_cast<size_t>(M) * K_TILE * sizeof(__half));
+            const size_t ml_b  = align256(static_cast<size_t>(M) * sizeof(float));
+            const size_t need  = q16_b + k16_b + s32_b + p16_b + 2 * ml_b;
 
-            const int64_t nq = static_cast<int64_t>(M) * 512;
-            mla_scale_cast_f32_to_f16_kernel<<<(nq + 255) / 256, 256, 0, stream>>>(d_q_abs, d_q16, nq, scale);
-            mla_init_flash_state_kernel<<<(M + 255) / 256, 256, 0, stream>>>(d_m, d_l, M);
+            if (need <= scratch_bytes) {
+                auto * base = static_cast<uint8_t *>(d_scratch);
+                size_t off = 0;
+                auto * d_q16 = reinterpret_cast<__half *>(base + off); off += q16_b;
+                auto * d_k16 = reinterpret_cast<__half *>(base + off); off += k16_b;
+                auto * d_s32 = reinterpret_cast<float  *>(base + off); off += s32_b;
+                auto * d_p16 = reinterpret_cast<__half *>(base + off); off += p16_b;
+                auto * d_m   = reinterpret_cast<float  *>(base + off); off += ml_b;
+                auto * d_l   = reinterpret_cast<float  *>(base + off);
 
-            const float one = 1.0f, zero = 0.0f;
-            cublasSetStream(cublas, stream);
+                const int64_t nq = static_cast<int64_t>(M) * 512;
+                mla_scale_cast_kernel<__half><<<(nq + 255) / 256, 256, 0, stream>>>(d_q_abs, d_q16, nq, scale);
+                mla_init_flash_state_kernel<<<(M + 255) / 256, 256, 0, stream>>>(d_m, d_l, M);
 
-            for (int k0 = 0; k0 < kv_len_max; k0 += K_TILE) {
-                const int kc = (k0 + K_TILE < kv_len_max) ? K_TILE : (kv_len_max - k0);
-                if (kv_is_q8_0) {
-                    mla_dequant_kv_tile_f16_kernel<true><<<dim3(2, kc), dim3(32, 8), 0, stream>>>(d_kv_cache, d_k16, k0, kc);
-                } else {
-                    mla_dequant_kv_tile_f16_kernel<false><<<dim3(2, kc), 256, 0, stream>>>(d_kv_cache, d_k16, k0, kc);
+                const float one = 1.0f, zero = 0.0f;
+                cublasSetStream(cublas, stream);
+
+                for (int k0 = 0; k0 < kv_len_max; k0 += K_TILE) {
+                    const int kc = (k0 + K_TILE < kv_len_max) ? K_TILE : (kv_len_max - k0);
+                    if (kv_is_q8_0) {
+                        mla_dequant_kv_tile_kernel<true, __half><<<dim3(2, kc), dim3(32, 8), 0, stream>>>(d_kv_cache, d_k16, k0, kc);
+                    } else {
+                        mla_dequant_kv_tile_kernel<false, __half><<<dim3(2, kc), 256, 0, stream>>>(d_kv_cache, d_k16, k0, kc);
+                    }
+
+                    cublasGemmEx(
+                        cublas,
+                        CUBLAS_OP_T, CUBLAS_OP_N,
+                        kc, M, 512,
+                        &one,
+                        d_k16, CUDA_R_16F, 512,
+                        d_q16, CUDA_R_16F, 512,
+                        &zero,
+                        d_s32, CUDA_R_32F, kc,
+                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+                    mla_flash_online_softmax_rescale_kernel<__half><<<M, 128, 0, stream>>>(
+                        d_s32, d_p16, d_pos, d_m, d_l, d_out, n_heads, k0, kc);
+
+                    cublasGemmEx(
+                        cublas,
+                        CUBLAS_OP_N, CUBLAS_OP_N,
+                        512, M, kc,
+                        &one,
+                        d_k16, CUDA_R_16F, 512,
+                        d_p16, CUDA_R_16F, kc,
+                        &one,
+                        d_out, CUDA_R_32F, 512,
+                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
                 }
 
-                // GEMM 1: S[M, kc] = Q_scaled[M, 512] @ K_tile[kc, 512]^T (col-major: K_cm^T @ Q_cm)
-                cublasGemmEx(
-                    cublas,
-                    CUBLAS_OP_T, CUBLAS_OP_N,
-                    kc, M, 512,
-                    &one,
-                    d_k16, CUDA_R_16F, 512,
-                    d_q16, CUDA_R_16F, 512,
-                    &zero,
-                    d_s32, CUDA_R_32F, kc,
-                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-
-                // Causal mask + online softmax + cast P_tile F16 + rescale d_out *= alpha
-                mla_flash_online_softmax_rescale_kernel<<<M, 128, 0, stream>>>(
-                    d_s32, d_p16, d_pos, d_m, d_l, d_out, n_heads, k0, kc);
-
-                // GEMM 2: d_out[M, 512] += P_tile[M, kc] @ K_tile[kc, 512] (col-major: K_cm @ P_cm)
-                cublasGemmEx(
-                    cublas,
-                    CUBLAS_OP_N, CUBLAS_OP_N,
-                    512, M, kc,
-                    &one,
-                    d_k16, CUDA_R_16F, 512,
-                    d_p16, CUDA_R_16F, kc,
-                    &one,
-                    d_out, CUDA_R_32F, 512,
-                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                mla_flash_finalize_out_kernel<<<M, 128, 0, stream>>>(d_out, d_l, M);
+                return;
             }
+        } else {
+            constexpr int K_TILE = 256;
+            const size_t q32_b = align256(static_cast<size_t>(M) * 512 * sizeof(float));
+            const size_t k32_b = align256(static_cast<size_t>(K_TILE) * 512 * sizeof(float));
+            const size_t s32_b = align256(static_cast<size_t>(M) * K_TILE * sizeof(float));
+            const size_t p32_b = s32_b;
+            const size_t ml_b  = align256(static_cast<size_t>(M) * sizeof(float));
+            const size_t need  = q32_b + k32_b + s32_b + p32_b + 2 * ml_b;
 
-            mla_flash_finalize_out_kernel<<<M, 128, 0, stream>>>(d_out, d_l, M);
-            return;
+            if (need <= scratch_bytes) {
+                auto * base = static_cast<uint8_t *>(d_scratch);
+                size_t off = 0;
+                auto * d_q32 = reinterpret_cast<float *>(base + off); off += q32_b;
+                auto * d_k32 = reinterpret_cast<float *>(base + off); off += k32_b;
+                auto * d_s32 = reinterpret_cast<float *>(base + off); off += s32_b;
+                auto * d_p32 = reinterpret_cast<float *>(base + off); off += p32_b;
+                auto * d_m   = reinterpret_cast<float *>(base + off); off += ml_b;
+                auto * d_l   = reinterpret_cast<float *>(base + off);
+
+                const int64_t nq = static_cast<int64_t>(M) * 512;
+                mla_scale_cast_kernel<float><<<(nq + 255) / 256, 256, 0, stream>>>(d_q_abs, d_q32, nq, scale);
+                mla_init_flash_state_kernel<<<(M + 255) / 256, 256, 0, stream>>>(d_m, d_l, M);
+
+                const float one = 1.0f, zero = 0.0f;
+                cublasSetStream(cublas, stream);
+
+                for (int k0 = 0; k0 < kv_len_max; k0 += K_TILE) {
+                    const int kc = (k0 + K_TILE < kv_len_max) ? K_TILE : (kv_len_max - k0);
+                    if (kv_is_q8_0) {
+                        mla_dequant_kv_tile_kernel<true, float><<<dim3(2, kc), dim3(32, 8), 0, stream>>>(d_kv_cache, d_k32, k0, kc);
+                    } else {
+                        mla_dequant_kv_tile_kernel<false, float><<<dim3(2, kc), 256, 0, stream>>>(d_kv_cache, d_k32, k0, kc);
+                    }
+
+                    cublasSgemm(
+                        cublas,
+                        CUBLAS_OP_T, CUBLAS_OP_N,
+                        kc, M, 512,
+                        &one,
+                        d_k32, 512,
+                        d_q32, 512,
+                        &zero,
+                        d_s32, kc);
+
+                    mla_flash_online_softmax_rescale_kernel<float><<<M, 128, 0, stream>>>(
+                        d_s32, d_p32, d_pos, d_m, d_l, d_out, n_heads, k0, kc);
+
+                    cublasSgemm(
+                        cublas,
+                        CUBLAS_OP_N, CUBLAS_OP_N,
+                        512, M, kc,
+                        &one,
+                        d_k32, 512,
+                        d_p32, kc,
+                        &one,
+                        d_out, 512);
+                }
+
+                mla_flash_finalize_out_kernel<<<M, 128, 0, stream>>>(d_out, d_l, M);
+                return;
+            }
         }
     }
 

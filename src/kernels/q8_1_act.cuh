@@ -21,6 +21,29 @@ static_assert(sizeof(BlockQ8_1_Act) == 48, "BlockQ8_1_Act must be 48 bytes (16B 
 __device__ __forceinline__ int dp4a_s32(int a, int b, int c) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 610
     return __dp4a(a, b, c);
+#elif defined(__CUDA_ARCH__)
+    // Pre-sm_61 (Maxwell sm_50/sm_52, Pascal GP100 sm_60):
+    // Unpack 4 signed int8 lanes into two packed int16x2 registers via PTX prmt.b32
+    // (selectors 0x9180 / 0xB3A2 sign-extend each byte into 16 bits), then accumulate
+    // with 4 single-cycle XMAD.S16.S16 (.H0/.H1) instructions (8 SASS ops vs 12 for bfe+shr).
+    int r = c;
+    asm("{\n\t"
+        ".reg .b32 al, ah, bl, bh;\n\t"
+        ".reg .s16 a0, a1, a2, a3, b0, b1, b2, b3;\n\t"
+        "prmt.b32 al, %1, 0, 0x9180;\n\t"
+        "prmt.b32 bl, %2, 0, 0x9180;\n\t"
+        "prmt.b32 ah, %1, 0, 0xB3A2;\n\t"
+        "prmt.b32 bh, %2, 0, 0xB3A2;\n\t"
+        "mov.b32 {a0, a1}, al;\n\t"
+        "mov.b32 {b0, b1}, bl;\n\t"
+        "mov.b32 {a2, a3}, ah;\n\t"
+        "mov.b32 {b2, b3}, bh;\n\t"
+        "mad.wide.s16 %0, a0, b0, %0;\n\t"
+        "mad.wide.s16 %0, a1, b1, %0;\n\t"
+        "mad.wide.s16 %0, a2, b2, %0;\n\t"
+        "mad.wide.s16 %0, a3, b3, %0;\n\t"
+        "}" : "+r"(r) : "r"(a), "r"(b));
+    return r;
 #else
     const int8_t * pa = reinterpret_cast<const int8_t *>(&a);
     const int8_t * pb = reinterpret_cast<const int8_t *>(&b);

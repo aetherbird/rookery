@@ -296,7 +296,7 @@ void Qwen35MoeModel::load(const std::string & gguf_path,
         cuda_ok(cudaStreamCreate(&rt.stream), "qwen35 stream");
         cuda_ok(cudaEventCreateWithFlags(&rt.done_event, cudaEventDisableTiming), "qwen35 event");
         if (cublasCreate(&rt.cublas) != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("cublasCreate failed");
-        cublasSetMathMode(rt.cublas, CUBLAS_TENSOR_OP_MATH);
+        if (device_has_tensor_cores(dev)) cublasSetMathMode(rt.cublas, CUBLAS_TENSOR_OP_MATH);
 
         rt.d_cur        = dev_alloc<float>(dev, B * H);
         rt.d_x_norm     = dev_alloc<float>(dev, B * H);

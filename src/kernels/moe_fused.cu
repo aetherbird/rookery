@@ -1,4 +1,5 @@
 #include "kernels/kernels.h"
+#include "kernels/q8_1_act.cuh"
 
 #include <cuda_fp16.h>
 #include <cfloat>
@@ -8,23 +9,6 @@
 namespace rookery {
 
 namespace {
-
-struct alignas(16) BlockQ8_1_Act {
-    int8_t qs[32];
-    float  d;
-    float  pad[3];
-};
-static_assert(sizeof(BlockQ8_1_Act) == 48, "BlockQ8_1_Act must be 48 bytes (16B aligned)");
-
-__device__ __forceinline__ int dp4a_s32(int a, int b, int c) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 610
-    return __dp4a(a, b, c);
-#else
-    const int8_t * pa = reinterpret_cast<const int8_t *>(&a);
-    const int8_t * pb = reinterpret_cast<const int8_t *>(&b);
-    return c + pa[0]*pb[0] + pa[1]*pb[1] + pa[2]*pb[2] + pa[3]*pb[3];
-#endif
-}
 
 __device__ __forceinline__ float warp_sum(float v) {
     for (int offset = 16; offset > 0; offset >>= 1) {

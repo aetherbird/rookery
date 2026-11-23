@@ -1,7 +1,7 @@
+#include "core/device.h"
 #include "kernels/kernels.h"
 #include "kernels/q8_1_act.cuh"
 
-#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cfloat>
 #include <cmath>
@@ -346,6 +346,20 @@ __global__ void bf16_to_f16_kernel(const uint16_t * __restrict__ src, __half * _
     }
 }
 
+__global__ void bf16_to_f32_kernel(const uint16_t * __restrict__ src, float * __restrict__ dst, int64_t n) {
+    const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) {
+        dst[i] = __uint_as_float(static_cast<uint32_t>(__ldg(&src[i])) << 16);
+    }
+}
+
+__global__ void f16_to_f32_kernel(const __half * __restrict__ src, float * __restrict__ dst, int64_t n) {
+    const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) {
+        dst[i] = __half2float(__ldg(&src[i]));
+    }
+}
+
 __global__ void dequant_q8_0_soa_to_f16_kernel(
     const int8_t *   __restrict__ src_qs,
     const uint16_t * __restrict__ src_sc,
@@ -359,6 +373,21 @@ __global__ void dequant_q8_0_soa_to_f16_kernel(
     *reinterpret_cast<uint16_t *>(&dh) = __ldg(&src_sc[b]);
     const float d = __half2float(dh);
     dst[b * 32 + lane] = __float2half_rn(d * static_cast<float>(__ldg(&src_qs[b * 32 + lane])));
+}
+
+__global__ void dequant_q8_0_soa_to_f32_kernel(
+    const int8_t *   __restrict__ src_qs,
+    const uint16_t * __restrict__ src_sc,
+    float *          __restrict__ dst,
+    int64_t n_blocks) {
+
+    const int64_t b = static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
+    if (b >= n_blocks) return;
+    const int lane = threadIdx.x;
+    __half dh;
+    *reinterpret_cast<uint16_t *>(&dh) = __ldg(&src_sc[b]);
+    const float d = __half2float(dh);
+    dst[b * 32 + lane] = d * static_cast<float>(__ldg(&src_qs[b * 32 + lane]));
 }
 
 __global__ void f32_to_f16_kernel(const float * __restrict__ src, __half * __restrict__ dst, int64_t n) {
@@ -409,6 +438,7 @@ __global__ void argmax_f32_batch_kernel(const float * __restrict__ x, int32_t * 
 
 void launch_quantize_q8_1(const float * d_x, void * d_xq8, int K, int T, cudaStream_t stream) {
     const int total_xb = T * (K / 32);
+    if (total_xb <= 0) return;
     constexpr int q_wpb = 8;
     quantize_q8_1_kernel<<<(total_xb + q_wpb - 1) / q_wpb, dim3(32, q_wpb), 0, stream>>>(
         d_x, static_cast<BlockQ8_1_Act *>(d_xq8), total_xb);
@@ -459,42 +489,73 @@ void launch_linear(
 
     const size_t x_f16_bytes = static_cast<size_t>(T) * K * sizeof(__half);
     const size_t align_x = (x_f16_bytes + 255) & ~size_t(255);
-    if (cublas != nullptr && T >= 16 && W.dtype == DType::Q8_0 && W.is_soa &&
-        align_x + static_cast<size_t>(K) * sizeof(__half) <= scratch_bytes) {
-        const size_t rem = scratch_bytes - align_x;
-        const int chunk_n = std::max(1, std::min(N, static_cast<int>(rem / (static_cast<size_t>(K) * sizeof(__half)))));
-        auto * d_xf16 = static_cast<__half *>(d_scratch);
-        auto * d_wf16 = reinterpret_cast<__half *>(static_cast<uint8_t *>(d_scratch) + align_x);
+    if (cublas != nullptr && T >= 16 && W.dtype == DType::Q8_0 && W.is_soa) {
+        const bool use_tc = device_has_tensor_cores(W.device);
+        if (use_tc && align_x + static_cast<size_t>(K) * sizeof(__half) <= scratch_bytes) {
+            const size_t rem = scratch_bytes - align_x;
+            const int chunk_n = std::max(1, std::min(N, static_cast<int>(rem / (static_cast<size_t>(K) * sizeof(__half)))));
+            auto * d_xf16 = static_cast<__half *>(d_scratch);
+            auto * d_wf16 = reinterpret_cast<__half *>(static_cast<uint8_t *>(d_scratch) + align_x);
 
-        const int64_t nx = static_cast<int64_t>(T) * K;
-        f32_to_f16_kernel<<<(nx + 255) / 256, 256, 0, stream>>>(d_x, d_xf16, nx);
+            const int64_t nx = static_cast<int64_t>(T) * K;
+            f32_to_f16_kernel<<<(nx + 255) / 256, 256, 0, stream>>>(d_x, d_xf16, nx);
 
-        const float alpha = 1.0f, beta = 0.0f;
-        cublasSetStream(cublas, stream);
-        const int nb_row = K / 32;
-        constexpr int wpb = 8;
+            const float alpha = 1.0f, beta = 0.0f;
+            cublasSetStream(cublas, stream);
+            const int nb_row = K / 32;
+            constexpr int wpb = 8;
 
-        for (int n0 = 0; n0 < N; n0 += chunk_n) {
-            const int cn = std::min(chunk_n, N - n0);
-            const int64_t b0 = static_cast<int64_t>(n0) * nb_row;
-            const int64_t n_blocks = static_cast<int64_t>(cn) * nb_row;
-            dequant_q8_0_soa_to_f16_kernel<<<(n_blocks + wpb - 1) / wpb, dim3(32, wpb), 0, stream>>>(
-                static_cast<const int8_t *>(W.ptr) + b0 * 32,
-                static_cast<const uint16_t *>(W.scales_ptr) + b0,
-                d_wf16, n_blocks);
+            for (int n0 = 0; n0 < N; n0 += chunk_n) {
+                const int cn = std::min(chunk_n, N - n0);
+                const int64_t b0 = static_cast<int64_t>(n0) * nb_row;
+                const int64_t n_blocks = static_cast<int64_t>(cn) * nb_row;
+                dequant_q8_0_soa_to_f16_kernel<<<(n_blocks + wpb - 1) / wpb, dim3(32, wpb), 0, stream>>>(
+                    static_cast<const int8_t *>(W.ptr) + b0 * 32,
+                    static_cast<const uint16_t *>(W.scales_ptr) + b0,
+                    d_wf16, n_blocks);
 
-            cublasGemmEx(
-                cublas,
-                CUBLAS_OP_T, CUBLAS_OP_N,
-                cn, T, K,
-                &alpha,
-                d_wf16, CUDA_R_16F, K,
-                d_xf16, CUDA_R_16F, K,
-                &beta,
-                d_y + n0, CUDA_R_32F, N,
-                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                cublasGemmEx(
+                    cublas,
+                    CUBLAS_OP_T, CUBLAS_OP_N,
+                    cn, T, K,
+                    &alpha,
+                    d_wf16, CUDA_R_16F, K,
+                    d_xf16, CUDA_R_16F, K,
+                    &beta,
+                    d_y + n0, CUDA_R_32F, N,
+                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            }
+            return;
         }
-        return;
+        if (!use_tc && static_cast<size_t>(K) * sizeof(float) <= scratch_bytes) {
+            const int chunk_n = std::max(1, std::min(N, static_cast<int>(scratch_bytes / (static_cast<size_t>(K) * sizeof(float)))));
+            auto * d_wf32 = static_cast<float *>(d_scratch);
+            const float alpha = 1.0f, beta = 0.0f;
+            cublasSetStream(cublas, stream);
+            const int nb_row = K / 32;
+            constexpr int wpb = 8;
+
+            for (int n0 = 0; n0 < N; n0 += chunk_n) {
+                const int cn = std::min(chunk_n, N - n0);
+                const int64_t b0 = static_cast<int64_t>(n0) * nb_row;
+                const int64_t n_blocks = static_cast<int64_t>(cn) * nb_row;
+                dequant_q8_0_soa_to_f32_kernel<<<(n_blocks + wpb - 1) / wpb, dim3(32, wpb), 0, stream>>>(
+                    static_cast<const int8_t *>(W.ptr) + b0 * 32,
+                    static_cast<const uint16_t *>(W.scales_ptr) + b0,
+                    d_wf32, n_blocks);
+
+                cublasSgemm(
+                    cublas,
+                    CUBLAS_OP_T, CUBLAS_OP_N,
+                    cn, T, K,
+                    &alpha,
+                    d_wf32, K,
+                    d_x, K,
+                    &beta,
+                    d_y + n0, N);
+            }
+            return;
+        }
     }
 
     if (is_kquant_dtype(W.dtype)) {
@@ -521,20 +582,67 @@ void launch_linear(
         return;
     }
 
-    if (W.dtype == DType::BF16 && T >= 16 && cublas != nullptr &&
-        align_x + static_cast<size_t>(N) * K * sizeof(__half) <= scratch_bytes) {
-        auto * d_xf16 = static_cast<__half *>(d_scratch);
-        auto * d_wf16 = reinterpret_cast<__half *>(static_cast<uint8_t *>(d_scratch) + align_x);
-        const int64_t nx = static_cast<int64_t>(T) * K;
-        const int64_t nw = static_cast<int64_t>(N) * K;
-        f32_to_f16_kernel<<<(nx + 255) / 256, 256, 0, stream>>>(d_x, d_xf16, nx);
-        bf16_to_f16_kernel<<<(nw + 255) / 256, 256, 0, stream>>>(static_cast<const uint16_t *>(W.ptr), d_wf16, nw);
-        const float alpha = 1.0f, beta = 0.0f;
-        cublasSetStream(cublas, stream);
-        cublasGemmEx(cublas, CUBLAS_OP_T, CUBLAS_OP_N, N, T, K,
-                     &alpha, d_wf16, CUDA_R_16F, K, d_xf16, CUDA_R_16F, K,
-                     &beta, d_y, CUDA_R_32F, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-        return;
+    if (W.dtype == DType::BF16 && T >= 16 && cublas != nullptr) {
+        const bool use_tc = device_has_tensor_cores(W.device);
+        if (use_tc && align_x + static_cast<size_t>(N) * K * sizeof(__half) <= scratch_bytes) {
+            auto * d_xf16 = static_cast<__half *>(d_scratch);
+            auto * d_wf16 = reinterpret_cast<__half *>(static_cast<uint8_t *>(d_scratch) + align_x);
+            const int64_t nx = static_cast<int64_t>(T) * K;
+            const int64_t nw = static_cast<int64_t>(N) * K;
+            f32_to_f16_kernel<<<(nx + 255) / 256, 256, 0, stream>>>(d_x, d_xf16, nx);
+            bf16_to_f16_kernel<<<(nw + 255) / 256, 256, 0, stream>>>(static_cast<const uint16_t *>(W.ptr), d_wf16, nw);
+            const float alpha = 1.0f, beta = 0.0f;
+            cublasSetStream(cublas, stream);
+            cublasGemmEx(cublas, CUBLAS_OP_T, CUBLAS_OP_N, N, T, K,
+                         &alpha, d_wf16, CUDA_R_16F, K, d_xf16, CUDA_R_16F, K,
+                         &beta, d_y, CUDA_R_32F, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            return;
+        }
+        if (!use_tc && static_cast<size_t>(K) * sizeof(float) <= scratch_bytes) {
+            const int chunk_n = std::max(1, std::min(N, static_cast<int>(scratch_bytes / (static_cast<size_t>(K) * sizeof(float)))));
+            auto * d_wf32 = static_cast<float *>(d_scratch);
+            const float alpha = 1.0f, beta = 0.0f;
+            cublasSetStream(cublas, stream);
+            for (int n0 = 0; n0 < N; n0 += chunk_n) {
+                const int cn = std::min(chunk_n, N - n0);
+                const int64_t nw = static_cast<int64_t>(cn) * K;
+                bf16_to_f32_kernel<<<(nw + 255) / 256, 256, 0, stream>>>(
+                    static_cast<const uint16_t *>(W.ptr) + static_cast<size_t>(n0) * K, d_wf32, nw);
+                cublasSgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, cn, T, K,
+                            &alpha, d_wf32, K, d_x, K, &beta, d_y + n0, N);
+            }
+            return;
+        }
+    }
+
+    if (W.dtype == DType::F16 && T >= 16 && cublas != nullptr) {
+        const bool use_tc = device_has_tensor_cores(W.device);
+        if (use_tc && align_x <= scratch_bytes) {
+            auto * d_xf16 = static_cast<__half *>(d_scratch);
+            const int64_t nx = static_cast<int64_t>(T) * K;
+            f32_to_f16_kernel<<<(nx + 255) / 256, 256, 0, stream>>>(d_x, d_xf16, nx);
+            const float alpha = 1.0f, beta = 0.0f;
+            cublasSetStream(cublas, stream);
+            cublasGemmEx(cublas, CUBLAS_OP_T, CUBLAS_OP_N, N, T, K,
+                         &alpha, W.ptr, CUDA_R_16F, K, d_xf16, CUDA_R_16F, K,
+                         &beta, d_y, CUDA_R_32F, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            return;
+        }
+        if (!use_tc && static_cast<size_t>(K) * sizeof(float) <= scratch_bytes) {
+            const int chunk_n = std::max(1, std::min(N, static_cast<int>(scratch_bytes / (static_cast<size_t>(K) * sizeof(float)))));
+            auto * d_wf32 = static_cast<float *>(d_scratch);
+            const float alpha = 1.0f, beta = 0.0f;
+            cublasSetStream(cublas, stream);
+            for (int n0 = 0; n0 < N; n0 += chunk_n) {
+                const int cn = std::min(chunk_n, N - n0);
+                const int64_t nw = static_cast<int64_t>(cn) * K;
+                f16_to_f32_kernel<<<(nw + 255) / 256, 256, 0, stream>>>(
+                    static_cast<const __half *>(W.ptr) + static_cast<size_t>(n0) * K, d_wf32, nw);
+                cublasSgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, cn, T, K,
+                            &alpha, d_wf32, K, d_x, K, &beta, d_y + n0, N);
+            }
+            return;
+        }
     }
 
     if (W.dtype == DType::F32 && T <= 4 && N <= 64 && K >= 512 && (K & 3) == 0) {

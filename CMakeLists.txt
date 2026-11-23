@@ -1,7 +1,8 @@
 cmake_minimum_required(VERSION 3.24)
 
-# Primary targets: Volta (Tesla V100 sm_70) + Ampere (RTX 3090 / 3060 sm_86)
-# NOTE: Must be set BEFORE project(... LANGUAGES CUDA), otherwise CMake defaults to sm_52!
+# Default targets: Volta (sm_70) + Ampere (sm_86).
+# Override via -DCMAKE_CUDA_ARCHITECTURES="52" (Maxwell), "52;60;61" (Maxwell+Pascal), etc.
+# NOTE: Must be set BEFORE project(... LANGUAGES CUDA), otherwise CMake defaults to sm_52.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES "70;86" CACHE STRING "CUDA target architectures")
 endif()
