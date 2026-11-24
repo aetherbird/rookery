@@ -25,6 +25,18 @@ __device__ __forceinline__ float warp_max(float v) {
     return v;
 }
 
+__device__ __forceinline__ float warp_signed_amax_af(float v) {
+    float best = v;
+    float ab   = fabsf(v);
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const float ov  = __shfl_down_sync(0xffffffffu, best, offset);
+        const float oab = fabsf(ov);
+        if (oab > ab) { best = ov; ab = oab; }
+    }
+    return __shfl_sync(0xffffffffu, best, 0);
+}
+
 __global__ void kv_write_f16_kernel(
     const float *   __restrict__ k,
     const float *   __restrict__ v,
@@ -90,6 +102,47 @@ __global__ void kv_write_q8_0_kernel(
     }
 }
 
+__global__ void kv_write_q4_0_kernel(
+    const float *   __restrict__ k,
+    const float *   __restrict__ v,
+    BlockQ4_0 *     __restrict__ k_cache,
+    BlockQ4_0 *     __restrict__ v_cache,
+    const int32_t * __restrict__ pos,
+    int T, int n_kv_heads, int head_dim) {
+
+    const int blocks_per_tok = (n_kv_heads * head_dim) / 32;
+    const int b = blockIdx.x * blockDim.y + threadIdx.y;
+    const int t = blockIdx.y;
+    if (t >= T || b >= blocks_per_tok) return;
+
+    const int lane = threadIdx.x;
+    const int p    = pos[t];
+    const size_t src_base = (static_cast<size_t>(t) * blocks_per_tok + b) * 32;
+    const size_t dst_blk  = static_cast<size_t>(p) * blocks_per_tok + b;
+
+    auto quant_store = [&](const float * src, BlockQ4_0 * dst) {
+        const float val   = src[src_base + lane];
+        const float max_v = warp_signed_amax_af(val);
+        const float d     = max_v * (-0.125f);
+        const float id    = (d != 0.0f) ? (1.0f / d) : 0.0f;
+        int qi = static_cast<int>(floorf(val * id + 8.5f));
+        if (qi < 0)  qi = 0;
+        if (qi > 15) qi = 15;
+        const uint32_t q    = static_cast<uint32_t>(qi);
+        const uint32_t q_lo = __shfl_sync(0xffffffffu, q, (lane << 1) & 31);
+        const uint32_t q_hi = __shfl_sync(0xffffffffu, q, ((lane << 1) | 1) & 31);
+        if (lane == 0) {
+            __half dh = __float2half_rn(d);
+            dst[dst_blk].d = *reinterpret_cast<uint16_t *>(&dh);
+        }
+        if (lane < 16) {
+            dst[dst_blk].qs[lane] = static_cast<uint8_t>(q_lo | (q_hi << 4));
+        }
+    };
+    quant_store(k, k_cache);
+    quant_store(v, v_cache);
+}
+
 // ============================================================================
 // Tiled FlashAttention Prefill (T >= 8, head_dim == 128)
 // Uses cublasGemmStridedBatchedEx:
@@ -132,7 +185,7 @@ __global__ void gqa_init_flash_ml_kernel(float * __restrict__ d_m, float * __res
     }
 }
 
-template <bool KV_Q8_0, typename TDst>
+template <KvCacheType KV_TYPE, typename TDst>
 __global__ void gqa_dequant_kv_tile_d128_kernel(
     const void * __restrict__ k_cache,
     const void * __restrict__ v_cache,
@@ -145,7 +198,7 @@ __global__ void gqa_dequant_kv_tile_d128_kernel(
     const int p   = k0 + kp;
     const size_t dst_base = (static_cast<size_t>(kvh) * kc + kp) * 128;
 
-    if constexpr (KV_Q8_0) {
+    if constexpr (KV_TYPE == KvCacheType::Q8_0) {
         // blockDim = (32, 4): 4 warps = 4 Q8_0 blocks of 32 elems
         const int lane = threadIdx.x;
         const int blk  = threadIdx.y;
@@ -160,6 +213,33 @@ __global__ void gqa_dequant_kv_tile_d128_kernel(
         *reinterpret_cast<uint16_t *>(&vd_h) = __ldg(&vb.d);
         const float kv = __half2float(kd_h) * static_cast<float>(__ldg(&kb.qs[lane]));
         const float vv = __half2float(vd_h) * static_cast<float>(__ldg(&vb.qs[lane]));
+        const int d = blk * 32 + lane;
+        if constexpr (std::is_same_v<TDst, __half>) {
+            k_out[dst_base + d] = __float2half_rn(kv);
+            v_out[dst_base + d] = __float2half_rn(vv);
+        } else {
+            k_out[dst_base + d] = kv;
+            v_out[dst_base + d] = vv;
+        }
+    } else if constexpr (KV_TYPE == KvCacheType::Q4_0) {
+        // blockDim = (32, 4): 4 warps = 4 Q4_0 blocks of 32 elems
+        const int lane = threadIdx.x;
+        const int blk  = threadIdx.y;
+        const auto * kc_b = static_cast<const BlockQ4_0 *>(k_cache);
+        const auto * vc_b = static_cast<const BlockQ4_0 *>(v_cache);
+        const size_t bidx = (static_cast<size_t>(p) * n_kv + kvh) * 4 + blk;
+        const BlockQ4_0 & kb = kc_b[bidx];
+        const BlockQ4_0 & vb = vc_b[bidx];
+
+        __half kd_h, vd_h;
+        *reinterpret_cast<uint16_t *>(&kd_h) = __ldg(&kb.d);
+        *reinterpret_cast<uint16_t *>(&vd_h) = __ldg(&vb.d);
+        const uint8_t kqb = __ldg(&kb.qs[lane >> 1]);
+        const uint8_t vqb = __ldg(&vb.qs[lane >> 1]);
+        const int kq = (lane & 1) ? static_cast<int>(kqb >> 4) : static_cast<int>(kqb & 0xFu);
+        const int vq = (lane & 1) ? static_cast<int>(vqb >> 4) : static_cast<int>(vqb & 0xFu);
+        const float kv = __half2float(kd_h) * static_cast<float>(kq - 8);
+        const float vv = __half2float(vd_h) * static_cast<float>(vq - 8);
         const int d = blk * 32 + lane;
         if constexpr (std::is_same_v<TDst, __half>) {
             k_out[dst_base + d] = __float2half_rn(kv);
@@ -308,7 +388,7 @@ __global__ void gqa_o_from_kvh_finalize_d128_kernel(
 }
 
 // Zero-syncthreads 1-warp-per-head online-softmax FlashAttention for GQA (head_dim = 128).
-template <bool KV_Q8_0>
+template <KvCacheType KV_TYPE>
 __global__ void gqa_flash_attn_d128_warp_kernel(
     const float *   __restrict__ q,
     const void *    __restrict__ k_cache,
@@ -343,7 +423,7 @@ __global__ void gqa_flash_attn_d128_warp_kernel(
         float k0, k1, k2, k3;
         float v0, v1, v2, v3;
 
-        if constexpr (KV_Q8_0) {
+        if constexpr (KV_TYPE == KvCacheType::Q8_0) {
             const auto * kc = static_cast<const BlockQ8_0 *>(k_cache);
             const auto * vc = static_cast<const BlockQ8_0 *>(v_cache);
             const size_t blk = (static_cast<size_t>(p) * n_kv_heads + kvh) * 4 + blk_idx;
@@ -365,6 +445,30 @@ __global__ void gqa_flash_attn_d128_warp_kernel(
             v1 = vd * static_cast<float>(vb.qs[blk_off + 1]);
             v2 = vd * static_cast<float>(vb.qs[blk_off + 2]);
             v3 = vd * static_cast<float>(vb.qs[blk_off + 3]);
+        } else if constexpr (KV_TYPE == KvCacheType::Q4_0) {
+            const auto * kc = static_cast<const BlockQ4_0 *>(k_cache);
+            const auto * vc = static_cast<const BlockQ4_0 *>(v_cache);
+            const size_t blk = (static_cast<size_t>(p) * n_kv_heads + kvh) * 4 + blk_idx;
+            const BlockQ4_0 & kb = kc[blk];
+            const BlockQ4_0 & vb = vc[blk];
+
+            __half kd_h, vd_h;
+            *reinterpret_cast<uint16_t *>(&kd_h) = __ldg(&kb.d);
+            *reinterpret_cast<uint16_t *>(&vd_h) = __ldg(&vb.d);
+            const float kd = __half2float(kd_h);
+            const float vd = __half2float(vd_h);
+            const uint16_t pk = __ldg(reinterpret_cast<const uint16_t *>(kb.qs + (blk_off >> 1)));
+            const uint16_t pv = __ldg(reinterpret_cast<const uint16_t *>(vb.qs + (blk_off >> 1)));
+
+            k0 = kd * static_cast<float>(static_cast<int>( pk        & 0xFu) - 8);
+            k1 = kd * static_cast<float>(static_cast<int>((pk >>  4) & 0xFu) - 8);
+            k2 = kd * static_cast<float>(static_cast<int>((pk >>  8) & 0xFu) - 8);
+            k3 = kd * static_cast<float>(static_cast<int>((pk >> 12) & 0xFu) - 8);
+
+            v0 = vd * static_cast<float>(static_cast<int>( pv        & 0xFu) - 8);
+            v1 = vd * static_cast<float>(static_cast<int>((pv >>  4) & 0xFu) - 8);
+            v2 = vd * static_cast<float>(static_cast<int>((pv >>  8) & 0xFu) - 8);
+            v3 = vd * static_cast<float>(static_cast<int>((pv >> 12) & 0xFu) - 8);
         } else {
             const auto * kc = static_cast<const uint2 *>(k_cache);
             const auto * vc = static_cast<const uint2 *>(v_cache);
@@ -434,9 +538,24 @@ void launch_kv_write_q8_0(
         d_pos, T, n_kv_heads, head_dim);
 }
 
+void launch_kv_write_q4_0(
+    const float * d_k, const float * d_v,
+    void * d_k_cache, void * d_v_cache,
+    const int32_t * d_pos, int T, int n_kv_heads, int head_dim,
+    cudaStream_t stream) {
+
+    const int blocks_per_tok = (n_kv_heads * head_dim) / 32;
+    constexpr int wpb = 8;
+    dim3 grid((blocks_per_tok + wpb - 1) / wpb, T);
+    kv_write_q4_0_kernel<<<grid, dim3(32, wpb), 0, stream>>>(
+        d_k, d_v,
+        static_cast<BlockQ4_0 *>(d_k_cache), static_cast<BlockQ4_0 *>(d_v_cache),
+        d_pos, T, n_kv_heads, head_dim);
+}
+
 void launch_gqa_attn(
     const float * d_q, const void * d_k_cache, const void * d_v_cache,
-    bool kv_is_q8_0, const int32_t * d_pos, float * d_out, void * d_scratch,
+    KvCacheType kv_type, const int32_t * d_pos, float * d_out, void * d_scratch,
     int T, int n_heads, int n_kv_heads, int head_dim, float scale,
     cudaStream_t stream,
     cublasHandle_t cublas, size_t scratch_bytes, int kv_len_max) {
@@ -484,11 +603,14 @@ void launch_gqa_attn(
 
                 for (int k0 = 0; k0 < kv_len_max; k0 += K_TILE) {
                     const int kc = (k0 + K_TILE < kv_len_max) ? K_TILE : (kv_len_max - k0);
-                    if (kv_is_q8_0) {
-                        gqa_dequant_kv_tile_d128_kernel<true, __half><<<dim3(n_kv_heads, kc), dim3(32, 4), 0, stream>>>(
+                    if (kv_type == KvCacheType::Q8_0) {
+                        gqa_dequant_kv_tile_d128_kernel<KvCacheType::Q8_0, __half><<<dim3(n_kv_heads, kc), dim3(32, 4), 0, stream>>>(
+                            d_k_cache, d_v_cache, d_k16, d_v16, k0, kc, n_kv_heads);
+                    } else if (kv_type == KvCacheType::Q4_0) {
+                        gqa_dequant_kv_tile_d128_kernel<KvCacheType::Q4_0, __half><<<dim3(n_kv_heads, kc), dim3(32, 4), 0, stream>>>(
                             d_k_cache, d_v_cache, d_k16, d_v16, k0, kc, n_kv_heads);
                     } else {
-                        gqa_dequant_kv_tile_d128_kernel<false, __half><<<dim3(n_kv_heads, kc), 128, 0, stream>>>(
+                        gqa_dequant_kv_tile_d128_kernel<KvCacheType::F16, __half><<<dim3(n_kv_heads, kc), 128, 0, stream>>>(
                             d_k_cache, d_v_cache, d_k16, d_v16, k0, kc, n_kv_heads);
                     }
 
@@ -554,11 +676,14 @@ void launch_gqa_attn(
 
                 for (int k0 = 0; k0 < kv_len_max; k0 += K_TILE) {
                     const int kc = (k0 + K_TILE < kv_len_max) ? K_TILE : (kv_len_max - k0);
-                    if (kv_is_q8_0) {
-                        gqa_dequant_kv_tile_d128_kernel<true, __half><<<dim3(n_kv_heads, kc), dim3(32, 4), 0, stream>>>(
+                    if (kv_type == KvCacheType::Q8_0) {
+                        gqa_dequant_kv_tile_d128_kernel<KvCacheType::Q8_0, __half><<<dim3(n_kv_heads, kc), dim3(32, 4), 0, stream>>>(
+                            d_k_cache, d_v_cache, d_k16, d_v16, k0, kc, n_kv_heads);
+                    } else if (kv_type == KvCacheType::Q4_0) {
+                        gqa_dequant_kv_tile_d128_kernel<KvCacheType::Q4_0, __half><<<dim3(n_kv_heads, kc), dim3(32, 4), 0, stream>>>(
                             d_k_cache, d_v_cache, d_k16, d_v16, k0, kc, n_kv_heads);
                     } else {
-                        gqa_dequant_kv_tile_d128_kernel<false, __half><<<dim3(n_kv_heads, kc), 128, 0, stream>>>(
+                        gqa_dequant_kv_tile_d128_kernel<KvCacheType::F16, __half><<<dim3(n_kv_heads, kc), 128, 0, stream>>>(
                             d_k_cache, d_v_cache, d_k16, d_v16, k0, kc, n_kv_heads);
                     }
 
@@ -625,11 +750,14 @@ void launch_gqa_attn(
 
                 for (int k0 = 0; k0 < kv_len_max; k0 += K_TILE) {
                     const int kc = (k0 + K_TILE < kv_len_max) ? K_TILE : (kv_len_max - k0);
-                    if (kv_is_q8_0) {
-                        gqa_dequant_kv_tile_d128_kernel<true, float><<<dim3(n_kv_heads, kc), dim3(32, 4), 0, stream>>>(
+                    if (kv_type == KvCacheType::Q8_0) {
+                        gqa_dequant_kv_tile_d128_kernel<KvCacheType::Q8_0, float><<<dim3(n_kv_heads, kc), dim3(32, 4), 0, stream>>>(
+                            d_k_cache, d_v_cache, d_k32, d_v32, k0, kc, n_kv_heads);
+                    } else if (kv_type == KvCacheType::Q4_0) {
+                        gqa_dequant_kv_tile_d128_kernel<KvCacheType::Q4_0, float><<<dim3(n_kv_heads, kc), dim3(32, 4), 0, stream>>>(
                             d_k_cache, d_v_cache, d_k32, d_v32, k0, kc, n_kv_heads);
                     } else {
-                        gqa_dequant_kv_tile_d128_kernel<false, float><<<dim3(n_kv_heads, kc), 128, 0, stream>>>(
+                        gqa_dequant_kv_tile_d128_kernel<KvCacheType::F16, float><<<dim3(n_kv_heads, kc), 128, 0, stream>>>(
                             d_k_cache, d_v_cache, d_k32, d_v32, k0, kc, n_kv_heads);
                     }
 
@@ -665,7 +793,7 @@ void launch_gqa_attn(
 
     // 2. Reuse Split-K GQA-8 Shared-KV FlashAttention for decode/MTP (T <= 4)!
     if (T <= 4 && d_scratch != nullptr) {
-        launch_gqa_attn_msa(d_q, d_k_cache, d_v_cache, kv_is_q8_0,
+        launch_gqa_attn_msa(d_q, d_k_cache, d_v_cache, kv_type,
                             d_pos, nullptr, nullptr, d_out, d_scratch,
                             T, n_heads, n_kv_heads, head_dim, 128, 0, scale, stream);
         return;
@@ -674,11 +802,14 @@ void launch_gqa_attn(
     constexpr int wpb = 4; // 4 heads per block = 8 blocks for 32 heads
     dim3 grid((n_heads + wpb - 1) / wpb, T);
     dim3 block(32, wpb);
-    if (kv_is_q8_0) {
-        gqa_flash_attn_d128_warp_kernel<true><<<grid, block, 0, stream>>>(
+    if (kv_type == KvCacheType::Q8_0) {
+        gqa_flash_attn_d128_warp_kernel<KvCacheType::Q8_0><<<grid, block, 0, stream>>>(
+            d_q, d_k_cache, d_v_cache, d_pos, d_out, n_heads, n_kv_heads, scale);
+    } else if (kv_type == KvCacheType::Q4_0) {
+        gqa_flash_attn_d128_warp_kernel<KvCacheType::Q4_0><<<grid, block, 0, stream>>>(
             d_q, d_k_cache, d_v_cache, d_pos, d_out, n_heads, n_kv_heads, scale);
     } else {
-        gqa_flash_attn_d128_warp_kernel<false><<<grid, block, 0, stream>>>(
+        gqa_flash_attn_d128_warp_kernel<KvCacheType::F16><<<grid, block, 0, stream>>>(
             d_q, d_k_cache, d_v_cache, d_pos, d_out, n_heads, n_kv_heads, scale);
     }
 }

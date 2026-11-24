@@ -42,10 +42,10 @@ Measured against `llama.cpp` (`-fa 1 -ctk q8_0 -ctv q8_0`) on heterogeneous mult
 | **Ling-3.0-tiny** (`Q4_K_M`) | RTX 3090 (`sm_86`) | Prefill `pp128` / `pp512` | `3,809.9` / `9,174.8 tok/s` | **`6,555.2` / `9,471.4 tok/s`** | **+72% / +3%** |
 | **Ling-3.0-tiny** (`Q4_K_M`) | RTX 3090 (`sm_86`) | Decode `tg128` (`d=0` / `4K` / `16K`) | `241.4` / `239.2` / `220.8 tok/s` | **`383.9` / `355.2` / `294.0 tok/s`** | **+59% / +49% / +33%** |
 | **Qwen3.6-35B-A3B** (`UD-Q3_K_XL`) | P100 + GTX 1060 (`sm_60/61`) | Decode `tg128` | `38.0 tok/s` | **`53.4 tok/s`** | **+41%** |
-| **Maxwell-V1-Flash** (`Q3_K_M`, MTP) | P100 + GTX 1060 (`sm_60/61`) | Prefill `pp512` / `pp4096` / `pp16384` | Unsupported | **`510.3` / `474.3` / `327.1 tok/s`** | **7.33×–8.12× vs baseline** |
-| **Maxwell-V1-Flash** (`Q3_K_M`, MTP) | P100 + GTX 1060 (`sm_60/61`) | Decode `tg128` (`d=0` / `4K` / `32K`, no MTP / + MTP) | Unsupported | `94.1` / `77.7` / `47.4` · **`110.7` / `93.3` / `55.5 tok/s`** | **3.38×–4.19× vs baseline** |
-| **Inkling-2-Mini** (`IQ4_NL`, `36K` ctx) | P100 + GTX 1060 (`sm_60/61`) | Prefill `pp512` / `pp8192` | Unsupported | **`543.7` / `504.7 tok/s`** | **7.87× vs baseline** |
-| **Inkling-2-Mini** (`IQ4_NL`, `36K` ctx) | P100 + GTX 1060 (`sm_60/61`) | Decode `tg128` (`d=0` / `16K` / `32K`) | Unsupported | **`64.0` / `54.6` / `49.0 tok/s`** | **2.31×–2.57× vs baseline** |
+| **Maxwell-V1-Flash** (`Q3_K_M`, MTP, `128K` `Q4_0` KV) | P100 + GTX 1060 (`sm_60/61`) | Prefill `pp512` / `pp4096` / `pp16384` | Unsupported | **`510.3`** (`409.5` @128K) / **`474.3`** / **`327.1 tok/s`** | **7.33×–8.12× vs baseline** |
+| **Maxwell-V1-Flash** (`Q3_K_M`, MTP, `128K` `Q4_0` KV) | P100 + GTX 1060 (`sm_60/61`) | Decode `tg128` (`d=0` / `4K` / `32K`, `Q4_0` 128K + MTP) | Unsupported | **`84.5`** / **`72.6`** / **`53.5 tok/s`** (`100%` MTP acc @32K MSA) | **4.0× max ctx (`32K → 128K`)** |
+| **Inkling-2-Mini** (`IQ4_NL`, `256K` `Q4_0` KV + SWA) | P100 + GTX 1060 (`sm_60/61`) | Prefill `pp512` / `pp4096` | Unsupported | **`509.3`** / **`487.1 tok/s`** (`543.7` @36K) | **7.1× max ctx (`36K → 256K`)** |
+| **Inkling-2-Mini** (`IQ4_NL`, `256K` `Q4_0` KV + SWA) | P100 + GTX 1060 (`sm_60/61`) | Decode `tg128` (`d=0` / `16K` / `32K`) | Unsupported | **`60.9`** / **`52.2`** / **`47.0 tok/s`** | **0.5% delta vs `Q8_0`** |
 
 See [bench/baseline.md](bench/baseline.md), [bench/engram_audit_v1.md](bench/engram_audit_v1.md), and [bench/engram_vertical_slice_v2.md](bench/engram_vertical_slice_v2.md) for detailed logs and Engram vertical-slice audits.
 
@@ -91,7 +91,7 @@ Common flags:
 - `--alias <name>` — Model ID reported by `/v1/models`
 - `-c, --ctx-size <n>` — Maximum context length (default `32768`)
 - `--gpus <0,1,...>` / `-ts, --tensor-split <w0,w1,...>` — Explicit GPU selection and layer split weights
-- `-ctk, --cache-type-k <q8_0|f16>` — KV cache quantization (default `q8_0`)
+- `-ctk, --cache-type-k <q8_0|q4_0|f16>` / `-ctv, --cache-type-v <q8_0|q4_0|f16>` — KV cache quantization (default `q8_0`; `q4_0` cuts KV + MSA indexer cache VRAM ~2×–3.5× for `128K–256K` contexts on 22 GB VRAM setups)
 - `--mtp` / `--no-mtp` — Enable/disable NextN Multi-Token Prediction speculative decoding (default on when present)
 - `--temp`, `--top-p`, `--top-k` — Default sampling parameters
 - `--engram <table.gguf>`, `--engram-adapter <adapter.rkad>`, `--engram-scale <f>` — Cross-model Engram sidecar options
@@ -119,7 +119,7 @@ python3 scripts/engram_pipeline.py build \
   --eval-prose /path/to/eval_prose.txt \
   --out /path/to/adapter_v3.rkad
 
-# (For Level-3 temp-calibrated contrastive gated training, pass --mode level3 --max-tokens 200000 --base-scale 0.05)
+# (For Level-3 temp-calibrated contrastive gated training with native provider W_V/W_K pre-decoding & algebraic folding into zero-overhead RKAD v3, pass --mode level3 --engram-kv-gguf /path/to/provider-kv-shard.gguf --max-tokens 200000 --base-scale 0.05)
 
 # 3. Optional N + M canonical Z composition (`engram-z-v1`, zero extra runtime overhead):
 #    Fit provider exporters (.rkex) and host importers (.rkim) independently, then fold any pair into RKAD v3

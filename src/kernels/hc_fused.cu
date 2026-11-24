@@ -34,27 +34,60 @@ __global__ void hc_flat_rmsnorm_mix_bf16_kernel(
     const int t   = blockIdx.y;
     if (row >= n_out) return;
 
-    const float4 * x4 = reinterpret_cast<const float4 *>(inpL + static_cast<size_t>(t) * hc_dim);
-    const uint4 *  w8 = reinterpret_cast<const uint4 *>(hc_fn + static_cast<size_t>(row) * hc_dim);
-    const int n8 = hc_dim >> 3;
+    auto dot_bf16_4 = [](const float4 & v, const uint2 & wp) -> float {
+        return __uint_as_float((wp.x & 0xffffu) << 16) * v.x
+             + __uint_as_float(wp.x & 0xffff0000u)     * v.y
+             + __uint_as_float((wp.y & 0xffffu) << 16) * v.z
+             + __uint_as_float(wp.y & 0xffff0000u)     * v.w;
+    };
 
     float ss  = 0.0f;
     float dot = 0.0f;
-    for (int i = threadIdx.x; i < n8; i += blockDim.x) {
-        const float4 xa = x4[i * 2 + 0];
-        const float4 xb = x4[i * 2 + 1];
-        const uint4  wp = __ldg(&w8[i]);
+    if ((hc_dim & 15) == 0) {
+        // Exact same 4-stream reduction order as hc_post_flat_rmsnorm_mix_bf16_kernel
+        // so fused vs unfused hc_post + hc_flat_rmsnorm_mix are bit-for-bit identical!
+        const int n_embd = hc_dim >> 2;
+        const int n4     = n_embd >> 2;
+        const float *  base_x = inpL  + static_cast<size_t>(t)   * hc_dim;
+        const uint16_t * base_w = hc_fn + static_cast<size_t>(row) * hc_dim;
+        const float4 * x0_p = reinterpret_cast<const float4 *>(base_x + 0 * n_embd);
+        const float4 * x1_p = reinterpret_cast<const float4 *>(base_x + 1 * n_embd);
+        const float4 * x2_p = reinterpret_cast<const float4 *>(base_x + 2 * n_embd);
+        const float4 * x3_p = reinterpret_cast<const float4 *>(base_x + 3 * n_embd);
+        const uint2 *  w0_p = reinterpret_cast<const uint2 *>(base_w + 0 * n_embd);
+        const uint2 *  w1_p = reinterpret_cast<const uint2 *>(base_w + 1 * n_embd);
+        const uint2 *  w2_p = reinterpret_cast<const uint2 *>(base_w + 2 * n_embd);
+        const uint2 *  w3_p = reinterpret_cast<const uint2 *>(base_w + 3 * n_embd);
 
-        ss  += xa.x * xa.x + xa.y * xa.y + xa.z * xa.z + xa.w * xa.w
-             + xb.x * xb.x + xb.y * xb.y + xb.z * xb.z + xb.w * xb.w;
-        dot += __uint_as_float((wp.x & 0xffffu) << 16) * xa.x
-             + __uint_as_float(wp.x & 0xffff0000u)     * xa.y
-             + __uint_as_float((wp.y & 0xffffu) << 16) * xa.z
-             + __uint_as_float(wp.y & 0xffff0000u)     * xa.w
-             + __uint_as_float((wp.z & 0xffffu) << 16) * xb.x
-             + __uint_as_float(wp.z & 0xffff0000u)     * xb.y
-             + __uint_as_float((wp.w & 0xffffu) << 16) * xb.z
-             + __uint_as_float(wp.w & 0xffff0000u)     * xb.w;
+        for (int i = threadIdx.x; i < n4; i += blockDim.x) {
+            const float4 y0 = x0_p[i], y1 = x1_p[i], y2 = x2_p[i], y3 = x3_p[i];
+            ss += y0.x * y0.x + y0.y * y0.y + y0.z * y0.z + y0.w * y0.w
+                + y1.x * y1.x + y1.y * y1.y + y1.z * y1.z + y1.w * y1.w
+                + y2.x * y2.x + y2.y * y2.y + y2.z * y2.z + y2.w * y2.w
+                + y3.x * y3.x + y3.y * y3.y + y3.z * y3.z + y3.w * y3.w;
+            dot += dot_bf16_4(y0, __ldg(&w0_p[i])) + dot_bf16_4(y1, __ldg(&w1_p[i]))
+                 + dot_bf16_4(y2, __ldg(&w2_p[i])) + dot_bf16_4(y3, __ldg(&w3_p[i]));
+        }
+    } else {
+        const float4 * x4 = reinterpret_cast<const float4 *>(inpL + static_cast<size_t>(t) * hc_dim);
+        const uint4 *  w8 = reinterpret_cast<const uint4 *>(hc_fn + static_cast<size_t>(row) * hc_dim);
+        const int n8 = hc_dim >> 3;
+        for (int i = threadIdx.x; i < n8; i += blockDim.x) {
+            const float4 xa = x4[i * 2 + 0];
+            const float4 xb = x4[i * 2 + 1];
+            const uint4  wp = __ldg(&w8[i]);
+
+            ss  += xa.x * xa.x + xa.y * xa.y + xa.z * xa.z + xa.w * xa.w
+                 + xb.x * xb.x + xb.y * xb.y + xb.z * xb.z + xb.w * xb.w;
+            dot += __uint_as_float((wp.x & 0xffffu) << 16) * xa.x
+                 + __uint_as_float(wp.x & 0xffff0000u)     * xa.y
+                 + __uint_as_float((wp.y & 0xffffu) << 16) * xa.z
+                 + __uint_as_float(wp.y & 0xffff0000u)     * xa.w
+                 + __uint_as_float((wp.z & 0xffffu) << 16) * xb.x
+                 + __uint_as_float(wp.z & 0xffff0000u)     * xb.y
+                 + __uint_as_float((wp.w & 0xffffu) << 16) * xb.z
+                 + __uint_as_float(wp.w & 0xffff0000u)     * xb.w;
+        }
     }
 
     __shared__ float s_ss[8];

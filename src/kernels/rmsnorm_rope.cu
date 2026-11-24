@@ -23,6 +23,18 @@ __device__ __forceinline__ float warp_max_rr(float v) {
     return v;
 }
 
+__device__ __forceinline__ float warp_signed_amax_rr(float v) {
+    float best = v;
+    float ab   = fabsf(v);
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const float ov  = __shfl_down_sync(0xffffffffu, best, offset);
+        const float oab = fabsf(ov);
+        if (oab > ab) { best = ov; ab = oab; }
+    }
+    return __shfl_sync(0xffffffffu, best, 0);
+}
+
 __global__ void embd_lookup_q8_0_soa_kernel(
     const int8_t *   __restrict__ qs,
     const uint16_t * __restrict__ scales,
@@ -290,7 +302,7 @@ __global__ void qk_norm_rope_neox_kernel(
 // Fused QK-RMSNorm + NeoX RoPE (head_dim == 128) + KV-Cache Write (Q8_0 or F16).
 // Eliminates 2 kernel launches/layer + K DRAM write/re-read roundtrip!
 // Grid: (n_heads + n_kv_heads, T), Block: 32 (1 warp per head; 36 CTAs for Maxwell T=1).
-template <bool KV_Q8_0>
+template <KvCacheType KV_TYPE>
 __global__ void maxwell_qk_norm_rope_kv_write_d128_kernel(
     float *         __restrict__ q,
     const float *   __restrict__ k,
@@ -358,7 +370,7 @@ __global__ void maxwell_qk_norm_rope_kv_write_d128_kernel(
     const float v2 = v_src[lane + 64];
     const float v3 = v_src[lane + 96];
 
-    if constexpr (KV_Q8_0) {
+    if constexpr (KV_TYPE == KvCacheType::Q8_0) {
         auto * kc = static_cast<BlockQ8_0 *>(k_cache);
         auto * vc = static_cast<BlockQ8_0 *>(v_cache);
         const size_t blk_base = (static_cast<size_t>(p) * n_kv_heads + kvh) * 4;
@@ -372,6 +384,31 @@ __global__ void maxwell_qk_norm_rope_kv_write_d128_kernel(
                 dst[blk_base + bi].d = *reinterpret_cast<uint16_t *>(&dh);
             }
             dst[blk_base + bi].qs[lane] = static_cast<int8_t>(__float2int_rn(val * inv_d));
+        };
+        quant_store(kc, 0, r0); quant_store(kc, 1, r1); quant_store(kc, 2, r2); quant_store(kc, 3, r3);
+        quant_store(vc, 0, v0); quant_store(vc, 1, v1); quant_store(vc, 2, v2); quant_store(vc, 3, v3);
+    } else if constexpr (KV_TYPE == KvCacheType::Q4_0) {
+        auto * kc = static_cast<BlockQ4_0 *>(k_cache);
+        auto * vc = static_cast<BlockQ4_0 *>(v_cache);
+        const size_t blk_base = (static_cast<size_t>(p) * n_kv_heads + kvh) * 4;
+
+        auto quant_store = [&](BlockQ4_0 * dst, int bi, float val) {
+            const float max_v = warp_signed_amax_rr(val);
+            const float d     = max_v * (-0.125f);
+            const float id    = (d != 0.0f) ? (1.0f / d) : 0.0f;
+            int qi = static_cast<int>(floorf(val * id + 8.5f));
+            if (qi < 0)  qi = 0;
+            if (qi > 15) qi = 15;
+            const uint32_t q    = static_cast<uint32_t>(qi);
+            const uint32_t q_lo = __shfl_sync(0xffffffffu, q, (lane << 1) & 31);
+            const uint32_t q_hi = __shfl_sync(0xffffffffu, q, ((lane << 1) | 1) & 31);
+            if (lane == 0) {
+                __half dh = __float2half_rn(d);
+                dst[blk_base + bi].d = *reinterpret_cast<uint16_t *>(&dh);
+            }
+            if (lane < 16) {
+                dst[blk_base + bi].qs[lane] = static_cast<uint8_t>(q_lo | (q_hi << 4));
+            }
         };
         quant_store(kc, 0, r0); quant_store(kc, 1, r1); quant_store(kc, 2, r2); quant_store(kc, 3, r3);
         quant_store(vc, 0, v0); quant_store(vc, 1, v1); quant_store(vc, 2, v2); quant_store(vc, 3, v3);
@@ -531,18 +568,22 @@ void launch_qk_norm_rope_neox(
 void launch_maxwell_qk_norm_rope_kv_write(
     float * d_q, const float * d_k, const float * d_v,
     const float * d_q_norm_w, const float * d_k_norm_w,
-    void * d_k_cache, void * d_v_cache, bool kv_is_q8_0,
+    void * d_k_cache, void * d_v_cache, KvCacheType kv_type,
     const int32_t * d_pos, int n_tokens, int n_heads, int n_kv_heads, int head_dim,
     float rms_eps, float rope_freq_base, cudaStream_t stream) {
 
     if (head_dim == 128) {
         dim3 grid(n_heads + n_kv_heads, n_tokens);
-        if (kv_is_q8_0) {
-            maxwell_qk_norm_rope_kv_write_d128_kernel<true><<<grid, 32, 0, stream>>>(
+        if (kv_type == KvCacheType::Q8_0) {
+            maxwell_qk_norm_rope_kv_write_d128_kernel<KvCacheType::Q8_0><<<grid, 32, 0, stream>>>(
+                d_q, d_k, d_v, d_q_norm_w, d_k_norm_w, d_k_cache, d_v_cache, d_pos,
+                n_heads, n_kv_heads, rms_eps, rope_freq_base);
+        } else if (kv_type == KvCacheType::Q4_0) {
+            maxwell_qk_norm_rope_kv_write_d128_kernel<KvCacheType::Q4_0><<<grid, 32, 0, stream>>>(
                 d_q, d_k, d_v, d_q_norm_w, d_k_norm_w, d_k_cache, d_v_cache, d_pos,
                 n_heads, n_kv_heads, rms_eps, rope_freq_base);
         } else {
-            maxwell_qk_norm_rope_kv_write_d128_kernel<false><<<grid, 32, 0, stream>>>(
+            maxwell_qk_norm_rope_kv_write_d128_kernel<KvCacheType::F16><<<grid, 32, 0, stream>>>(
                 d_q, d_k, d_v, d_q_norm_w, d_k_norm_w, d_k_cache, d_v_cache, d_pos,
                 n_heads, n_kv_heads, rms_eps, rope_freq_base);
         }
@@ -550,8 +591,10 @@ void launch_maxwell_qk_norm_rope_kv_write(
     }
     launch_qk_norm_rope_neox(d_q, d_q_norm_w, d_pos, n_tokens, n_heads, head_dim, rms_eps, rope_freq_base, stream);
     launch_qk_norm_rope_neox(const_cast<float *>(d_k), d_k_norm_w, d_pos, n_tokens, n_kv_heads, head_dim, rms_eps, rope_freq_base, stream);
-    if (kv_is_q8_0) {
+    if (kv_type == KvCacheType::Q8_0) {
         launch_kv_write_q8_0(d_k, d_v, d_k_cache, d_v_cache, d_pos, n_tokens, n_kv_heads, head_dim, stream);
+    } else if (kv_type == KvCacheType::Q4_0) {
+        launch_kv_write_q4_0(d_k, d_v, d_k_cache, d_v_cache, d_pos, n_tokens, n_kv_heads, head_dim, stream);
     } else {
         launch_kv_write_f16(d_k, d_v, d_k_cache, d_v_cache, d_pos, n_tokens, n_kv_heads, head_dim, stream);
     }

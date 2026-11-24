@@ -693,8 +693,9 @@ int main(int argc, char ** argv) {
     std::string host  = "127.0.0.1";
     int         port  = 8080;
     std::string alias;
-    int         max_ctx = 32768;
-    bool        kv_q8   = true;
+    int                  max_ctx       = 32768;
+    rookery::KvCacheType kv_type       = rookery::KvCacheType::Q8_0;
+    bool                 kv_type_k_set = false;
     bool        use_mtp = true;
     std::vector<int>   gpu_ids;
     std::vector<float> tensor_split;
@@ -715,8 +716,13 @@ int main(int argc, char ** argv) {
         else if (a == "-c" || a == "--ctx-size")  max_ctx = std::atoi(next().c_str());
         else if (a == "--tensor-split" || a == "-ts") tensor_split = parse_csv_floats(next());
         else if (a == "--gpus")                   gpu_ids = parse_csv_ints(next());
-        else if (a == "--cache-type-k" || a == "-ctk") kv_q8 = (next() != "f16");
-        else if (a == "--cache-type-v" || a == "-ctv") (void) next();
+        else if (a == "--cache-type-k" || a == "-ctk") {
+            kv_type = rookery::parse_kv_cache_type(next());
+            kv_type_k_set = true;
+        } else if (a == "--cache-type-v" || a == "-ctv") {
+            const auto vt = rookery::parse_kv_cache_type(next());
+            if (!kv_type_k_set) kv_type = vt;
+        }
         else if (a == "--temp")                   default_sampling.temperature = std::strtof(next().c_str(), nullptr);
         else if (a == "--top-p")                  default_sampling.top_p = std::strtof(next().c_str(), nullptr);
         else if (a == "--top-k")                  default_sampling.top_k = std::atoi(next().c_str());
@@ -1241,6 +1247,7 @@ int main(int argc, char ** argv) {
         tokenizer.load(sg.meta());
     }
 
+    const bool kv_q8 = (kv_type != rookery::KvCacheType::F16);
     if (engine.arch == "glm5-next" || engine.arch == "glm5next") {
         tokenizer.add_stop_token("<|user|>");
         tokenizer.add_stop_token("<|observation|>");
@@ -1249,7 +1256,7 @@ int main(int argc, char ** argv) {
         engine.glm5->load(model_path, gpu_ids, tensor_split, max_ctx, kv_q8, use_mtp);
     } else if (engine.arch == "inkling2_loop" || engine.arch == "inkling2") {
         engine.inkling2 = std::make_unique<rookery::Inkling2LoopModel>();
-        engine.inkling2->load(model_path, gpu_ids, max_ctx, kv_q8);
+        engine.inkling2->load(model_path, gpu_ids, max_ctx, kv_type);
     } else if (engine.arch == "qwen35moe") {
         tokenizer.add_stop_token("<|im_end|>");
         tokenizer.add_stop_token("<|endoftext|>");
@@ -1267,7 +1274,7 @@ int main(int argc, char ** argv) {
         engine.bailing3->load(model_path, gpu_ids, tensor_split, max_ctx, kv_q8, use_mtp);
     } else if (engine.arch == "maxwell-moe") {
         engine.maxwell = std::make_unique<rookery::MaxwellMoeModel>();
-        engine.maxwell->load(model_path, gpu_ids, tensor_split, max_ctx, kv_q8, use_mtp);
+        engine.maxwell->load(model_path, gpu_ids, tensor_split, max_ctx, kv_type, use_mtp);
     } else {
         throw std::runtime_error("Unsupported model architecture: " + engine.arch);
     }

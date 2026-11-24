@@ -31,18 +31,21 @@ int main(int argc, char ** argv) {
     int  n_gen     = 128;
     int  max_ctx   = 65536;
     int  pp_test   = 0;
+    int  fill_ctx  = 0;
     bool use_graph = true;
-    bool kv_q8_0   = true;
+    rookery::KvCacheType kv_type = rookery::KvCacheType::Q8_0;
 
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
-        if (a == "--gpus" && i + 1 < argc)        gpus = parse_ints(argv[++i]);
-        else if (a == "--prompt" && i + 1 < argc) prompt_str = argv[++i];
-        else if (a == "--gen" && i + 1 < argc)    n_gen = std::atoi(argv[++i]);
-        else if (a == "--ctx" && i + 1 < argc)    max_ctx = std::atoi(argv[++i]);
+        if (a == "--gpus" && i + 1 < argc)         gpus = parse_ints(argv[++i]);
+        else if (a == "--prompt" && i + 1 < argc)  prompt_str = argv[++i];
+        else if (a == "--gen" && i + 1 < argc)     n_gen = std::atoi(argv[++i]);
+        else if (a == "--ctx" && i + 1 < argc)     max_ctx = std::atoi(argv[++i]);
         else if (a == "--pp-test" && i + 1 < argc) pp_test = std::atoi(argv[++i]);
-        else if (a == "--no-graph")               use_graph = false;
-        else if (a == "--kv-f16")                 kv_q8_0 = false;
+        else if (a == "--fill-ctx" && i + 1 < argc) fill_ctx = std::atoi(argv[++i]);
+        else if (a == "--no-graph")                use_graph = false;
+        else if (a == "--kv-f16")                  kv_type = rookery::KvCacheType::F16;
+        else if (a == "--kv" && i + 1 < argc)      kv_type = rookery::parse_kv_cache_type(argv[++i]);
     }
 
     auto topo = rookery::discover_topology();
@@ -54,13 +57,33 @@ int main(int argc, char ** argv) {
         tok.load(sg.meta());
     }
     auto prompt = tok.encode(prompt_str, false, true);
+    if (fill_ctx > 0 && static_cast<int>(prompt.size()) < fill_ctx) {
+        const std::string para =
+            "In modern GPU inference engines, batched prompt prefill groups routed MoE tokens by expert so each "
+            "quantized weight matrix is read from HBM once per batch instead of once per token. ";
+        auto para_ids = tok.encode(para, false, false);
+        auto tail = prompt;
+        prompt.clear();
+        prompt.reserve(fill_ctx);
+        while (static_cast<int>(prompt.size() + tail.size()) < fill_ctx) {
+            for (int32_t id : para_ids) {
+                if (static_cast<int>(prompt.size() + tail.size()) >= fill_ctx) break;
+                prompt.push_back(id);
+            }
+        }
+        prompt.insert(prompt.end(), tail.begin(), tail.end());
+        if (max_ctx < static_cast<int>(prompt.size()) + n_gen + 64) {
+            max_ctx = static_cast<int>(prompt.size()) + n_gen + 64;
+        }
+    }
     std::printf("Prompt '%s' -> %zu tokens:", prompt_str.c_str(), prompt.size());
-    for (int32_t t : prompt) std::printf(" %d", t);
+    for (size_t i = 0; i < std::min<size_t>(prompt.size(), 16); ++i) std::printf(" %d", prompt[i]);
+    if (prompt.size() > 16) std::printf(" ...");
     std::printf("\n");
 
     rookery::Inkling2LoopModel model;
     model.set_use_cuda_graphs(use_graph);
-    model.load(path, gpus, max_ctx, kv_q8_0);
+    model.load(path, gpus, max_ctx, kv_type);
 
     if (pp_test > 0) {
         const std::string para =
@@ -168,7 +191,12 @@ int main(int argc, char ** argv) {
     std::vector<float> logits;
 
     const auto t_pp0 = std::chrono::steady_clock::now();
-    model.forward(prompt, pos, logits);
+    const size_t chunk = 256;
+    for (size_t off = 0; off < prompt.size(); off += chunk) {
+        size_t len = std::min(chunk, prompt.size() - off);
+        model.forward({prompt.begin() + off, prompt.begin() + off + len},
+                      {pos.begin() + off, pos.begin() + off + len}, logits);
+    }
     const auto t_pp1 = std::chrono::steady_clock::now();
     const double pp_ms = std::chrono::duration<double, std::milli>(t_pp1 - t_pp0).count();
 

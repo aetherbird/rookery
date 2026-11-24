@@ -187,30 +187,49 @@ def cmd_build(args):
             "--dump-pairs", tmp_dump, "--dump-delta",
             "--corpus", args.corpus, "--max-tokens", str(args.max_tokens),
         ])
-        run_cmd([
-            fit_bin, "--pairs", tmp_dump, "--out", str(out_path),
-            "--rank", str(args.rank), "--auto-lam", "--scale", str(args.base_scale),
-            "--center", "--device", "0", "--rkad-v3",
-            "--provider-arch", prov["provider_arch"],
-            "--provider-fp", prov["provider_fingerprint"],
-            "--host-arch", host["host_arch"],
-            "--host-n-layers", str(host["host_n_layers"]),
-            "--host-hc-mult", str(host["host_hc_mult"]),
-        ])
+        if args.engram_kv_gguf:
+            fit_py = str(Path(__file__).resolve().parent / "fit_engram_adapter.py")
+            run_cmd([
+                args.python, fit_py, "--pairs", tmp_dump, "--out", str(out_path),
+                "--rank", str(args.rank), "--auto-lam", "--scale", str(args.base_scale),
+                "--engram-kv-gguf", args.engram_kv_gguf,
+                "--provider-arch", prov["provider_arch"],
+                "--provider-fp", prov["provider_fingerprint"],
+                "--host-arch", host["host_arch"],
+                "--host-n-layers", str(host["host_n_layers"]),
+                "--host-hc-mult", str(host["host_hc_mult"]),
+                "--delta-clip", str(args.delta_clip),
+            ])
+        else:
+            run_cmd([
+                fit_bin, "--pairs", tmp_dump, "--out", str(out_path),
+                "--rank", str(args.rank), "--auto-lam", "--scale", str(args.base_scale),
+                "--center", "--device", "0", "--rkad-v3",
+                "--provider-arch", prov["provider_arch"],
+                "--provider-fp", prov["provider_fingerprint"],
+                "--host-arch", host["host_arch"],
+                "--host-n-layers", str(host["host_n_layers"]),
+                "--host-hc-mult", str(host["host_hc_mult"]),
+            ])
     else:
         ce_layer = args.ce_layer if args.ce_layer >= 0 else (host["host_n_layers"] - 1)
         if not args.reuse_rkce or not os.path.exists(tmp_dump):
-            run_cmd([
+            dump_cmd = [
                 engram_test, "-m", args.model, "--engram", args.engram,
                 "--gpus", args.gpus, "--split", args.split,
                 "--dump-tail-ce", tmp_dump, "--ce-layer", str(ce_layer),
                 "--doc-ctx", "4096", "--max-tokens", str(args.max_tokens),
                 "--corpus", args.corpus,
-            ])
+            ]
+            if args.ce_src_layer >= 0:
+                dump_cmd += ["--ce-src-layer", str(args.ce_src_layer)]
+            run_cmd(dump_cmd)
         tr_cmd = [
             args.python, train_py,
             "--rkce", tmp_dump, "--out", str(out_path),
-            "--src-layer", str(args.src_layer), "--rank", str(args.rank), "--scale", str(args.base_scale),
+            "--src-layer", str(0 if args.ce_src_layer >= 0 else args.src_layer),
+            "--export-src-layer", str(args.ce_src_layer if args.ce_src_layer >= 0 else args.src_layer),
+            "--rank", str(args.rank), "--scale", str(args.base_scale),
             "--epochs", str(args.epochs), "--batch-size", "256", "--lr", "8e-4", "--wd", "2e-2",
             "--calibrate-base-temp", "--kl-beta", "0.5", "--shuf-kl-beta", "1.5", "--delta-reg", "1.0",
             "--dropout", "0.25", "--rkad-v3",
@@ -220,6 +239,8 @@ def cmd_build(args):
             "--host-n-layers", str(host["host_n_layers"]),
             "--delta-clip", str(args.delta_clip),
         ]
+        if args.engram_kv_gguf:
+            tr_cmd += ["--engram-kv-gguf", args.engram_kv_gguf]
         if args.safetensors_dir:
             tr_cmd += ["--safetensors-dir", args.safetensors_dir]
         else:
@@ -328,7 +349,9 @@ def main():
     p_bld.add_argument("--rank", type=int, default=128)
     p_bld.add_argument("--base-scale", type=float, default=0.02)
     p_bld.add_argument("--src-layer", type=int, default=0)
+    p_bld.add_argument("--ce-src-layer", type=int, default=-1)
     p_bld.add_argument("--ce-layer", type=int, default=-1)
+    p_bld.add_argument("--engram-kv-gguf", default="", help="Optional provider GGUF shard containing blk.<L>.engram_kv.weight for semantic folding")
     p_bld.add_argument("--epochs", type=int, default=6)
     p_bld.add_argument("--delta-clip", type=float, default=0.15)
     p_bld.add_argument("--safetensors-dir", default="")

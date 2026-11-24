@@ -28,6 +28,18 @@ __device__ __forceinline__ float warp_max(float v) {
     return v;
 }
 
+__device__ __forceinline__ float warp_signed_amax_ink2(float v) {
+    float best = v;
+    float ab   = fabsf(v);
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const float ov  = __shfl_down_sync(0xffffffffu, best, offset);
+        const float oab = fabsf(ov);
+        if (oab > ab) { best = ov; ab = oab; }
+    }
+    return __shfl_sync(0xffffffffu, best, 0);
+}
+
 // ============================================================================
 // 1. Block Attention Residuals: mix(blocks, cur, query[n_q, n_embd])
 //    Exact match to llama_model_inkling2::graph::mix():
@@ -496,6 +508,54 @@ __global__ void inkling2_kv_write_q8_0_kernel(
     quant_store(v, v_cache);
 }
 
+// SoA Q4_0 KV cache layout inside a single allocation of size cache_cap * n_kv * (head_dim/32) * 18:
+//   [0 .. qs_bytes): uint8_t qs[cache_cap, n_kv, head_dim/2] (64-byte aligned per head for d=128!)
+//   [qs_bytes ..):   uint16_t scales[cache_cap, n_kv, head_dim/32]
+__global__ void inkling2_kv_write_q4_0_kernel(
+    const float *   __restrict__ k,
+    const float *   __restrict__ v,
+    void *          __restrict__ k_cache,
+    void *          __restrict__ v_cache,
+    const int32_t * __restrict__ pos,
+    int T, int n_kv, int head_dim, int cache_cap) {
+
+    const int n_blk_h = head_dim >> 5;
+    const int total_b = n_kv * n_blk_h;
+    const int b    = blockIdx.x * blockDim.y + threadIdx.y;
+    const int t    = blockIdx.y;
+    if (t >= T || b >= total_b) return;
+
+    const int lane = threadIdx.x;
+    const int slot = pos[t] % cache_cap;
+    const size_t src_off  = static_cast<size_t>(t) * (n_kv * head_dim) + b * 32 + lane;
+    const size_t dst_b    = static_cast<size_t>(slot) * total_b + b;
+    const size_t qs_bytes = static_cast<size_t>(cache_cap) * n_kv * (head_dim >> 1);
+
+    auto quant_store = [&](const float * src, void * dst_raw) {
+        auto * dst_qs = static_cast<uint8_t *>(dst_raw);
+        auto * dst_sc = reinterpret_cast<uint16_t *>(static_cast<uint8_t *>(dst_raw) + qs_bytes);
+        const float val   = src[src_off];
+        const float max_v = warp_signed_amax_ink2(val);
+        const float d     = max_v * (-0.125f);
+        const float id    = (d != 0.0f) ? (1.0f / d) : 0.0f;
+        int qi = static_cast<int>(floorf(val * id + 8.5f));
+        if (qi < 0)  qi = 0;
+        if (qi > 15) qi = 15;
+        const uint32_t q    = static_cast<uint32_t>(qi);
+        const uint32_t q_lo = __shfl_sync(0xffffffffu, q, (lane << 1) & 31);
+        const uint32_t q_hi = __shfl_sync(0xffffffffu, q, ((lane << 1) | 1) & 31);
+        if (lane == 0) {
+            __half dh = __float2half_rn(d);
+            dst_sc[dst_b] = *reinterpret_cast<uint16_t *>(&dh);
+        }
+        if (lane < 16) {
+            dst_qs[dst_b * 16 + lane] = static_cast<uint8_t>(q_lo | (q_hi << 4));
+        }
+    };
+    quant_store(k, k_cache);
+    quant_store(v, v_cache);
+}
+
 __global__ void inkling2_kv_write_f16_kernel(
     const float *   __restrict__ k,
     const float *   __restrict__ v,
@@ -522,7 +582,7 @@ __global__ void inkling2_kv_write_f16_kernel(
 // - 4 warps/CTA * 32 splits * 8 kv_heads = 1024 active warps across 56 SMs (~18 warps/SM)!
 // - Each warp loads 128 contiguous bytes (32 x uint32_t) per K & V vector in ONE cache line transaction!
 // - Shares each K & V load across all GQA=3 query heads (3x less HBM traffic)!
-template <bool KV_Q8_0, int SPLITS, int GQA, int WARPS>
+template <KvCacheType KV_TYPE, int SPLITS, int GQA, int WARPS>
 __global__ void inkling2_attn_splitk_gqa_kernel(
     const float *   __restrict__ q,          // [T, n_head, 128]
     const void *    __restrict__ k_cache,    // SoA Q8_0 or F16 [cache_cap, n_kv, 128]
@@ -569,16 +629,16 @@ __global__ void inkling2_attn_splitk_gqa_kernel(
     const bool is_swa     = (swa_window > 0);
     const bool pow2_cap   = ((cache_cap & (cache_cap - 1)) == 0);
     const int  cap_mask   = cache_cap - 1;
-    const size_t qs_bytes = static_cast<size_t>(cache_cap) * n_kv * 128;
-    const auto * k_u32    = static_cast<const uint32_t *>(k_cache);
-    const auto * v_u32    = static_cast<const uint32_t *>(v_cache);
-    const auto * k_sc     = reinterpret_cast<const uint16_t *>(static_cast<const uint8_t *>(k_cache) + qs_bytes);
-    const auto * v_sc     = reinterpret_cast<const uint16_t *>(static_cast<const uint8_t *>(v_cache) + qs_bytes);
 
     for (int p = p0 + warp; p < p1; p += WARPS) {
         const int slot = is_swa ? (pow2_cap ? (p & cap_mask) : (p % cache_cap)) : p;
         float4 kv, vv;
-        if constexpr (KV_Q8_0) {
+        if constexpr (KV_TYPE == KvCacheType::Q8_0) {
+            const size_t qs_bytes  = static_cast<size_t>(cache_cap) * n_kv * 128;
+            const auto * k_u32     = static_cast<const uint32_t *>(k_cache);
+            const auto * v_u32     = static_cast<const uint32_t *>(v_cache);
+            const auto * k_sc      = reinterpret_cast<const uint16_t *>(static_cast<const uint8_t *>(k_cache) + qs_bytes);
+            const auto * v_sc      = reinterpret_cast<const uint16_t *>(static_cast<const uint8_t *>(v_cache) + qs_bytes);
             const size_t head_base = static_cast<size_t>(slot) * n_kv + kvh;
             const uint32_t kq = __ldg(&k_u32[head_base * 32 + lane]);
             const uint32_t vq = __ldg(&v_u32[head_base * 32 + lane]);
@@ -595,6 +655,28 @@ __global__ void inkling2_attn_splitk_gqa_kernel(
                              vd * static_cast<int8_t>((vq >> 8) & 0xFFu),
                              vd * static_cast<int8_t>((vq >> 16) & 0xFFu),
                              vd * static_cast<int8_t>(vq >> 24));
+        } else if constexpr (KV_TYPE == KvCacheType::Q4_0) {
+            const size_t qs_bytes  = static_cast<size_t>(cache_cap) * n_kv * 64;
+            const auto * k_u16     = static_cast<const uint16_t *>(k_cache);
+            const auto * v_u16     = static_cast<const uint16_t *>(v_cache);
+            const auto * k_sc      = reinterpret_cast<const uint16_t *>(static_cast<const uint8_t *>(k_cache) + qs_bytes);
+            const auto * v_sc      = reinterpret_cast<const uint16_t *>(static_cast<const uint8_t *>(v_cache) + qs_bytes);
+            const size_t head_base = static_cast<size_t>(slot) * n_kv + kvh;
+            const uint16_t kq = __ldg(&k_u16[head_base * 32 + lane]);
+            const uint16_t vq = __ldg(&v_u16[head_base * 32 + lane]);
+            __half kdh, vdh;
+            *reinterpret_cast<uint16_t *>(&kdh) = __ldg(&k_sc[head_base * 4 + blk_in_h]);
+            *reinterpret_cast<uint16_t *>(&vdh) = __ldg(&v_sc[head_base * 4 + blk_in_h]);
+            const float kd = __half2float(kdh);
+            const float vd = __half2float(vdh);
+            kv = make_float4(kd * static_cast<float>(static_cast<int>( kq        & 0xFu) - 8),
+                             kd * static_cast<float>(static_cast<int>((kq >>  4) & 0xFu) - 8),
+                             kd * static_cast<float>(static_cast<int>((kq >>  8) & 0xFu) - 8),
+                             kd * static_cast<float>(static_cast<int>((kq >> 12) & 0xFu) - 8));
+            vv = make_float4(vd * static_cast<float>(static_cast<int>( vq        & 0xFu) - 8),
+                             vd * static_cast<float>(static_cast<int>((vq >>  4) & 0xFu) - 8),
+                             vd * static_cast<float>(static_cast<int>((vq >>  8) & 0xFu) - 8),
+                             vd * static_cast<float>(static_cast<int>((vq >> 12) & 0xFu) - 8));
         } else {
             const size_t off = (static_cast<size_t>(slot) * n_kv + kvh) * 32 + lane;
             uint2 pk = __ldg(&static_cast<const uint2 *>(k_cache)[off]);
@@ -665,7 +747,7 @@ __global__ void inkling2_attn_splitk_gqa_kernel(
     }
 }
 
-template <bool KV_Q8_0, int SPLITS>
+template <KvCacheType KV_TYPE, int SPLITS>
 __global__ void inkling2_attn_splitk_kernel(
     const float *   __restrict__ q,          // [T, n_head, 128]
     const void *    __restrict__ k_cache,    // [cache_cap, n_kv, 128]
@@ -705,7 +787,7 @@ __global__ void inkling2_attn_splitk_kernel(
     for (int p = p0; p < p1; ++p) {
         const int slot = p % cache_cap;
         float4 kv, vv;
-        if constexpr (KV_Q8_0) {
+        if constexpr (KV_TYPE == KvCacheType::Q8_0) {
             const size_t qs_bytes = static_cast<size_t>(cache_cap) * n_kv * 128;
             const size_t bidx     = (static_cast<size_t>(slot) * n_kv + kvh) * 4 + blk_in_h;
             const size_t w_off    = (static_cast<size_t>(slot) * n_kv + kvh) * 32 + lane;
@@ -726,6 +808,27 @@ __global__ void inkling2_attn_splitk_kernel(
                              vd * static_cast<int8_t>((vq >> 8) & 0xFFu),
                              vd * static_cast<int8_t>((vq >> 16) & 0xFFu),
                              vd * static_cast<int8_t>(vq >> 24));
+        } else if constexpr (KV_TYPE == KvCacheType::Q4_0) {
+            const size_t qs_bytes = static_cast<size_t>(cache_cap) * n_kv * 64;
+            const size_t bidx     = (static_cast<size_t>(slot) * n_kv + kvh) * 4 + blk_in_h;
+            const size_t w_off    = (static_cast<size_t>(slot) * n_kv + kvh) * 32 + lane;
+            const uint16_t kq = __ldg(&static_cast<const uint16_t *>(k_cache)[w_off]);
+            const uint16_t vq = __ldg(&static_cast<const uint16_t *>(v_cache)[w_off]);
+            const auto * k_sc = reinterpret_cast<const uint16_t *>(static_cast<const uint8_t *>(k_cache) + qs_bytes);
+            const auto * v_sc = reinterpret_cast<const uint16_t *>(static_cast<const uint8_t *>(v_cache) + qs_bytes);
+            __half kdh, vdh;
+            *reinterpret_cast<uint16_t *>(&kdh) = __ldg(&k_sc[bidx]);
+            *reinterpret_cast<uint16_t *>(&vdh) = __ldg(&v_sc[bidx]);
+            const float kd = __half2float(kdh);
+            const float vd = __half2float(vdh);
+            kv = make_float4(kd * static_cast<float>(static_cast<int>( kq        & 0xFu) - 8),
+                             kd * static_cast<float>(static_cast<int>((kq >>  4) & 0xFu) - 8),
+                             kd * static_cast<float>(static_cast<int>((kq >>  8) & 0xFu) - 8),
+                             kd * static_cast<float>(static_cast<int>((kq >> 12) & 0xFu) - 8));
+            vv = make_float4(vd * static_cast<float>(static_cast<int>( vq        & 0xFu) - 8),
+                             vd * static_cast<float>(static_cast<int>((vq >>  4) & 0xFu) - 8),
+                             vd * static_cast<float>(static_cast<int>((vq >>  8) & 0xFu) - 8),
+                             vd * static_cast<float>(static_cast<int>((vq >> 12) & 0xFu) - 8));
         } else {
             const size_t off = (static_cast<size_t>(slot) * n_kv + kvh) * 32 + lane;
             uint2 pk = __ldg(&static_cast<const uint2 *>(k_cache)[off]);
@@ -831,7 +934,7 @@ __global__ void inkling2_q_to_kvh_kernel(
     qm[dst] = ink2_f32_to_mat<TMat>(q[idx] * scale);
 }
 
-template <bool KV_Q8_0, typename TMat>
+template <KvCacheType KV_TYPE, typename TMat>
 __global__ void inkling2_dequant_kv_tile_kernel(
     const void * __restrict__ k_cache,
     const void * __restrict__ v_cache,
@@ -843,7 +946,7 @@ __global__ void inkling2_dequant_kv_tile_kernel(
     if (c >= kc) return;
     const int slot = (k0 + c) % cache_cap;
     const size_t dst_base = (static_cast<size_t>(kvh) * kc + c) * 128;
-    if constexpr (KV_Q8_0) {
+    if constexpr (KV_TYPE == KvCacheType::Q8_0) {
         const int b    = threadIdx.y; // 0..3
         const int lane = threadIdx.x; // 0..31
         const size_t qs_bytes = static_cast<size_t>(cache_cap) * n_kv * 128;
@@ -857,6 +960,24 @@ __global__ void inkling2_dequant_kv_tile_kernel(
         *reinterpret_cast<uint16_t *>(&vdh) = __ldg(&v_sc[bidx]);
         km[dst_base + b * 32 + lane] = ink2_f32_to_mat<TMat>(__half2float(kdh) * static_cast<float>(__ldg(&k_qs[bidx * 32 + lane])));
         vm[dst_base + b * 32 + lane] = ink2_f32_to_mat<TMat>(__half2float(vdh) * static_cast<float>(__ldg(&v_qs[bidx * 32 + lane])));
+    } else if constexpr (KV_TYPE == KvCacheType::Q4_0) {
+        const int b    = threadIdx.y; // 0..3
+        const int lane = threadIdx.x; // 0..31
+        const size_t qs_bytes = static_cast<size_t>(cache_cap) * n_kv * 64;
+        const size_t bidx     = (static_cast<size_t>(slot) * n_kv + kvh) * 4 + b;
+        const auto * k_qs = static_cast<const uint8_t *>(k_cache);
+        const auto * k_sc = reinterpret_cast<const uint16_t *>(static_cast<const uint8_t *>(k_cache) + qs_bytes);
+        const auto * v_qs = static_cast<const uint8_t *>(v_cache);
+        const auto * v_sc = reinterpret_cast<const uint16_t *>(static_cast<const uint8_t *>(v_cache) + qs_bytes);
+        __half kdh, vdh;
+        *reinterpret_cast<uint16_t *>(&kdh) = __ldg(&k_sc[bidx]);
+        *reinterpret_cast<uint16_t *>(&vdh) = __ldg(&v_sc[bidx]);
+        const uint8_t kqb = __ldg(&k_qs[bidx * 16 + (lane >> 1)]);
+        const uint8_t vqb = __ldg(&v_qs[bidx * 16 + (lane >> 1)]);
+        const int kq = (lane & 1) ? static_cast<int>(kqb >> 4) : static_cast<int>(kqb & 0xFu);
+        const int vq = (lane & 1) ? static_cast<int>(vqb >> 4) : static_cast<int>(vqb & 0xFu);
+        km[dst_base + b * 32 + lane] = ink2_f32_to_mat<TMat>(__half2float(kdh) * static_cast<float>(kq - 8));
+        vm[dst_base + b * 32 + lane] = ink2_f32_to_mat<TMat>(__half2float(vdh) * static_cast<float>(vq - 8));
     } else {
         const int d = threadIdx.x; // 0..127
         const size_t src = (static_cast<size_t>(slot) * n_kv + kvh) * 128 + d;
@@ -3170,7 +3291,8 @@ __global__ void inkling2_moe_down_grouped_q8_0_ktiled_dp4a_kernel(
 // ============================================================================
 // Stage 5B: Fused Decode Attention Pre-Ops (T == 1)
 // ============================================================================
-__global__ void inkling2_kv_conv_norm_write_q8_0_t1_kernel(
+template <KvCacheType KV_TYPE>
+__global__ void inkling2_kv_conv_norm_write_t1_kernel(
     const float * __restrict__ k_raw, const float * __restrict__ k_w, const float * __restrict__ k_dyn, float * __restrict__ k_state,
     const float * __restrict__ v_raw, const float * __restrict__ v_w, const float * __restrict__ v_dyn, float * __restrict__ v_state,
     void * __restrict__ k_cache, void * __restrict__ v_cache, const int32_t * __restrict__ pos,
@@ -3224,19 +3346,43 @@ __global__ void inkling2_kv_conv_norm_write_q8_0_t1_kernel(
     const int slot = pos[0] % cache_cap;
     const int total_b = n_head_kv * 4;
     const size_t dst_b = static_cast<size_t>(slot) * total_b + (h * 4 + warp);
-    const size_t qs_bytes = static_cast<size_t>(cache_cap) * n_head_kv * 128;
     void * dst_raw = is_v ? v_cache : k_cache;
-    auto * dst_qs = static_cast<int8_t *>(dst_raw);
-    auto * dst_sc = reinterpret_cast<uint16_t *>(static_cast<uint8_t *>(dst_raw) + qs_bytes);
 
-    const float amax = __shfl_sync(0xffffffffu, warp_max(fabsf(val)), 0);
-    const float sc   = amax / 127.0f;
-    const float inv  = (sc > 0.0f) ? (127.0f / amax) : 0.0f;
-    if (lane == 0) {
-        __half dh = __float2half_rn(sc);
-        dst_sc[dst_b] = *reinterpret_cast<uint16_t *>(&dh);
+    if constexpr (KV_TYPE == KvCacheType::Q8_0) {
+        const size_t qs_bytes = static_cast<size_t>(cache_cap) * n_head_kv * 128;
+        auto * dst_qs = static_cast<int8_t *>(dst_raw);
+        auto * dst_sc = reinterpret_cast<uint16_t *>(static_cast<uint8_t *>(dst_raw) + qs_bytes);
+
+        const float amax = __shfl_sync(0xffffffffu, warp_max(fabsf(val)), 0);
+        const float sc   = amax / 127.0f;
+        const float inv  = (sc > 0.0f) ? (127.0f / amax) : 0.0f;
+        if (lane == 0) {
+            __half dh = __float2half_rn(sc);
+            dst_sc[dst_b] = *reinterpret_cast<uint16_t *>(&dh);
+        }
+        dst_qs[dst_b * 32 + lane] = static_cast<int8_t>(__float2int_rn(val * inv));
+    } else if constexpr (KV_TYPE == KvCacheType::Q4_0) {
+        const size_t qs_bytes = static_cast<size_t>(cache_cap) * n_head_kv * 64;
+        auto * dst_qs = static_cast<uint8_t *>(dst_raw);
+        auto * dst_sc = reinterpret_cast<uint16_t *>(static_cast<uint8_t *>(dst_raw) + qs_bytes);
+
+        const float max_v = warp_signed_amax_ink2(val);
+        const float sc    = max_v * (-0.125f);
+        const float id    = (sc != 0.0f) ? (1.0f / sc) : 0.0f;
+        int qi = static_cast<int>(floorf(val * id + 8.5f));
+        if (qi < 0)  qi = 0;
+        if (qi > 15) qi = 15;
+        const uint32_t q    = static_cast<uint32_t>(qi);
+        const uint32_t q_lo = __shfl_sync(0xffffffffu, q, (lane << 1) & 31);
+        const uint32_t q_hi = __shfl_sync(0xffffffffu, q, ((lane << 1) | 1) & 31);
+        if (lane == 0) {
+            __half dh = __float2half_rn(sc);
+            dst_sc[dst_b] = *reinterpret_cast<uint16_t *>(&dh);
+        }
+        if (lane < 16) {
+            dst_qs[dst_b * 16 + lane] = static_cast<uint8_t>(q_lo | (q_hi << 4));
+        }
     }
-    dst_qs[dst_b * 32 + lane] = static_cast<int8_t>(__float2int_rn(val * inv));
 }
 
 __global__ void inkling2_qr_l2_clip_fused_t1_kernel(
@@ -3998,18 +4144,26 @@ void launch_inkling2_gemv_q8_0_h2(
     }
 }
 
-void launch_inkling2_kv_conv_norm_write_q8_0_t1(
+void launch_inkling2_kv_conv_norm_write_t1(
     const float * d_k_raw, const float * d_k_w, const float * d_k_dyn, float * d_k_state,
     const float * d_v_raw, const float * d_v_w, const float * d_v_dyn, float * d_v_state,
-    void * d_k_cache, void * d_v_cache, const int32_t * d_pos,
+    void * d_k_cache, void * d_v_cache, KvCacheType kv_type, const int32_t * d_pos,
     int n_head_kv, int head_dim, int cache_cap, float qk_clip, float rms_eps,
     cudaStream_t stream) {
     (void) head_dim;
-    inkling2_kv_conv_norm_write_q8_0_t1_kernel<<<n_head_kv * 2, 128, 0, stream>>>(
-        d_k_raw, d_k_w, d_k_dyn, d_k_state,
-        d_v_raw, d_v_w, d_v_dyn, d_v_state,
-        d_k_cache, d_v_cache, d_pos,
-        n_head_kv, cache_cap, qk_clip, rms_eps);
+    if (kv_type == KvCacheType::Q4_0) {
+        inkling2_kv_conv_norm_write_t1_kernel<KvCacheType::Q4_0><<<n_head_kv * 2, 128, 0, stream>>>(
+            d_k_raw, d_k_w, d_k_dyn, d_k_state,
+            d_v_raw, d_v_w, d_v_dyn, d_v_state,
+            d_k_cache, d_v_cache, d_pos,
+            n_head_kv, cache_cap, qk_clip, rms_eps);
+    } else {
+        inkling2_kv_conv_norm_write_t1_kernel<KvCacheType::Q8_0><<<n_head_kv * 2, 128, 0, stream>>>(
+            d_k_raw, d_k_w, d_k_dyn, d_k_state,
+            d_v_raw, d_v_w, d_v_dyn, d_v_state,
+            d_k_cache, d_v_cache, d_pos,
+            n_head_kv, cache_cap, qk_clip, rms_eps);
+    }
 }
 
 void launch_inkling2_qr_l2_clip_fused_t1(
@@ -4126,12 +4280,18 @@ void launch_inkling2_rel_bias_table(
 
 void launch_inkling2_kv_write(
     const float * d_k, const float * d_v,
-    void * d_k_cache, void * d_v_cache, bool kv_is_q8_0,
+    void * d_k_cache, void * d_v_cache, KvCacheType kv_type,
     const int32_t * d_pos, int T, int n_kv, int head_dim, int cache_cap, cudaStream_t stream) {
-    if (kv_is_q8_0) {
+    if (kv_type == KvCacheType::Q8_0) {
         const int total_b = n_kv * (head_dim >> 5);
         constexpr int wpb = 8;
         inkling2_kv_write_q8_0_kernel<<<dim3((total_b + wpb - 1) / wpb, T), dim3(32, wpb), 0, stream>>>(
+            d_k, d_v, d_k_cache, d_v_cache,
+            d_pos, T, n_kv, head_dim, cache_cap);
+    } else if (kv_type == KvCacheType::Q4_0) {
+        const int total_b = n_kv * (head_dim >> 5);
+        constexpr int wpb = 8;
+        inkling2_kv_write_q4_0_kernel<<<dim3((total_b + wpb - 1) / wpb, T), dim3(32, wpb), 0, stream>>>(
             d_k, d_v, d_k_cache, d_v_cache,
             d_pos, T, n_kv, head_dim, cache_cap);
     } else {
@@ -4143,7 +4303,7 @@ void launch_inkling2_kv_write(
 }
 
 void launch_inkling2_attn(
-    const float * d_q, const void * d_k_cache, const void * d_v_cache, bool kv_is_q8_0,
+    const float * d_q, const void * d_k_cache, const void * d_v_cache, KvCacheType kv_type,
     const float * d_bias_table, const int32_t * d_pos, float * d_out,
     void * d_scratch, size_t scratch_bytes,
     int T, int n_head, int n_kv, int head_dim,
@@ -4195,11 +4355,14 @@ void launch_inkling2_attn(
 
                 for (int k0 = k_start; k0 < kv_len_max; k0 += K_TILE) {
                     const int kc = (k0 + K_TILE < kv_len_max) ? K_TILE : (kv_len_max - k0);
-                    if (kv_is_q8_0) {
-                        inkling2_dequant_kv_tile_kernel<true, __half><<<dim3(n_kv, kc), dim3(32, 4), 0, stream>>>(
+                    if (kv_type == KvCacheType::Q8_0) {
+                        inkling2_dequant_kv_tile_kernel<KvCacheType::Q8_0, __half><<<dim3(n_kv, kc), dim3(32, 4), 0, stream>>>(
+                            d_k_cache, d_v_cache, d_k16, d_v16, k0, kc, n_kv, cache_cap);
+                    } else if (kv_type == KvCacheType::Q4_0) {
+                        inkling2_dequant_kv_tile_kernel<KvCacheType::Q4_0, __half><<<dim3(n_kv, kc), dim3(32, 4), 0, stream>>>(
                             d_k_cache, d_v_cache, d_k16, d_v16, k0, kc, n_kv, cache_cap);
                     } else {
-                        inkling2_dequant_kv_tile_kernel<false, __half><<<dim3(n_kv, kc), 128, 0, stream>>>(
+                        inkling2_dequant_kv_tile_kernel<KvCacheType::F16, __half><<<dim3(n_kv, kc), 128, 0, stream>>>(
                             d_k_cache, d_v_cache, d_k16, d_v16, k0, kc, n_kv, cache_cap);
                     }
 
@@ -4265,11 +4428,14 @@ void launch_inkling2_attn(
 
                 for (int k0 = k_start; k0 < kv_len_max; k0 += K_TILE) {
                     const int kc = (k0 + K_TILE < kv_len_max) ? K_TILE : (kv_len_max - k0);
-                    if (kv_is_q8_0) {
-                        inkling2_dequant_kv_tile_kernel<true, __half><<<dim3(n_kv, kc), dim3(32, 4), 0, stream>>>(
+                    if (kv_type == KvCacheType::Q8_0) {
+                        inkling2_dequant_kv_tile_kernel<KvCacheType::Q8_0, __half><<<dim3(n_kv, kc), dim3(32, 4), 0, stream>>>(
+                            d_k_cache, d_v_cache, d_k16, d_v16, k0, kc, n_kv, cache_cap);
+                    } else if (kv_type == KvCacheType::Q4_0) {
+                        inkling2_dequant_kv_tile_kernel<KvCacheType::Q4_0, __half><<<dim3(n_kv, kc), dim3(32, 4), 0, stream>>>(
                             d_k_cache, d_v_cache, d_k16, d_v16, k0, kc, n_kv, cache_cap);
                     } else {
-                        inkling2_dequant_kv_tile_kernel<false, __half><<<dim3(n_kv, kc), 128, 0, stream>>>(
+                        inkling2_dequant_kv_tile_kernel<KvCacheType::F16, __half><<<dim3(n_kv, kc), 128, 0, stream>>>(
                             d_k_cache, d_v_cache, d_k16, d_v16, k0, kc, n_kv, cache_cap);
                     }
 
@@ -4336,11 +4502,14 @@ void launch_inkling2_attn(
 
                 for (int k0 = k_start; k0 < kv_len_max; k0 += K_TILE) {
                     const int kc = (k0 + K_TILE < kv_len_max) ? K_TILE : (kv_len_max - k0);
-                    if (kv_is_q8_0) {
-                        inkling2_dequant_kv_tile_kernel<true, float><<<dim3(n_kv, kc), dim3(32, 4), 0, stream>>>(
+                    if (kv_type == KvCacheType::Q8_0) {
+                        inkling2_dequant_kv_tile_kernel<KvCacheType::Q8_0, float><<<dim3(n_kv, kc), dim3(32, 4), 0, stream>>>(
+                            d_k_cache, d_v_cache, d_k32, d_v32, k0, kc, n_kv, cache_cap);
+                    } else if (kv_type == KvCacheType::Q4_0) {
+                        inkling2_dequant_kv_tile_kernel<KvCacheType::Q4_0, float><<<dim3(n_kv, kc), dim3(32, 4), 0, stream>>>(
                             d_k_cache, d_v_cache, d_k32, d_v32, k0, kc, n_kv, cache_cap);
                     } else {
-                        inkling2_dequant_kv_tile_kernel<false, float><<<dim3(n_kv, kc), 128, 0, stream>>>(
+                        inkling2_dequant_kv_tile_kernel<KvCacheType::F16, float><<<dim3(n_kv, kc), 128, 0, stream>>>(
                             d_k_cache, d_v_cache, d_k32, d_v32, k0, kc, n_kv, cache_cap);
                     }
 
@@ -4383,12 +4552,16 @@ void launch_inkling2_attn(
             float * pl = pm + n_slots;
             float * po = pl + n_slots;
             dim3 grid(n_kv, S, T);
-            if (kv_is_q8_0) {
-                inkling2_attn_splitk_gqa_kernel<true, S, 3, 4><<<grid, dim3(32, 4), 0, stream>>>(
+            if (kv_type == KvCacheType::Q8_0) {
+                inkling2_attn_splitk_gqa_kernel<KvCacheType::Q8_0, S, 3, 4><<<grid, dim3(32, 4), 0, stream>>>(
+                    d_q, d_k_cache, d_v_cache, d_bias_table, d_pos, pm, pl, po,
+                    n_head, n_kv, swa_window, n_extent, cache_cap, scale);
+            } else if (kv_type == KvCacheType::Q4_0) {
+                inkling2_attn_splitk_gqa_kernel<KvCacheType::Q4_0, S, 3, 4><<<grid, dim3(32, 4), 0, stream>>>(
                     d_q, d_k_cache, d_v_cache, d_bias_table, d_pos, pm, pl, po,
                     n_head, n_kv, swa_window, n_extent, cache_cap, scale);
             } else {
-                inkling2_attn_splitk_gqa_kernel<false, S, 3, 4><<<grid, dim3(32, 4), 0, stream>>>(
+                inkling2_attn_splitk_gqa_kernel<KvCacheType::F16, S, 3, 4><<<grid, dim3(32, 4), 0, stream>>>(
                     d_q, d_k_cache, d_v_cache, d_bias_table, d_pos, pm, pl, po,
                     n_head, n_kv, swa_window, n_extent, cache_cap, scale);
             }
@@ -4401,12 +4574,16 @@ void launch_inkling2_attn(
         float * pl = pm + n_slots;
         float * po = pl + n_slots;
         dim3 grid(n_head, S, T);
-        if (kv_is_q8_0) {
-            inkling2_attn_splitk_kernel<true, S><<<grid, 32, 0, stream>>>(
+        if (kv_type == KvCacheType::Q8_0) {
+            inkling2_attn_splitk_kernel<KvCacheType::Q8_0, S><<<grid, 32, 0, stream>>>(
+                d_q, d_k_cache, d_v_cache, d_bias_table, d_pos, pm, pl, po,
+                n_head, n_kv, swa_window, n_extent, cache_cap, scale);
+        } else if (kv_type == KvCacheType::Q4_0) {
+            inkling2_attn_splitk_kernel<KvCacheType::Q4_0, S><<<grid, 32, 0, stream>>>(
                 d_q, d_k_cache, d_v_cache, d_bias_table, d_pos, pm, pl, po,
                 n_head, n_kv, swa_window, n_extent, cache_cap, scale);
         } else {
-            inkling2_attn_splitk_kernel<false, S><<<grid, 32, 0, stream>>>(
+            inkling2_attn_splitk_kernel<KvCacheType::F16, S><<<grid, 32, 0, stream>>>(
                 d_q, d_k_cache, d_v_cache, d_bias_table, d_pos, pm, pl, po,
                 n_head, n_kv, swa_window, n_extent, cache_cap, scale);
         }
@@ -4418,12 +4595,16 @@ void launch_inkling2_attn(
         float * pl = pm + n_slots;
         float * po = pl + n_slots;
         dim3 grid(n_head, 1, T);
-        if (kv_is_q8_0) {
-            inkling2_attn_splitk_kernel<true, S><<<grid, 32, 0, stream>>>(
+        if (kv_type == KvCacheType::Q8_0) {
+            inkling2_attn_splitk_kernel<KvCacheType::Q8_0, S><<<grid, 32, 0, stream>>>(
+                d_q, d_k_cache, d_v_cache, d_bias_table, d_pos, pm, pl, po,
+                n_head, n_kv, swa_window, n_extent, cache_cap, scale);
+        } else if (kv_type == KvCacheType::Q4_0) {
+            inkling2_attn_splitk_kernel<KvCacheType::Q4_0, S><<<grid, 32, 0, stream>>>(
                 d_q, d_k_cache, d_v_cache, d_bias_table, d_pos, pm, pl, po,
                 n_head, n_kv, swa_window, n_extent, cache_cap, scale);
         } else {
-            inkling2_attn_splitk_kernel<false, S><<<grid, 32, 0, stream>>>(
+            inkling2_attn_splitk_kernel<KvCacheType::F16, S><<<grid, 32, 0, stream>>>(
                 d_q, d_k_cache, d_v_cache, d_bias_table, d_pos, pm, pl, po,
                 n_head, n_kv, swa_window, n_extent, cache_cap, scale);
         }

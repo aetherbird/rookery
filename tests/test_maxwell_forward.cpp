@@ -31,7 +31,7 @@ static std::vector<float> parse_float_list(const std::string & s) {
 
 int main(int argc, char ** argv) {
     if (argc < 2) {
-        std::printf("Usage: %s <maxwell.gguf> [--gpus 0,1] [--split 24,32] [--tokens 1,100] [--gen 128] [--kv f16|q8] [--mtp] [--mtp-pos-off 0|1] [--no-graph]\n", argv[0]);
+        std::printf("Usage: %s <maxwell.gguf> [--gpus 0,1] [--split 24,32] [--tokens 1,100] [--gen 128] [--kv f16|q8_0|q4_0] [--mtp] [--mtp-pos-off 0|1] [--no-graph]\n", argv[0]);
         return 1;
     }
 
@@ -42,7 +42,7 @@ int main(int argc, char ** argv) {
     int n_gen = 128;
     int max_ctx = 4096;
     int fill_ctx = 0;
-    bool kv_q8 = true;
+    rookery::KvCacheType kv_type = rookery::KvCacheType::Q8_0;
     bool use_graph = true;
     bool use_mtp = false;
     int  mtp_pos_off = 0;
@@ -63,7 +63,7 @@ int main(int argc, char ** argv) {
         } else if (a == "--fill-ctx" && i + 1 < argc) {
             fill_ctx = std::atoi(argv[++i]);
         } else if (a == "--kv" && i + 1 < argc) {
-            kv_q8 = (std::string(argv[++i]) != "f16");
+            kv_type = rookery::parse_kv_cache_type(argv[++i]);
         } else if (a == "--no-graph") {
             use_graph = false;
         } else if (a == "--mtp") {
@@ -88,7 +88,7 @@ int main(int argc, char ** argv) {
     rookery::MaxwellMoeModel model;
     model.set_use_cuda_graphs(use_graph);
     model.set_mtp_pos_offset(mtp_pos_off);
-    model.load(path, gpus, split, max_ctx, kv_q8, use_mtp);
+    model.load(path, gpus, split, max_ctx, kv_type, use_mtp);
 
     std::vector<int32_t> pos(prompt.size());
     std::iota(pos.begin(), pos.end(), 0);

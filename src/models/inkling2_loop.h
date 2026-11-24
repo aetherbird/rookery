@@ -47,8 +47,8 @@ struct Inkling2Config {
     float logit_softcap        = 30.0f;
     float rms_eps              = 1e-6f;
 
-    int   max_ctx              = 192000;
-    bool  kv_q8_0              = true;
+    int         max_ctx        = 192000;
+    KvCacheType kv_type        = KvCacheType::Q8_0;
 
     std::vector<bool> is_swa; // [n_phys]
 };
@@ -102,7 +102,7 @@ public:
     void load(const std::string & gguf_path,
               const std::vector<int> & gpu_ids,
               int max_ctx = 65536,
-              bool kv_q8_0 = true);
+              KvCacheType kv_type = KvCacheType::Q8_0);
 
     void reset_state();
 

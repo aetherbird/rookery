@@ -56,7 +56,7 @@ void launch_maxwell_qk_norm_rope_kv_write(
     const float *   d_k_norm_w,
     void *          d_k_cache,
     void *          d_v_cache,
-    bool            kv_is_q8_0,
+    KvCacheType     kv_type,
     const int32_t * d_pos,
     int             n_tokens,
     int             n_heads,
@@ -237,7 +237,7 @@ void launch_moe_ffn_q8_0_with_shared(
     int                  k,
     cudaStream_t         stream);
 
-// --- Attention & KV Cache (F16 and Q8_0 KV) ---
+// --- Attention & KV Cache (F16, Q8_0, and Q4_0 KV) ---
 void launch_kv_write_f16(
     const float *   d_k,
     const float *   d_v,
@@ -260,11 +260,22 @@ void launch_kv_write_q8_0(
     int             head_dim,
     cudaStream_t    stream);
 
+void launch_kv_write_q4_0(
+    const float *   d_k,
+    const float *   d_v,
+    void *          d_k_cache,
+    void *          d_v_cache,
+    const int32_t * d_pos,
+    int             T,
+    int             n_kv_heads,
+    int             head_dim,
+    cudaStream_t    stream);
+
 void launch_gqa_attn(
     const float *   d_q,
     const void *    d_k_cache,
     const void *    d_v_cache,
-    bool            kv_is_q8_0,
+    KvCacheType     kv_type,
     const int32_t * d_pos,
     float *         d_out,
     void *          d_scratch,
@@ -287,9 +298,18 @@ void launch_idx_k_write_f16(
     int             idx_dim,
     cudaStream_t    stream);
 
+void launch_idx_k_write_q4_0(
+    const float *   d_ik,
+    void *          d_ik_cache,
+    const int32_t * d_pos,
+    int             T,
+    int             idx_dim,
+    cudaStream_t    stream);
+
 void launch_msa_indexer_topk(
     const float *   d_iq,
     const void *    d_ik_cache,
+    bool            ik_is_q4_0,
     const int32_t * d_pos,
     int32_t *       d_out_blocks,
     int32_t *       d_out_k_count,
@@ -308,7 +328,7 @@ void launch_gqa_attn_msa(
     const float *   d_q,
     const void *    d_k_cache,
     const void *    d_v_cache,
-    bool            kv_is_q8_0,
+    KvCacheType     kv_type,
     const int32_t * d_pos,
     const int32_t * d_msa_blocks,
     const int32_t * d_msa_k_count,
@@ -538,10 +558,10 @@ void launch_inkling2_gemv_q8_0_h2(
 void launch_inkling2_quant_f16_contig(
     const float * d_x, void * d_out_h2_d, int K, int T, cudaStream_t stream);
 
-void launch_inkling2_kv_conv_norm_write_q8_0_t1(
+void launch_inkling2_kv_conv_norm_write_t1(
     const float * d_k_raw, const float * d_k_w, const float * d_k_dyn, float * d_k_state,
     const float * d_v_raw, const float * d_v_w, const float * d_v_dyn, float * d_v_state,
-    void * d_k_cache, void * d_v_cache, const int32_t * d_pos,
+    void * d_k_cache, void * d_v_cache, KvCacheType kv_type, const int32_t * d_pos,
     int n_head_kv, int head_dim, int cache_cap, float qk_clip, float rms_eps,
     cudaStream_t stream);
 
@@ -585,14 +605,14 @@ void launch_inkling2_rel_bias_table(
 
 void launch_inkling2_kv_write(
     const float * d_k, const float * d_v,
-    void * d_k_cache, void * d_v_cache, bool kv_is_q8_0,
+    void * d_k_cache, void * d_v_cache, KvCacheType kv_type,
     const int32_t * d_pos, int T, int n_kv, int head_dim, int cache_cap, cudaStream_t stream);
 
 void launch_inkling2_attn(
     const float * d_q,              // [T, n_head, head_dim]
     const void *  d_k_cache,        // [cache_cap, n_kv, head_dim]
     const void *  d_v_cache,        // [cache_cap, n_kv, head_dim]
-    bool          kv_is_q8_0,
+    KvCacheType   kv_type,
     const float * d_bias_table,     // [T, n_head, n_extent + 1]
     const int32_t * d_pos,          // [T]
     float *       d_out,            // [T, n_head, head_dim]

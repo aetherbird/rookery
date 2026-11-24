@@ -15,6 +15,18 @@ __device__ __forceinline__ float warp_sum(float v) {
     return v;
 }
 
+__device__ __forceinline__ float warp_signed_amax_msa(float v) {
+    float best = v;
+    float ab   = fabsf(v);
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const float ov  = __shfl_down_sync(0xffffffffu, best, offset);
+        const float oab = fabsf(ov);
+        if (oab > ab) { best = ov; ab = oab; }
+    }
+    return __shfl_sync(0xffffffffu, best, 0);
+}
+
 __global__ void idx_k_write_f16_kernel(
     const float *   __restrict__ ik,
     __half *        __restrict__ ik_cache,
@@ -28,12 +40,46 @@ __global__ void idx_k_write_f16_kernel(
     ik_cache[static_cast<size_t>(p) * idx_dim + d] = __float2half_rn(ik[static_cast<size_t>(t) * idx_dim + d]);
 }
 
+__global__ void idx_k_write_q4_0_kernel(
+    const float *   __restrict__ ik,
+    BlockQ4_0 *     __restrict__ ik_cache,
+    const int32_t * __restrict__ pos,
+    int T, int idx_dim) {
+
+    const int n_blk = idx_dim >> 5;
+    const int b     = threadIdx.y;
+    const int t     = blockIdx.x;
+    if (t >= T || b >= n_blk) return;
+
+    const int lane = threadIdx.x;
+    const int p    = pos[t];
+    const float val   = ik[static_cast<size_t>(t) * idx_dim + b * 32 + lane];
+    const float max_v = warp_signed_amax_msa(val);
+    const float d     = max_v * (-0.125f);
+    const float id    = (d != 0.0f) ? (1.0f / d) : 0.0f;
+    int qi = static_cast<int>(floorf(val * id + 8.5f));
+    if (qi < 0)  qi = 0;
+    if (qi > 15) qi = 15;
+    const uint32_t q    = static_cast<uint32_t>(qi);
+    const uint32_t q_lo = __shfl_sync(0xffffffffu, q, (lane << 1) & 31);
+    const uint32_t q_hi = __shfl_sync(0xffffffffu, q, ((lane << 1) | 1) & 31);
+    const size_t dst_blk = static_cast<size_t>(p) * n_blk + b;
+    if (lane == 0) {
+        __half dh = __float2half_rn(d);
+        ik_cache[dst_blk].d = *reinterpret_cast<uint16_t *>(&dh);
+    }
+    if (lane < 16) {
+        ik_cache[dst_blk].qs[lane] = static_cast<uint8_t>(q_lo | (q_hi << 4));
+    }
+}
+
 // ============================================================================
 // Split-Block MSA Indexer: 1 block per (block_b, idx_head, token)
 // ============================================================================
+template <bool IK_Q4_0>
 __global__ void msa_indexer_score_blocks_d128_kernel(
     const float *   __restrict__ iq,         // [T, n_idx_heads, 128]
-    const __half *  __restrict__ ik_cache,   // [max_ctx, 128] F16
+    const void *    __restrict__ ik_cache,   // [max_ctx, 128] F16 or BlockQ4_0
     const int32_t * __restrict__ pos,        // [T]
     float *         __restrict__ bscores,    // [T, n_idx_heads, max_nblk]
     int max_nblk, int n_idx_heads, int blk_size, int prefix_blks, int local_blks, int dense_prefix_tokens) {
@@ -65,12 +111,31 @@ __global__ void msa_indexer_score_blocks_d128_kernel(
     const int p_start = b * blk_size;
     const int p_end   = (p_start + blk_size < kv_len) ? (p_start + blk_size) : kv_len;
 
+    const int blk_idx  = lane >> 3;
+    const int byte_off = (lane & 7) << 1;
     float wmax = -FLT_MAX;
     for (int kp = p_start + warp; kp < p_end; kp += 4) {
-        const uint2 kpack = __ldg(reinterpret_cast<const uint2 *>(ik_cache + static_cast<size_t>(kp) * 128) + lane);
-        const float2 kf0 = __half22float2(*reinterpret_cast<const __half2 *>(&kpack.x));
-        const float2 kf1 = __half22float2(*reinterpret_cast<const __half2 *>(&kpack.y));
-        float dot = warp_sum(q4.x * kf0.x + q4.y * kf0.y + q4.z * kf1.x + q4.w * kf1.y);
+        float dot;
+        if constexpr (IK_Q4_0) {
+            const auto * ik_q4 = static_cast<const BlockQ4_0 *>(ik_cache);
+            const BlockQ4_0 & kb = ik_q4[static_cast<size_t>(kp) * 4 + blk_idx];
+            __half kdh;
+            *reinterpret_cast<uint16_t *>(&kdh) = __ldg(&kb.d);
+            const float kd = __half2float(kdh);
+            const uint16_t pk = __ldg(reinterpret_cast<const uint16_t *>(kb.qs + byte_off));
+            const float partial = kd * (
+                q4.x * static_cast<float>(static_cast<int>( pk        & 0xFu) - 8) +
+                q4.y * static_cast<float>(static_cast<int>((pk >>  4) & 0xFu) - 8) +
+                q4.z * static_cast<float>(static_cast<int>((pk >>  8) & 0xFu) - 8) +
+                q4.w * static_cast<float>(static_cast<int>((pk >> 12) & 0xFu) - 8));
+            dot = warp_sum(partial);
+        } else {
+            const auto * ik_f16 = static_cast<const __half *>(ik_cache);
+            const uint2 kpack = __ldg(reinterpret_cast<const uint2 *>(ik_f16 + static_cast<size_t>(kp) * 128) + lane);
+            const float2 kf0 = __half22float2(*reinterpret_cast<const __half2 *>(&kpack.x));
+            const float2 kf1 = __half22float2(*reinterpret_cast<const __half2 *>(&kpack.y));
+            dot = warp_sum(q4.x * kf0.x + q4.y * kf0.y + q4.z * kf1.x + q4.w * kf1.y);
+        }
         if (lane == 0) wmax = fmaxf(wmax, dot);
     }
 
@@ -158,13 +223,13 @@ __global__ void msa_indexer_select_topk_kernel(
 // Cooperatively loads 8 KV positions ONCE into shared memory (8 KB total),
 // cutting KV cache DRAM bandwidth by 8x for both dense & MSA block-sparse decode!
 // ============================================================================
-template <bool KV_Q8_0>
+template <KvCacheType KV_TYPE>
 __device__ __forceinline__ void load_one_kv_to_smem(
     int p, int n_kv_heads, int kvh, int lane, int blk_idx, int blk_off,
     const void * k_cache, const void * v_cache,
     float4 * dst_k, float4 * dst_v) {
 
-    if constexpr (KV_Q8_0) {
+    if constexpr (KV_TYPE == KvCacheType::Q8_0) {
         const auto * kc = static_cast<const BlockQ8_0 *>(k_cache);
         const auto * vc = static_cast<const BlockQ8_0 *>(v_cache);
         const size_t blk = (static_cast<size_t>(p) * n_kv_heads + kvh) * 4 + blk_idx;
@@ -188,6 +253,28 @@ __device__ __forceinline__ void load_one_kv_to_smem(
             vd * static_cast<float>(static_cast<int8_t>(vq01 >> 8)),
             vd * static_cast<float>(static_cast<int8_t>(vq23 & 0xFF)),
             vd * static_cast<float>(static_cast<int8_t>(vq23 >> 8)));
+    } else if constexpr (KV_TYPE == KvCacheType::Q4_0) {
+        const auto * kc = static_cast<const BlockQ4_0 *>(k_cache);
+        const auto * vc = static_cast<const BlockQ4_0 *>(v_cache);
+        const size_t blk = (static_cast<size_t>(p) * n_kv_heads + kvh) * 4 + blk_idx;
+        const BlockQ4_0 & kb = kc[blk];
+        const BlockQ4_0 & vb = vc[blk];
+        __half kd_h, vd_h;
+        *reinterpret_cast<uint16_t *>(&kd_h) = __ldg(&kb.d);
+        *reinterpret_cast<uint16_t *>(&vd_h) = __ldg(&vb.d);
+        const float kd = __half2float(kd_h), vd = __half2float(vd_h);
+        const uint16_t pk = __ldg(reinterpret_cast<const uint16_t *>(kb.qs + (blk_off >> 1)));
+        const uint16_t pv = __ldg(reinterpret_cast<const uint16_t *>(vb.qs + (blk_off >> 1)));
+        dst_k[lane] = make_float4(
+            kd * static_cast<float>(static_cast<int>( pk        & 0xFu) - 8),
+            kd * static_cast<float>(static_cast<int>((pk >>  4) & 0xFu) - 8),
+            kd * static_cast<float>(static_cast<int>((pk >>  8) & 0xFu) - 8),
+            kd * static_cast<float>(static_cast<int>((pk >> 12) & 0xFu) - 8));
+        dst_v[lane] = make_float4(
+            vd * static_cast<float>(static_cast<int>( pv        & 0xFu) - 8),
+            vd * static_cast<float>(static_cast<int>((pv >>  4) & 0xFu) - 8),
+            vd * static_cast<float>(static_cast<int>((pv >>  8) & 0xFu) - 8),
+            vd * static_cast<float>(static_cast<int>((pv >> 12) & 0xFu) - 8));
     } else {
         const auto * kc = static_cast<const uint2 *>(k_cache);
         const auto * vc = static_cast<const uint2 *>(v_cache);
@@ -202,7 +289,7 @@ __device__ __forceinline__ void load_one_kv_to_smem(
     }
 }
 
-template <bool KV_Q8_0, int SPLITS>
+template <KvCacheType KV_TYPE, int SPLITS>
 __global__ __launch_bounds__(256) void gqa8_flash_attn_msa_splitk_d128_kernel(
     const float *   __restrict__ q,
     const void *    __restrict__ k_cache,
@@ -242,7 +329,7 @@ __global__ __launch_bounds__(256) void gqa8_flash_attn_msa_splitk_d128_kernel(
         for (int p0 = r0; p0 < r1; p0 += 8) {
             const int cnt = (p0 + 8 <= r1) ? 8 : (r1 - p0);
             if (warp < cnt) {
-                load_one_kv_to_smem<KV_Q8_0>(
+                load_one_kv_to_smem<KV_TYPE>(
                     p0 + warp, n_kv_heads, kvh, lane, blk_idx, blk_off,
                     k_cache, v_cache, s_k[warp], s_v[warp]);
             }
@@ -323,7 +410,7 @@ __global__ __launch_bounds__(256) void gqa8_flash_attn_msa_splitk_d128_kernel(
 }
 
 // Generic Split-K fallback (for non-GQA-8 head ratios)
-template <bool KV_Q8_0>
+template <KvCacheType KV_TYPE>
 __device__ __forceinline__ void attend_one_pos(
     int p, int n_kv_heads, int kvh, int lane, int blk_idx, int blk_off,
     float q0, float q1, float q2, float q3,
@@ -331,7 +418,7 @@ __device__ __forceinline__ void attend_one_pos(
     float & m_i, float & l_i, float & o0, float & o1, float & o2, float & o3) {
 
     float k0, k1, k2, k3, v0, v1, v2, v3;
-    if constexpr (KV_Q8_0) {
+    if constexpr (KV_TYPE == KvCacheType::Q8_0) {
         const auto * kc = static_cast<const BlockQ8_0 *>(k_cache);
         const auto * vc = static_cast<const BlockQ8_0 *>(v_cache);
         const size_t blk = (static_cast<size_t>(p) * n_kv_heads + kvh) * 4 + blk_idx;
@@ -353,6 +440,26 @@ __device__ __forceinline__ void attend_one_pos(
         v1 = vd * static_cast<float>(static_cast<int8_t>(vq01 >> 8));
         v2 = vd * static_cast<float>(static_cast<int8_t>(vq23 & 0xFF));
         v3 = vd * static_cast<float>(static_cast<int8_t>(vq23 >> 8));
+    } else if constexpr (KV_TYPE == KvCacheType::Q4_0) {
+        const auto * kc = static_cast<const BlockQ4_0 *>(k_cache);
+        const auto * vc = static_cast<const BlockQ4_0 *>(v_cache);
+        const size_t blk = (static_cast<size_t>(p) * n_kv_heads + kvh) * 4 + blk_idx;
+        const BlockQ4_0 & kb = kc[blk];
+        const BlockQ4_0 & vb = vc[blk];
+        __half kd_h, vd_h;
+        *reinterpret_cast<uint16_t *>(&kd_h) = __ldg(&kb.d);
+        *reinterpret_cast<uint16_t *>(&vd_h) = __ldg(&vb.d);
+        const float kd = __half2float(kd_h), vd = __half2float(vd_h);
+        const uint16_t pk = __ldg(reinterpret_cast<const uint16_t *>(kb.qs + (blk_off >> 1)));
+        const uint16_t pv = __ldg(reinterpret_cast<const uint16_t *>(vb.qs + (blk_off >> 1)));
+        k0 = kd * static_cast<float>(static_cast<int>( pk        & 0xFu) - 8);
+        k1 = kd * static_cast<float>(static_cast<int>((pk >>  4) & 0xFu) - 8);
+        k2 = kd * static_cast<float>(static_cast<int>((pk >>  8) & 0xFu) - 8);
+        k3 = kd * static_cast<float>(static_cast<int>((pk >> 12) & 0xFu) - 8);
+        v0 = vd * static_cast<float>(static_cast<int>( pv        & 0xFu) - 8);
+        v1 = vd * static_cast<float>(static_cast<int>((pv >>  4) & 0xFu) - 8);
+        v2 = vd * static_cast<float>(static_cast<int>((pv >>  8) & 0xFu) - 8);
+        v3 = vd * static_cast<float>(static_cast<int>((pv >> 12) & 0xFu) - 8);
     } else {
         const auto * kc = static_cast<const uint2 *>(k_cache);
         const auto * vc = static_cast<const uint2 *>(v_cache);
@@ -378,7 +485,7 @@ __device__ __forceinline__ void attend_one_pos(
     m_i = m_new;
 }
 
-template <bool KV_Q8_0, int SPLITS>
+template <KvCacheType KV_TYPE, int SPLITS>
 __global__ void gqa_flash_attn_msa_splitk_d128_kernel(
     const float *   __restrict__ q,
     const void *    __restrict__ k_cache,
@@ -416,7 +523,7 @@ __global__ void gqa_flash_attn_msa_splitk_d128_kernel(
         const int p0    = s * chunk;
         const int p1    = (p0 + chunk < kv_len) ? (p0 + chunk) : kv_len;
         for (int p = p0; p < p1; ++p) {
-            attend_one_pos<KV_Q8_0>(p, n_kv_heads, kvh, lane, blk_idx, blk_off,
+            attend_one_pos<KV_TYPE>(p, n_kv_heads, kvh, lane, blk_idx, blk_off,
                                     q0, q1, q2, q3, k_cache, v_cache, m_i, l_i, o0, o1, o2, o3);
         }
     } else {
@@ -428,7 +535,7 @@ __global__ void gqa_flash_attn_msa_splitk_d128_kernel(
             const int base_p = blks[bi] * blk_size;
             const int end_p  = (base_p + blk_size < kv_len) ? (base_p + blk_size) : kv_len;
             for (int p = base_p; p < end_p; ++p) {
-                attend_one_pos<KV_Q8_0>(p, n_kv_heads, kvh, lane, blk_idx, blk_off,
+                attend_one_pos<KV_TYPE>(p, n_kv_heads, kvh, lane, blk_idx, blk_off,
                                         q0, q1, q2, q3, k_cache, v_cache, m_i, l_i, o0, o1, o2, o3);
             }
         }
@@ -483,7 +590,7 @@ __global__ void gqa_flash_attn_splitk_reduce_d128_kernel(
 }
 
 // Single-pass warp kernel for sparse prefill batches (T > 4 with active MSA top-K blocks)
-template <bool KV_Q8_0>
+template <KvCacheType KV_TYPE>
 __global__ void gqa_flash_attn_msa_d128_warp_kernel(
     const float *   __restrict__ q,
     const void *    __restrict__ k_cache,
@@ -516,7 +623,7 @@ __global__ void gqa_flash_attn_msa_d128_warp_kernel(
 
     if (k_sel == 0) {
         for (int p = 0; p < kv_len; ++p) {
-            attend_one_pos<KV_Q8_0>(p, n_kv_heads, kvh, lane, blk_idx, blk_off,
+            attend_one_pos<KV_TYPE>(p, n_kv_heads, kvh, lane, blk_idx, blk_off,
                                     q0, q1, q2, q3, k_cache, v_cache, m_i, l_i, o0, o1, o2, o3);
         }
     } else {
@@ -525,7 +632,7 @@ __global__ void gqa_flash_attn_msa_d128_warp_kernel(
             const int base_p = blks[bi] * blk_size;
             const int end_p  = (base_p + blk_size < kv_len) ? (base_p + blk_size) : kv_len;
             for (int p = base_p; p < end_p; ++p) {
-                attend_one_pos<KV_Q8_0>(p, n_kv_heads, kvh, lane, blk_idx, blk_off,
+                attend_one_pos<KV_TYPE>(p, n_kv_heads, kvh, lane, blk_idx, blk_off,
                                         q0, q1, q2, q3, k_cache, v_cache, m_i, l_i, o0, o1, o2, o3);
             }
         }
@@ -547,8 +654,17 @@ void launch_idx_k_write_f16(
         d_ik, static_cast<__half *>(d_ik_cache), d_pos, T, idx_dim);
 }
 
+void launch_idx_k_write_q4_0(
+    const float * d_ik, void * d_ik_cache, const int32_t * d_pos,
+    int T, int idx_dim, cudaStream_t stream) {
+
+    const int n_blk = idx_dim >> 5;
+    idx_k_write_q4_0_kernel<<<T, dim3(32, n_blk), 0, stream>>>(
+        d_ik, static_cast<BlockQ4_0 *>(d_ik_cache), d_pos, T, idx_dim);
+}
+
 void launch_msa_indexer_topk(
-    const float * d_iq, const void * d_ik_cache, const int32_t * d_pos,
+    const float * d_iq, const void * d_ik_cache, bool ik_is_q4_0, const int32_t * d_pos,
     int32_t * d_out_blocks, int32_t * d_out_k_count, void * d_scratch,
     int T, int max_ctx, int n_idx_heads, int blk_size, int prefix_blks, int local_blks, int k_max, int dense_prefix_tokens,
     cudaStream_t stream) {
@@ -557,9 +673,15 @@ void launch_msa_indexer_topk(
     float * d_bscores = static_cast<float *>(d_scratch);
 
     dim3 score_grid(max_nblk, n_idx_heads, T);
-    msa_indexer_score_blocks_d128_kernel<<<score_grid, 128, 0, stream>>>(
-        d_iq, static_cast<const __half *>(d_ik_cache), d_pos, d_bscores,
-        max_nblk, n_idx_heads, blk_size, prefix_blks, local_blks, dense_prefix_tokens);
+    if (ik_is_q4_0) {
+        msa_indexer_score_blocks_d128_kernel<true><<<score_grid, 128, 0, stream>>>(
+            d_iq, d_ik_cache, d_pos, d_bscores,
+            max_nblk, n_idx_heads, blk_size, prefix_blks, local_blks, dense_prefix_tokens);
+    } else {
+        msa_indexer_score_blocks_d128_kernel<false><<<score_grid, 128, 0, stream>>>(
+            d_iq, d_ik_cache, d_pos, d_bscores,
+            max_nblk, n_idx_heads, blk_size, prefix_blks, local_blks, dense_prefix_tokens);
+    }
 
     dim3 topk_grid(n_idx_heads, T);
     msa_indexer_select_topk_kernel<<<topk_grid, 256, 0, stream>>>(
@@ -569,7 +691,7 @@ void launch_msa_indexer_topk(
 
 void launch_gqa_attn_msa(
     const float * d_q, const void * d_k_cache, const void * d_v_cache,
-    bool kv_is_q8_0, const int32_t * d_pos,
+    KvCacheType kv_type, const int32_t * d_pos,
     const int32_t * d_msa_blocks, const int32_t * d_msa_k_count,
     float * d_out, void * d_scratch, int T, int n_heads, int n_kv_heads, int head_dim, int blk_size, int k_max, float scale,
     cudaStream_t stream) {
@@ -589,12 +711,16 @@ void launch_gqa_attn_msa(
             float * pl8 = pm8 + n_slots8;
             float * po8 = pl8 + n_slots8;
             dim3 grid(n_kv_heads, S8, T);
-            if (kv_is_q8_0) {
-                gqa8_flash_attn_msa_splitk_d128_kernel<true, S8><<<grid, dim3(32, 8), 0, stream>>>(
+            if (kv_type == KvCacheType::Q8_0) {
+                gqa8_flash_attn_msa_splitk_d128_kernel<KvCacheType::Q8_0, S8><<<grid, dim3(32, 8), 0, stream>>>(
+                    d_q, d_k_cache, d_v_cache, d_pos, d_msa_blocks, d_msa_k_count,
+                    pm8, pl8, po8, n_heads, n_kv_heads, blk_size, k_max, scale);
+            } else if (kv_type == KvCacheType::Q4_0) {
+                gqa8_flash_attn_msa_splitk_d128_kernel<KvCacheType::Q4_0, S8><<<grid, dim3(32, 8), 0, stream>>>(
                     d_q, d_k_cache, d_v_cache, d_pos, d_msa_blocks, d_msa_k_count,
                     pm8, pl8, po8, n_heads, n_kv_heads, blk_size, k_max, scale);
             } else {
-                gqa8_flash_attn_msa_splitk_d128_kernel<false, S8><<<grid, dim3(32, 8), 0, stream>>>(
+                gqa8_flash_attn_msa_splitk_d128_kernel<KvCacheType::F16, S8><<<grid, dim3(32, 8), 0, stream>>>(
                     d_q, d_k_cache, d_v_cache, d_pos, d_msa_blocks, d_msa_k_count,
                     pm8, pl8, po8, n_heads, n_kv_heads, blk_size, k_max, scale);
             }
@@ -603,12 +729,16 @@ void launch_gqa_attn_msa(
             return;
         } else {
             dim3 grid(n_heads, S, T);
-            if (kv_is_q8_0) {
-                gqa_flash_attn_msa_splitk_d128_kernel<true, S><<<grid, 32, 0, stream>>>(
+            if (kv_type == KvCacheType::Q8_0) {
+                gqa_flash_attn_msa_splitk_d128_kernel<KvCacheType::Q8_0, S><<<grid, 32, 0, stream>>>(
+                    d_q, d_k_cache, d_v_cache, d_pos, d_msa_blocks, d_msa_k_count,
+                    part_m, part_l, part_o, n_heads, n_kv_heads, blk_size, k_max, scale);
+            } else if (kv_type == KvCacheType::Q4_0) {
+                gqa_flash_attn_msa_splitk_d128_kernel<KvCacheType::Q4_0, S><<<grid, 32, 0, stream>>>(
                     d_q, d_k_cache, d_v_cache, d_pos, d_msa_blocks, d_msa_k_count,
                     part_m, part_l, part_o, n_heads, n_kv_heads, blk_size, k_max, scale);
             } else {
-                gqa_flash_attn_msa_splitk_d128_kernel<false, S><<<grid, 32, 0, stream>>>(
+                gqa_flash_attn_msa_splitk_d128_kernel<KvCacheType::F16, S><<<grid, 32, 0, stream>>>(
                     d_q, d_k_cache, d_v_cache, d_pos, d_msa_blocks, d_msa_k_count,
                     part_m, part_l, part_o, n_heads, n_kv_heads, blk_size, k_max, scale);
             }
@@ -621,12 +751,16 @@ void launch_gqa_attn_msa(
     constexpr int wpb = 4;
     dim3 grid((n_heads + wpb - 1) / wpb, T);
     dim3 block(32, wpb);
-    if (kv_is_q8_0) {
-        gqa_flash_attn_msa_d128_warp_kernel<true><<<grid, block, 0, stream>>>(
+    if (kv_type == KvCacheType::Q8_0) {
+        gqa_flash_attn_msa_d128_warp_kernel<KvCacheType::Q8_0><<<grid, block, 0, stream>>>(
+            d_q, d_k_cache, d_v_cache, d_pos, d_msa_blocks, d_msa_k_count,
+            d_out, n_heads, n_kv_heads, blk_size, k_max, scale);
+    } else if (kv_type == KvCacheType::Q4_0) {
+        gqa_flash_attn_msa_d128_warp_kernel<KvCacheType::Q4_0><<<grid, block, 0, stream>>>(
             d_q, d_k_cache, d_v_cache, d_pos, d_msa_blocks, d_msa_k_count,
             d_out, n_heads, n_kv_heads, blk_size, k_max, scale);
     } else {
-        gqa_flash_attn_msa_d128_warp_kernel<false><<<grid, block, 0, stream>>>(
+        gqa_flash_attn_msa_d128_warp_kernel<KvCacheType::F16><<<grid, block, 0, stream>>>(
             d_q, d_k_cache, d_v_cache, d_pos, d_msa_blocks, d_msa_k_count,
             d_out, n_heads, n_kv_heads, blk_size, k_max, scale);
     }

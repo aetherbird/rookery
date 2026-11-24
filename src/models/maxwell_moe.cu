@@ -130,7 +130,7 @@ void MaxwellMoeModel::load(const std::string & gguf_path,
                            const std::vector<int> & gpu_ids,
                            const std::vector<float> & split_weights,
                            int max_ctx,
-                           bool kv_q8_0,
+                           KvCacheType kv_type,
                            bool load_mtp) {
     if (gpu_ids.empty()) {
         throw std::runtime_error("MaxwellMoeModel::load requires at least 1 GPU");
@@ -166,7 +166,7 @@ void MaxwellMoeModel::load(const std::string & gguf_path,
     cfg_.rms_eps              = static_cast<float>(gguf.get_f64("maxwell-moe.attention.layer_norm_rms_epsilon", 1e-6));
     cfg_.rope_freq_base       = static_cast<float>(gguf.get_f64("maxwell-moe.rope.freq_base", 20000000.0));
     cfg_.max_ctx              = max_ctx;
-    cfg_.kv_q8_0              = kv_q8_0;
+    cfg_.kv_type              = kv_type;
     cfg_.idx_n_head           = static_cast<int>(gguf.get_u64("maxwell-moe.attention.indexer.head_count", 4));
     cfg_.idx_head_dim         = static_cast<int>(gguf.get_u64("maxwell-moe.attention.indexer.key_length", 128));
     cfg_.idx_top_k            = static_cast<int>(gguf.get_u64("maxwell-moe.attention.indexer.top_k", 16));
@@ -176,10 +176,15 @@ void MaxwellMoeModel::load(const std::string & gguf_path,
     cfg_.idx_dense_prefix     = static_cast<int>(gguf.get_u64("maxwell-moe.attention.indexer.dense_prefix_tokens", 16384));
     msa_enabled_              = (cfg_.max_ctx > cfg_.idx_dense_prefix);
 
-    const size_t kv_bytes_per_layer = kv_q8_0
+    const size_t kv_bytes_per_layer = (kv_type == KvCacheType::Q8_0)
         ? static_cast<size_t>(cfg_.max_ctx) * cfg_.n_head_kv * (cfg_.head_dim / 32) * sizeof(BlockQ8_0)
-        : static_cast<size_t>(cfg_.max_ctx) * cfg_.n_head_kv * cfg_.head_dim * sizeof(uint16_t);
-    const size_t ik_bytes_per_layer = static_cast<size_t>(cfg_.max_ctx) * cfg_.idx_head_dim * sizeof(uint16_t);
+        : (kv_type == KvCacheType::Q4_0)
+            ? static_cast<size_t>(cfg_.max_ctx) * cfg_.n_head_kv * (cfg_.head_dim / 32) * sizeof(BlockQ4_0)
+            : static_cast<size_t>(cfg_.max_ctx) * cfg_.n_head_kv * cfg_.head_dim * sizeof(uint16_t);
+    const bool ik_q4_0 = (kv_type == KvCacheType::Q4_0);
+    const size_t ik_bytes_per_layer = ik_q4_0
+        ? static_cast<size_t>(cfg_.max_ctx) * (cfg_.idx_head_dim / 32) * sizeof(BlockQ4_0)
+        : static_cast<size_t>(cfg_.max_ctx) * cfg_.idx_head_dim * sizeof(uint16_t);
     const bool will_load_mtp = load_mtp && cfg_.n_nextn > 0 &&
         (gguf.find_tensor("blk." + std::to_string(cfg_.n_layers) + ".nextn.eh_proj.weight") != nullptr);
 
@@ -279,17 +284,20 @@ void MaxwellMoeModel::load(const std::string & gguf_path,
                 }
             }
             if (best_split < 0) {
-                double best_ratio = 1e9;
-                for (int s = 1; s < cfg_.n_layers; ++s) {
+                int64_t best_slack = INT64_MIN;
+                const size_t rt_est0 = 380ULL << 20;
+                const size_t rt_est1 = (will_load_mtp ? 420ULL : 340ULL) << 20;
+                for (int s = cfg_.n_layers - 1; s >= 1; --s) {
                     size_t w0 = out_b, w1 = embd_b + mtp_b;
                     for (int il = 0; il < s; ++il) w0 += lb[il];
                     for (int il = s; il < cfg_.n_layers; ++il) w1 += lb[il];
                     const size_t kv0 = static_cast<size_t>(s) * kv_per_l_tot;
                     const size_t kv1 = static_cast<size_t>(cfg_.n_layers - s) * kv_per_l_tot
                                      + (will_load_mtp ? 2 * kv_bytes_per_layer : 0);
-                    const double r = std::max(static_cast<double>(w0 + kv0) / std::max<size_t>(1, free0),
-                                              static_cast<double>(w1 + kv1) / std::max<size_t>(1, free1));
-                    if (r < best_ratio) { best_ratio = r; best_split = s; }
+                    const int64_t s0 = static_cast<int64_t>(free0) - static_cast<int64_t>(std::max(w0 + load_margin0, w0 + kv0 + rt_est0));
+                    const int64_t s1 = static_cast<int64_t>(free1) - static_cast<int64_t>(std::max(w1 + load_margin1, w1 + kv1 + rt_est1));
+                    const int64_t slack = std::min(s0, s1);
+                    if (slack > best_slack) { best_slack = slack; best_split = s; }
                 }
             }
 
@@ -513,8 +521,9 @@ void MaxwellMoeModel::load(const std::string & gguf_path,
 
     const auto t1 = std::chrono::steady_clock::now();
     const double sec = std::chrono::duration<double>(t1 - t0).count();
-    std::printf("Loaded Maxwell-V1-Flash (%d backbone%s, ctx=%d, kv=%s, SoA=LDG.128%s) in %.2f s\n",
-                cfg_.n_layers, mtp_.loaded ? " + blk.45 MTP" : "", cfg_.max_ctx, kv_q8_0 ? "Q8_0" : "F16",
+    std::printf("Loaded Maxwell-V1-Flash (%d backbone%s, ctx=%d, kv=%s%s, SoA=LDG.128%s) in %.2f s\n",
+                cfg_.n_layers, mtp_.loaded ? " + blk.45 MTP" : "", cfg_.max_ctx, kv_cache_type_name(cfg_.kv_type),
+                (msa_enabled_ ? (ik_q4_0 ? ", ik=Q4_0" : ", ik=F16") : ""),
                 asym_mode_ ? ", asym:head@GPU0,embd@GPU1" : "", sec);
     for (const auto & rt : runtimes_) {
         cudaSetDevice(rt.device);
@@ -612,19 +621,24 @@ void MaxwellMoeModel::run_gpu_segment(size_t gi, int T, bool run_argmax, bool lo
             rt.d_q, rt.d_k, rt.d_v,
             static_cast<const float *>(L.attn_q_norm.ptr),
             static_cast<const float *>(L.attn_k_norm.ptr),
-            k_caches_[il], v_caches_[il], cfg_.kv_q8_0,
+            k_caches_[il], v_caches_[il], cfg_.kv_type,
             rt.d_pos, T, cfg_.n_head, cfg_.n_head_kv, cfg_.head_dim,
             cfg_.rms_eps, cfg_.rope_freq_base, rt.stream);
         p_add(p_qkkv, pt);
 
         if (msa_enabled_ && L.idx_k_proj.valid() && ik_caches_[il] != nullptr) {
+            const bool ik_q4_0 = (cfg_.kv_type == KvCacheType::Q4_0);
             launch_linear(rt.cublas, L.idx_k_proj, rt.d_x_norm, rt.d_ik, T, rt.d_scratch, rt.scratch_bytes, rt.stream);
             launch_qk_norm_rope_neox(rt.d_ik, static_cast<const float *>(L.idx_k_norm.ptr),
                                      rt.d_pos, T, 1, cfg_.idx_head_dim, cfg_.rms_eps, cfg_.rope_freq_base, rt.stream);
-            launch_idx_k_write_f16(rt.d_ik, ik_caches_[il], rt.d_pos, T, cfg_.idx_head_dim, rt.stream);
+            if (ik_q4_0) {
+                launch_idx_k_write_q4_0(rt.d_ik, ik_caches_[il], rt.d_pos, T, cfg_.idx_head_dim, rt.stream);
+            } else {
+                launch_idx_k_write_f16(rt.d_ik, ik_caches_[il], rt.d_pos, T, cfg_.idx_head_dim, rt.stream);
+            }
 
             if (T >= 8 && kv_len_max > 0 && kv_len_max <= cfg_.idx_dense_prefix) {
-                launch_gqa_attn(rt.d_q, k_caches_[il], v_caches_[il], cfg_.kv_q8_0,
+                launch_gqa_attn(rt.d_q, k_caches_[il], v_caches_[il], cfg_.kv_type,
                                 rt.d_pos, rt.d_attn_out, rt.d_scratch, T, cfg_.n_head, cfg_.n_head_kv, cfg_.head_dim,
                                 kq_scale, rt.stream, rt.cublas, rt.scratch_bytes, kv_len_max);
             } else {
@@ -634,18 +648,18 @@ void MaxwellMoeModel::run_gpu_segment(size_t gi, int T, bool run_argmax, bool lo
 
                 const int k_max = cfg_.idx_prefix_blks + cfg_.idx_local_blks + cfg_.idx_top_k;
                 launch_msa_indexer_topk(
-                    rt.d_iq, ik_caches_[il], rt.d_pos, rt.d_msa_blocks, rt.d_msa_kcnt, rt.d_scratch,
+                    rt.d_iq, ik_caches_[il], ik_q4_0, rt.d_pos, rt.d_msa_blocks, rt.d_msa_kcnt, rt.d_scratch,
                     T, cfg_.max_ctx, cfg_.idx_n_head, cfg_.idx_blk_size, cfg_.idx_prefix_blks, cfg_.idx_local_blks,
                     k_max, cfg_.idx_dense_prefix, rt.stream);
 
                 launch_gqa_attn_msa(
-                    rt.d_q, k_caches_[il], v_caches_[il], cfg_.kv_q8_0,
+                    rt.d_q, k_caches_[il], v_caches_[il], cfg_.kv_type,
                     rt.d_pos, rt.d_msa_blocks, rt.d_msa_kcnt,
                     rt.d_attn_out, rt.d_scratch, T, cfg_.n_head, cfg_.n_head_kv, cfg_.head_dim,
                     cfg_.idx_blk_size, k_max, kq_scale, rt.stream);
             }
         } else {
-            launch_gqa_attn(rt.d_q, k_caches_[il], v_caches_[il], cfg_.kv_q8_0,
+            launch_gqa_attn(rt.d_q, k_caches_[il], v_caches_[il], cfg_.kv_type,
                             rt.d_pos, rt.d_attn_out, rt.d_scratch, T, cfg_.n_head, cfg_.n_head_kv, cfg_.head_dim,
                             kq_scale, rt.stream, rt.cublas, rt.scratch_bytes, kv_len_max);
         }
@@ -717,7 +731,8 @@ void MaxwellMoeModel::run_gpu_segment(size_t gi, int T, bool run_argmax, bool lo
             p_add(p_moe, pt);
         }
 
-        if (T <= 16 && hook_ == nullptr && (il + 1 < rt.layer_end) &&
+        const bool layer_hooked = (hook_ != nullptr && hook_->hooks_layer(il));
+        if (T <= 16 && !layer_hooked && (il + 1 < rt.layer_end) &&
             layers_[il + 1].hc_attn_fn.dtype == DType::BF16) {
             launch_hc_post_flat_rmsnorm_mix(
                 rt.d_sub_out, rt.d_inpL_alt, rt.d_post, rt.d_comb, rt.d_inpL,
@@ -728,7 +743,7 @@ void MaxwellMoeModel::run_gpu_segment(size_t gi, int T, bool run_argmax, bool lo
         }
         p_add(p_mhc, pt);
 
-        if (hook_ != nullptr) {
+        if (layer_hooked) {
             hook_->on_post_layer(il, rt.device, rt.d_inpL, T, cfg_.n_embd, cfg_.hc_mult, rt.stream);
         }
     }
@@ -1099,11 +1114,11 @@ void MaxwellMoeModel::run_mtp_body_on_last_gpu(const float * d_h_states, int T_m
         rt.d_q, rt.d_k, rt.d_v,
         static_cast<const float *>(L.attn_q_norm.ptr),
         static_cast<const float *>(L.attn_k_norm.ptr),
-        k_cache_mtp_, v_cache_mtp_, cfg_.kv_q8_0,
+        k_cache_mtp_, v_cache_mtp_, cfg_.kv_type,
         rt.d_mtp_pos, T_mtp, cfg_.n_head, cfg_.n_head_kv, cfg_.head_dim,
         cfg_.rms_eps, cfg_.rope_freq_base, rt.stream);
 
-    launch_gqa_attn(rt.d_q, k_cache_mtp_, v_cache_mtp_, cfg_.kv_q8_0,
+    launch_gqa_attn(rt.d_q, k_cache_mtp_, v_cache_mtp_, cfg_.kv_type,
                     rt.d_mtp_pos, rt.d_attn_out, rt.d_scratch, T_mtp, cfg_.n_head, cfg_.n_head_kv, cfg_.head_dim,
                     kq_scale, rt.stream, rt.cublas, rt.scratch_bytes, kv_len_max);
 

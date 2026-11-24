@@ -228,7 +228,19 @@ public:
                             const std::vector<int32_t> & positions,
                             const std::vector<EngramRuntimeParams> & per_token_params);
 
-    // LayerHook callback invoked inside host model's layer loop (including inside CUDA Graphs!).
+    // LayerHook callbacks invoked inside host model's layer loop (including inside CUDA Graphs!).
+    bool hooks_layer(int layer_idx) const override {
+        if (layer_idx < 0) return false;
+        if (ce_fp_ != nullptr && layer_idx == ce_target_layer_) return true;
+        if (dump_fp_ != nullptr && dump_delta_ &&
+            static_cast<size_t>(layer_idx) < delta_next_to_hook_.size() &&
+            delta_next_to_hook_[layer_idx] >= 0) return true;
+        if (static_cast<size_t>(layer_idx) < layer_to_hook_.size()) {
+            const int hi = layer_to_hook_[layer_idx];
+            if (hi >= 0 && (hooks_[hi].scale != 0.0f || dump_fp_ != nullptr)) return true;
+        }
+        return false;
+    }
     void on_post_layer(int layer_idx, int device, float * d_inpL, int n_tokens, int n_embd, int hc, cudaStream_t stream) override;
 
 private:

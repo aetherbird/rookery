@@ -33,13 +33,13 @@ struct HostEvalModel {
             qwen35->load(path, gpus, split, max_ctx, true, false);
         } else if (arch == "inkling2_loop" || arch == "inkling2") {
             inkling2 = std::make_unique<rookery::Inkling2LoopModel>();
-            inkling2->load(path, gpus, max_ctx, true);
+            inkling2->load(path, gpus, max_ctx, rookery::KvCacheType::Q8_0);
         } else if (arch == "bailingmoe3") {
             bailing3 = std::make_unique<rookery::BailingMoe3Model>();
             bailing3->load(path, gpus, split, max_ctx, true, false);
         } else {
             maxwell = std::make_unique<rookery::MaxwellMoeModel>();
-            maxwell->load(path, gpus, split, max_ctx, true, false);
+            maxwell->load(path, gpus, split, max_ctx, rookery::KvCacheType::Q8_0, false);
         }
     }
     int n_embd() const {

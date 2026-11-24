@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
-Level-3 Supervised Gated Bridge Trainer for Cross-Model Engram Grafting (RKCE v1 -> RKAD v2).
+Level-3 Supervised Gated Bridge Trainer for Cross-Model Engram Grafting (RKCE v1 -> RKAD v2/v3).
 
 Trains a lightweight low-rank gated Engram bridge (A_v, B_v, A_k, B_k, gate_w) directly against
-next-token Cross-Entropy + Host-KL regularization through the host model's EXACT frozen tail
-(hc_head + output_norm + lm_head), matching rookery's CUDA kernels formula-for-formula!
+next-token Cross-Entropy + Host-KL + Contrastive Shuffled-KL regularization through the host model's
+EXACT frozen tail (hc_head + output_norm + lm_head), matching rookery's CUDA kernels formula-for-formula!
 
-Exports directly to RKAD v2 (centered, has_gate=1) for immediate zero-overhead inference in rookery.
+Optional `--engram-kv-gguf`: loads the Engram provider's own pre-trained Engram decoder
+(e.g. DeepSeek-V4.1-Flash `blk.1.engram_kv.weight` / `blk.14.engram_kv.weight`), unit-RMS normalizes
+the decoded semantic value/key subspaces, trains the semantic coordinate translator in the provider's
+decoded space, and algebraically folds `A_v @ W_V_norm` and `A_k @ W_K_norm` directly into a standard
+zero-overhead RKAD v3 adapter (no provider projection shard required at inference time!).
 """
 import argparse
 import json
@@ -23,6 +27,7 @@ from safetensors import safe_open
 
 
 def load_rkce(path: str, src_layer: int):
+    """Pre-allocated low-RAM loader for RKCE v1 dumps (supports single- or multi-layer dumps)."""
     with open(path, "rb") as f:
         magic = f.read(4)
         if magic != b"RKCE":
@@ -34,30 +39,55 @@ def load_rkce(path: str, src_layer: int):
         if src_layer < 0 or src_layer >= n_eng:
             raise ValueError(f"src_layer {src_layer} out of range [0, {n_eng})")
 
-        targets_list = []
-        h_list = []
-        e_list = []
-        while True:
-            raw = f.read(4)
-            if len(raw) < 4:
-                break
-            (nt,) = struct.unpack("<i", raw)
-            if nt <= 0:
-                break
-            tgts = np.frombuffer(f.read(nt * 4), dtype=np.int32).copy()
-            h_f16 = np.frombuffer(f.read(nt * hc * d_host * 2), dtype=np.float16).reshape(nt, hc, d_host).copy()
-            e_sel = None
-            for el in range(n_eng):
-                buf = f.read(nt * d_eng * 2)
-                if el == src_layer:
-                    e_sel = np.frombuffer(buf, dtype=np.float16).reshape(nt, d_eng).copy()
-            targets_list.append(tgts)
-            h_list.append(h_f16)
-            e_list.append(e_sel)
+        if n_tokens_hdr > 0:
+            targets = np.empty((n_tokens_hdr,), dtype=np.int32)
+            h_all = np.empty((n_tokens_hdr, hc, d_host), dtype=np.float16)
+            e_all = np.empty((n_tokens_hdr, d_eng), dtype=np.float16)
+            off = 0
+            while off < n_tokens_hdr:
+                raw = f.read(4)
+                if len(raw) < 4:
+                    break
+                (nt,) = struct.unpack("<i", raw)
+                if nt <= 0:
+                    break
+                targets[off : off + nt] = np.frombuffer(f.read(nt * 4), dtype=np.int32)
+                h_all[off : off + nt] = np.frombuffer(
+                    f.read(nt * hc * d_host * 2), dtype=np.float16
+                ).reshape(nt, hc, d_host)
+                for el in range(n_eng):
+                    nbytes = nt * d_eng * 2
+                    if el == src_layer:
+                        e_all[off : off + nt] = np.frombuffer(f.read(nbytes), dtype=np.float16).reshape(nt, d_eng)
+                    else:
+                        f.seek(nbytes, 1)
+                off += nt
+            targets, h_all, e_all = targets[:off], h_all[:off], e_all[:off]
+        else:
+            targets_list, h_list, e_list = [], [], []
+            while True:
+                raw = f.read(4)
+                if len(raw) < 4:
+                    break
+                (nt,) = struct.unpack("<i", raw)
+                if nt <= 0:
+                    break
+                tgts = np.frombuffer(f.read(nt * 4), dtype=np.int32).copy()
+                h_f16 = np.frombuffer(f.read(nt * hc * d_host * 2), dtype=np.float16).reshape(nt, hc, d_host).copy()
+                e_sel = None
+                for el in range(n_eng):
+                    nbytes = nt * d_eng * 2
+                    if el == src_layer:
+                        e_sel = np.frombuffer(f.read(nbytes), dtype=np.float16).reshape(nt, d_eng).copy()
+                    else:
+                        f.seek(nbytes, 1)
+                targets_list.append(tgts)
+                h_list.append(h_f16)
+                e_list.append(e_sel)
+            targets = np.concatenate(targets_list, axis=0)
+            h_all = np.concatenate(h_list, axis=0)
+            e_all = np.concatenate(e_list, axis=0)
 
-    targets = np.concatenate(targets_list, axis=0)
-    h_all = np.concatenate(h_list, axis=0)
-    e_all = np.concatenate(e_list, axis=0)
     valid = targets >= 0
     return (
         h_all[valid],
@@ -67,31 +97,8 @@ def load_rkce(path: str, src_layer: int):
     )
 
 
-def load_maxwell_head(safetensors_dir: str, device: torch.device):
-    idx_path = os.path.join(safetensors_dir, "model.safetensors.index.json")
-    wmap = json.load(open(idx_path))["weight_map"]
-
-    def get_t(key: str) -> torch.Tensor:
-        shard = os.path.join(safetensors_dir, wmap[key])
-        with safe_open(shard, framework="pt", device="cpu") as f:
-            return f.get_tensor(key)
-
-    hc_fn = get_t("model.hc_head.hc_head_fn").to(device=device, dtype=torch.float32)       # [4, hc*d] or [hc*d, 4]
-    hc_scale = get_t("model.hc_head.hc_head_scale").to(device=device, dtype=torch.float32) # [1] or scalar
-    hc_base = get_t("model.hc_head.hc_head_base").to(device=device, dtype=torch.float32)   # [4]
-    out_norm = get_t("model.norm.weight").to(device=device, dtype=torch.float32)           # [d_host]
-    lm_head = get_t("lm_head.weight").to(device=device, dtype=torch.float16)               # [vocab, d_host]
-
-    # Normalize hc_fn orientation to [4, hc * d_host]
-    if hc_fn.shape[0] != 4 and hc_fn.shape[1] == 4:
-        hc_fn = hc_fn.t().contiguous()
-    hc_scale = hc_scale.reshape(-1)[0]
-    hc_base = hc_base.reshape(4)
-    return hc_fn, hc_scale, hc_base, out_norm, lm_head
-
-
-def load_gguf_tail_head(gguf_path: str, device: torch.device):
-    """Load frozen output_norm.weight + output.weight directly from a GGUF file (for hc=1 models like qwen35moe)."""
+def load_gguf_tensors(gguf_path: str, tensor_names: list[str]) -> dict[str, torch.Tensor]:
+    """Load and dequantize named tensors from a GGUF file (F32, F16, BF16, Q8_0, Q4_K, Q6_K)."""
     def read_str(f):
         (n,) = struct.unpack("<Q", f.read(8))
         return f.read(n).decode("utf-8", "replace")
@@ -113,10 +120,9 @@ def load_gguf_tail_head(gguf_path: str, device: torch.device):
                 skip_val(f, et)
 
     with open(gguf_path, "rb") as f:
-        magic = f.read(4)
-        if magic != b"GGUF":
+        if f.read(4) != b"GGUF":
             raise ValueError(f"Not a GGUF file: {gguf_path}")
-        (ver,) = struct.unpack("<I", f.read(4))
+        f.read(4)
         nt, nkv = struct.unpack("<QQ", f.read(16))
         align = 32
         for _ in range(nkv):
@@ -136,7 +142,10 @@ def load_gguf_tail_head(gguf_path: str, device: torch.device):
         pos = f.tell()
         data_off = ((pos + align - 1) // align) * align
 
-        def load_t(name: str) -> torch.Tensor:
+        out_map = {}
+        for name in tensor_names:
+            if name not in tensors:
+                raise KeyError(f"Tensor '{name}' not found in {gguf_path}")
             dims, tt, off = tensors[name]
             ne = 1
             for d in dims:
@@ -149,19 +158,19 @@ def load_gguf_tail_head(gguf_path: str, device: torch.device):
             elif tt == 30:  # BF16
                 u16 = np.frombuffer(f.read(ne * 2), dtype=np.uint16).astype(np.uint32) << 16
                 arr = u16.view(np.float32).copy()
-            elif tt == 8:  # Q8_0 (2B fp16 d + 32 int8 qs = 34B per 32 elems)
+            elif tt == 8:  # Q8_0
                 nblk = ne // 32
                 raw = np.frombuffer(f.read(nblk * 34), dtype=np.uint8).reshape(nblk, 34)
                 d = raw[:, :2].copy().view(np.float16).astype(np.float32)
                 qs = raw[:, 2:].view(np.int8).astype(np.float32)
                 arr = (d * qs).reshape(ne)
-            elif tt == 12:  # Q4_K (2B d + 2B dmin + 12B scales + 128B qs = 144B per 256 elems)
+            elif tt == 12:  # Q4_K
                 nblk = ne // 256
                 raw = np.frombuffer(f.read(nblk * 144), dtype=np.uint8).reshape(nblk, 144)
-                d = raw[:, 0:2].copy().view(np.float16).astype(np.float32)       # [nblk, 1]
-                dmin = raw[:, 2:4].copy().view(np.float16).astype(np.float32)    # [nblk, 1]
-                sc_b = raw[:, 4:16]                                              # [nblk, 12]
-                qs = raw[:, 16:144]                                              # [nblk, 128]
+                d = raw[:, 0:2].copy().view(np.float16).astype(np.float32)
+                dmin = raw[:, 2:4].copy().view(np.float16).astype(np.float32)
+                sc_b = raw[:, 4:16]
+                qs = raw[:, 16:144]
                 sc = np.empty((nblk, 8), dtype=np.float32)
                 mn = np.empty((nblk, 8), dtype=np.float32)
                 sc[:, 0:4] = sc_b[:, 0:4] & 63
@@ -171,20 +180,16 @@ def load_gguf_tail_head(gguf_path: str, device: torch.device):
                 out = np.empty((nblk, 256), dtype=np.float32)
                 for j in range(4):
                     q = qs[:, 32 * j : 32 * (j + 1)]
-                    d1 = (d * sc[:, 2 * j : 2 * j + 1])
-                    m1 = (dmin * mn[:, 2 * j : 2 * j + 1])
-                    d2 = (d * sc[:, 2 * j + 1 : 2 * j + 2])
-                    m2 = (dmin * mn[:, 2 * j + 1 : 2 * j + 2])
-                    out[:, 64 * j : 64 * j + 32] = d1 * (q & 0x0F).astype(np.float32) - m1
-                    out[:, 64 * j + 32 : 64 * j + 64] = d2 * (q >> 4).astype(np.float32) - m2
+                    out[:, 64 * j : 64 * j + 32] = (d * sc[:, 2 * j : 2 * j + 1]) * (q & 0x0F).astype(np.float32) - (dmin * mn[:, 2 * j : 2 * j + 1])
+                    out[:, 64 * j + 32 : 64 * j + 64] = (d * sc[:, 2 * j + 1 : 2 * j + 2]) * (q >> 4).astype(np.float32) - (dmin * mn[:, 2 * j + 1 : 2 * j + 2])
                 arr = out.reshape(ne)
-            elif tt == 14:  # Q6_K (128B ql + 64B qh + 16B scales(int8) + 2B d = 210B per 256 elems)
+            elif tt == 14:  # Q6_K
                 nblk = ne // 256
                 raw = np.frombuffer(f.read(nblk * 210), dtype=np.uint8).reshape(nblk, 210)
-                ql = raw[:, 0:128]                                               # [nblk, 128]
-                qh = raw[:, 128:192]                                             # [nblk, 64]
-                sc = raw[:, 192:208].copy().view(np.int8).astype(np.float32)     # [nblk, 16]
-                d = raw[:, 208:210].copy().view(np.float16).astype(np.float32)   # [nblk, 1]
+                ql = raw[:, 0:128]
+                qh = raw[:, 128:192]
+                sc = raw[:, 192:208].copy().view(np.int8).astype(np.float32)
+                d = raw[:, 208:210].copy().view(np.float16).astype(np.float32)
                 out = np.empty((nblk, 256), dtype=np.float32)
                 for n in range(2):
                     ql_n = ql[:, 64 * n : 64 * (n + 1)]
@@ -194,34 +199,96 @@ def load_gguf_tail_head(gguf_path: str, device: torch.device):
                     q2 = ((ql_n[:, 32:64] & 0x0F) | (((qh_n >> 2) & 3) << 4)).astype(np.int32) - 32
                     q3 = ((ql_n[:, 0:32] >> 4) | (((qh_n >> 4) & 3) << 4)).astype(np.int32) - 32
                     q4 = ((ql_n[:, 32:64] >> 4) | (((qh_n >> 6) & 3) << 4)).astype(np.int32) - 32
-                    # is = 0 for l in 0..15, 1 for l in 16..31
-                    s0 = np.repeat(sc_n[:, 0:2], 16, axis=1)
-                    s2 = np.repeat(sc_n[:, 2:4], 16, axis=1)
-                    s4 = np.repeat(sc_n[:, 4:6], 16, axis=1)
-                    s6 = np.repeat(sc_n[:, 6:8], 16, axis=1)
-                    out[:, 128 * n + 0 : 128 * n + 32] = d * s0 * q1
-                    out[:, 128 * n + 32 : 128 * n + 64] = d * s2 * q2
-                    out[:, 128 * n + 64 : 128 * n + 96] = d * s4 * q3
-                    out[:, 128 * n + 96 : 128 * n + 128] = d * s6 * q4
+                    out[:, 128 * n + 0 : 128 * n + 32] = d * np.repeat(sc_n[:, 0:2], 16, axis=1) * q1
+                    out[:, 128 * n + 32 : 128 * n + 64] = d * np.repeat(sc_n[:, 2:4], 16, axis=1) * q2
+                    out[:, 128 * n + 64 : 128 * n + 96] = d * np.repeat(sc_n[:, 4:6], 16, axis=1) * q3
+                    out[:, 128 * n + 96 : 128 * n + 128] = d * np.repeat(sc_n[:, 6:8], 16, axis=1) * q4
                 arr = out.reshape(ne)
             else:
                 raise ValueError(f"Unsupported GGUF tensor type {tt} for {name}")
-            # GGUF dims are reversed relative to PyTorch row-major [rows, cols]
             shape = tuple(reversed(dims))
-            return torch.from_numpy(arr.reshape(shape))
+            out_map[name] = torch.from_numpy(arr.reshape(shape))
+    return out_map
 
-        out_norm = load_t("output_norm.weight").to(device=device, dtype=torch.float32)
-        lm_head = load_t("output.weight").to(device=device, dtype=torch.float16)
-    return None, None, None, out_norm, lm_head
+
+def load_provider_engram_kv(
+    gguf_path: str,
+    src_layer: int,
+    tensor_name: str = "",
+    hc_provider: int = 4,
+    device: torch.device = torch.device("cuda:0"),
+):
+    """
+    Load provider's native pre-trained Engram projection (e.g. DeepSeek-V4.1-Flash `blk.1.engram_kv.weight`).
+    Layout in DeepSeek-V4.1-Flash: [ (hc + 1) * d_prov, d_eng ], where:
+      - rows [0 : hc * d_prov] = K_0..K_{hc-1} (averaged across streams -> W_K_prov [d_prov, d_eng])
+      - rows [hc * d_prov : (hc + 1) * d_prov] = V (W_V_prov [d_prov, d_eng])
+    """
+    if not tensor_name:
+        blk = 1 if src_layer == 0 else 14
+        tensor_name = f"blk.{blk}.engram_kv.weight"
+    kv = load_gguf_tensors(gguf_path, [tensor_name])[tensor_name]  # [(hc+1)*d_prov, d_eng]
+    n_rows, d_eng = kv.shape
+    if n_rows % (hc_provider + 1) != 0:
+        raise ValueError(f"Unexpected {tensor_name} shape {tuple(kv.shape)} for hc_provider={hc_provider}")
+    d_prov = n_rows // (hc_provider + 1)
+    W_K = kv[: hc_provider * d_prov].reshape(hc_provider, d_prov, d_eng).mean(dim=0).to(device=device, dtype=torch.float32)
+    W_V = kv[hc_provider * d_prov :].contiguous().to(device=device, dtype=torch.float32)
+    return W_V, W_K, tensor_name
+
+
+def load_maxwell_head(safetensors_dir: str, device: torch.device):
+    idx_path = os.path.join(safetensors_dir, "model.safetensors.index.json")
+    wmap = json.load(open(idx_path))["weight_map"]
+
+    def get_t(key: str) -> torch.Tensor:
+        shard = os.path.join(safetensors_dir, wmap[key])
+        with safe_open(shard, framework="pt", device="cpu") as f:
+            return f.get_tensor(key)
+
+    hc_fn = get_t("model.hc_head.hc_head_fn").to(device=device, dtype=torch.float32)
+    hc_scale = get_t("model.hc_head.hc_head_scale").to(device=device, dtype=torch.float32)
+    hc_base = get_t("model.hc_head.hc_head_base").to(device=device, dtype=torch.float32)
+    out_norm = get_t("model.norm.weight").to(device=device, dtype=torch.float32)
+    lm_head = get_t("lm_head.weight").to(device=device, dtype=torch.float16)
+
+    if hc_fn.shape[0] != 4 and hc_fn.shape[1] == 4:
+        hc_fn = hc_fn.t().contiguous()
+    hc_scale = hc_scale.reshape(-1)[0]
+    hc_base = hc_base.reshape(4)
+    return hc_fn, hc_scale, hc_base, out_norm, lm_head
+
+
+def load_gguf_tail_head(gguf_path: str, device: torch.device):
+    """Load frozen tail from GGUF for both hc=1 models (output_norm + output) and Maxwell hc=4 models!"""
+    # Check if Maxwell hc_head tensors exist in GGUF
+    try:
+        tmap = load_gguf_tensors(
+            gguf_path,
+            ["output_hc_fn.weight", "output_hc_scale.weight", "output_hc_base.weight", "output_norm.weight", "output.weight"],
+        )
+        hc_fn = tmap["output_hc_fn.weight"].to(device=device, dtype=torch.float32)
+        if hc_fn.shape[0] != 4 and hc_fn.shape[1] == 4:
+            hc_fn = hc_fn.t().contiguous()
+        hc_scale = tmap["output_hc_scale.weight"].to(device=device, dtype=torch.float32).reshape(-1)[0]
+        hc_base = tmap["output_hc_base.weight"].to(device=device, dtype=torch.float32).reshape(4)
+        out_norm = tmap["output_norm.weight"].to(device=device, dtype=torch.float32)
+        lm_head = tmap["output.weight"].to(device=device, dtype=torch.float16)
+        return hc_fn, hc_scale, hc_base, out_norm, lm_head
+    except KeyError:
+        tmap = load_gguf_tensors(gguf_path, ["output_norm.weight", "output.weight"])
+        out_norm = tmap["output_norm.weight"].to(device=device, dtype=torch.float32)
+        lm_head = tmap["output.weight"].to(device=device, dtype=torch.float16)
+        return None, None, None, out_norm, lm_head
 
 
 def maxwell_head_logits(
-    h_hc: torch.Tensor,  # [B, hc, d_host] fp32
-    hc_fn,               # [4, 4*d_host] fp32 or None (for standard hc=1 models)
+    h_hc: torch.Tensor,
+    hc_fn,
     hc_scale,
     hc_base,
-    out_norm: torch.Tensor,  # [d_host] fp32
-    lm_head: torch.Tensor,   # [vocab, d_host] fp16
+    out_norm: torch.Tensor,
+    lm_head: torch.Tensor,
     rms_eps: float = 1e-6,
     hc_eps: float = 1e-6,
 ) -> torch.Tensor:
@@ -229,11 +296,11 @@ def maxwell_head_logits(
     if hc_fn is not None:
         flat = h_hc.reshape(B, hc * D)
         inv_flat = torch.rsqrt(flat.pow(2).mean(dim=-1, keepdim=True) + rms_eps)
-        mixes = F.linear(flat * inv_flat, hc_fn)  # [B, 4]
-        pre = torch.sigmoid(mixes * hc_scale + hc_base) + hc_eps  # [B, 4]
-        mixed = (pre.unsqueeze(-1) * h_hc).sum(dim=1)  # [B, D]
+        mixes = F.linear(flat * inv_flat, hc_fn)
+        pre = torch.sigmoid(mixes * hc_scale + hc_base) + hc_eps
+        mixed = (pre.unsqueeze(-1) * h_hc).sum(dim=1)
     else:
-        mixed = h_hc.mean(dim=1)  # [B, D] for standard hc=1 models (qwen35moe, etc.)
+        mixed = h_hc.mean(dim=1)
     inv_rms = torch.rsqrt(mixed.pow(2).mean(dim=-1, keepdim=True) + rms_eps)
     x_norm = mixed * inv_rms * out_norm
     logits = F.linear(x_norm.to(lm_head.dtype), lm_head).float()
@@ -241,37 +308,43 @@ def maxwell_head_logits(
 
 
 class RookeryGatedBridge(nn.Module):
-    """Exact PyTorch replica of rookery's engram_gated_inject_kernel (RKAD v2 has_gate=1)."""
+    """Exact PyTorch replica of rookery's engram_gated_inject_kernel (RKAD v2/v3 has_gate=1)."""
 
-    def __init__(self, d_eng: int, d_host: int, hc: int, rank: int, init_scale: float = 0.05, dropout: float = 0.0):
+    def __init__(self, d_in: int, d_host: int, hc: int, rank: int, init_scale: float = 0.05, dropout: float = 0.0):
         super().__init__()
-        self.d_eng = d_eng
+        self.d_eng = d_in
         self.d_host = d_host
         self.hc = hc
         self.rank = rank
         self.fixed_scale = init_scale
         self.drop = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
 
-        self.A_v = nn.Parameter(torch.randn(rank, d_eng) * (1.0 / math.sqrt(d_eng)))
+        self.A_v = nn.Parameter(torch.randn(rank, d_in) * (1.0 / math.sqrt(d_in)))
         self.B_v = nn.Parameter(torch.zeros(d_host, rank))  # exact zero-init -> starts at baseline!
-        self.A_k = nn.Parameter(torch.randn(rank, d_eng) * (1.0 / math.sqrt(d_eng)))
+        self.A_k = nn.Parameter(torch.randn(rank, d_in) * (1.0 / math.sqrt(d_in)))
         self.B_k = nn.Parameter(torch.randn(d_host, rank) * (1.0 / math.sqrt(rank)))
         self.gate_w = nn.Parameter(torch.ones(hc, d_host))
 
-    def forward(self, h_hc: torch.Tensor, e_c: torch.Tensor, rms_eps: float = 1e-6, return_stats: bool = False):
-        e_in = self.drop(e_c)
-        # v: [B, d_host], k: [B, d_host]
-        v = F.linear(self.drop(F.linear(e_in, self.A_v)), self.B_v)
-        k = F.linear(self.drop(F.linear(e_in, self.A_k)), self.B_k)
+    def forward(
+        self,
+        h_hc: torch.Tensor,
+        e_v: torch.Tensor,
+        e_k: torch.Tensor = None,
+        rms_eps: float = 1e-6,
+        return_stats: bool = False,
+    ):
+        if e_k is None:
+            e_k = e_v
+        v = F.linear(self.drop(F.linear(self.drop(e_v), self.A_v)), self.B_v)
+        k = F.linear(self.drop(F.linear(self.drop(e_k), self.A_k)), self.B_k)
 
-        # Exact engram_gated_inject_kernel math per stream s in 0..hc-1
-        k_norm = k * torch.rsqrt(k.pow(2).mean(dim=-1, keepdim=True) + rms_eps)  # [B, D]
-        h_norm = h_hc * torch.rsqrt(h_hc.pow(2).mean(dim=-1, keepdim=True) + rms_eps)  # [B, hc, D]
-        dot = (h_norm * k_norm.unsqueeze(1) * self.gate_w.unsqueeze(0)).sum(dim=-1)  # [B, hc]
+        k_norm = k * torch.rsqrt(k.pow(2).mean(dim=-1, keepdim=True) + rms_eps)
+        h_norm = h_hc * torch.rsqrt(h_hc.pow(2).mean(dim=-1, keepdim=True) + rms_eps)
+        dot = (h_norm * k_norm.unsqueeze(1) * self.gate_w.unsqueeze(0)).sum(dim=-1)
         scaled = dot / math.sqrt(float(self.d_host))
         mag = torch.sqrt(torch.clamp(scaled.abs(), min=1e-6))
         sgn = torch.where(scaled >= 0.0, torch.ones_like(scaled), -torch.ones_like(scaled))
-        g = torch.sigmoid(sgn * mag) * self.fixed_scale  # [B, hc]
+        g = torch.sigmoid(sgn * mag) * self.fixed_scale
         delta = g.unsqueeze(-1) * v.unsqueeze(1)
         out = h_hc + delta
         if return_stats:
@@ -290,21 +363,37 @@ def write_rkad_v3(
     bridge: RookeryGatedBridge,
     manifest: dict,
     delta_clip: float = 0.0,
+    W_V_fold: torch.Tensor = None,
+    W_K_fold: torch.Tensor = None,
 ):
+    A_v = (bridge.A_v @ W_V_fold) if W_V_fold is not None else bridge.A_v
+    A_k = (bridge.A_k @ W_K_fold) if W_K_fold is not None else bridge.A_k
+    d_eng_out = int(A_v.shape[1])
+
     m_bytes = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
-    hook_flags = 1 | 2 | (4 if delta_clip > 0.0 else 0)  # bit0=mu_e, bit1=gate, bit2=delta_clip
+    has_mu = mu_e is not None
+    hook_flags = (1 if has_mu else 0) | 2 | (4 if delta_clip > 0.0 else 0)
     with open(out_path, "wb") as f:
         f.write(b"RKAD")
-        # version=3, n_hooks=1, d_engram, d_host, default_rank, global_flags=0
-        f.write(struct.pack("<6I", 3, 1, bridge.d_eng, bridge.d_host, bridge.rank, 0))
+        f.write(struct.pack("<6I", 3, 1, d_eng_out, bridge.d_host, bridge.rank, 0))
         f.write(struct.pack("<I", len(m_bytes)))
         f.write(m_bytes)
-        f.write(struct.pack("<2if2If", target_layer, src_layer, float(bridge.fixed_scale),
-                            bridge.rank, hook_flags, float(delta_clip)))
-        f.write(mu_e.astype(np.float32).tobytes())
-        f.write(bridge.A_v.detach().cpu().float().numpy().tobytes())
+        f.write(
+            struct.pack(
+                "<2if2If",
+                target_layer,
+                src_layer,
+                float(bridge.fixed_scale),
+                bridge.rank,
+                hook_flags,
+                float(delta_clip),
+            )
+        )
+        if has_mu:
+            f.write(mu_e.astype(np.float32).tobytes())
+        f.write(A_v.detach().cpu().float().numpy().tobytes())
         f.write(bridge.B_v.detach().cpu().float().numpy().tobytes())
-        f.write(bridge.A_k.detach().cpu().float().numpy().tobytes())
+        f.write(A_k.detach().cpu().float().numpy().tobytes())
         f.write(bridge.B_k.detach().cpu().float().numpy().tobytes())
         f.write(bridge.gate_w.detach().cpu().float().numpy().tobytes())
 
@@ -315,22 +404,37 @@ def write_rkad_v2(
     src_layer: int,
     mu_e: np.ndarray,
     bridge: RookeryGatedBridge,
+    W_V_fold: torch.Tensor = None,
+    W_K_fold: torch.Tensor = None,
 ):
+    A_v = (bridge.A_v @ W_V_fold) if W_V_fold is not None else bridge.A_v
+    A_k = (bridge.A_k @ W_K_fold) if W_K_fold is not None else bridge.A_k
+    d_eng_out = int(A_v.shape[1])
     with open(out_path, "wb") as f:
         f.write(b"RKAD")
-        # version=2, n_hooks=1, d_engram, d_host, rank, has_gate=1
-        f.write(struct.pack("<6I", 2, 1, bridge.d_eng, bridge.d_host, bridge.rank, 1))
+        f.write(struct.pack("<6I", 2, 1, d_eng_out, bridge.d_host, bridge.rank, 1))
         f.write(struct.pack("<2if", target_layer, src_layer, float(bridge.fixed_scale)))
         f.write(mu_e.astype(np.float32).tobytes())
-        f.write(bridge.A_v.detach().cpu().float().numpy().tobytes())
+        f.write(A_v.detach().cpu().float().numpy().tobytes())
         f.write(bridge.B_v.detach().cpu().float().numpy().tobytes())
-        f.write(bridge.A_k.detach().cpu().float().numpy().tobytes())
+        f.write(A_k.detach().cpu().float().numpy().tobytes())
         f.write(bridge.B_k.detach().cpu().float().numpy().tobytes())
         f.write(bridge.gate_w.detach().cpu().float().numpy().tobytes())
 
 
 @torch.no_grad()
-def evaluate(bridge, h_val, e_val, y_val, mu_e_t, head_tensors, batch_size=256, shuffled=False):
+def evaluate(
+    bridge,
+    h_val,
+    e_val,
+    y_val,
+    mu_e_t,
+    head_tensors,
+    W_V_norm=None,
+    W_K_norm=None,
+    batch_size=256,
+    shuffled=False,
+):
     bridge.eval()
     hc_fn, hc_scale, hc_base, out_norm, lm_head = head_tensors
     device = out_norm.device
@@ -351,7 +455,9 @@ def evaluate(bridge, h_val, e_val, y_val, mu_e_t, head_tensors, batch_size=256, 
         tot_base_nll += F.cross_entropy(base_logits, yb, reduction="sum").item()
         base_hit1 += (base_logits.argmax(dim=-1) == yb).sum().item()
 
-        h_out = bridge(hb, eb)
+        ev = F.linear(eb, W_V_norm) if W_V_norm is not None else eb
+        ek = F.linear(eb, W_K_norm) if W_K_norm is not None else ev
+        h_out = bridge(hb, ev, ek)
         logits = maxwell_head_logits(h_out, hc_fn, hc_scale, hc_base, out_norm, lm_head)
         tot_nll += F.cross_entropy(logits, yb, reduction="sum").item()
         hit1 += (logits.argmax(dim=-1) == yb).sum().item()
@@ -370,30 +476,33 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rkce", required=True, help="Path to RKCE v1 dump")
     ap.add_argument("--safetensors-dir", default="", help="Directory with Maxwell safetensors + index.json")
-    ap.add_argument("--gguf", default="", help="Host GGUF path for standard hc=1 tail loading (output_norm + output)")
+    ap.add_argument("--gguf", default="", help="Host GGUF path for frozen tail loading (hc=1 or Maxwell hc=4)")
+    ap.add_argument("--engram-kv-gguf", default="", help="Optional provider GGUF shard with blk.<L>.engram_kv.weight for pre-decoded semantic folding")
+    ap.add_argument("--engram-kv-tensor", default="", help="Explicit tensor name in --engram-kv-gguf (default: auto blk.1/blk.14.engram_kv.weight)")
+    ap.add_argument("--engram-kv-hc", type=int, default=4, help="Provider hc_mult for splitting engram_kv into [K_0..K_{hc-1}, V]")
+    ap.add_argument("--no-center", action="store_true", help="Do not subtract corpus mean mu_e (keeps e=0 -> delta=0 exact, eliminates phantom -mu_e bias on unseen/shuffled rows)")
     ap.add_argument("--out", required=True, help="Output RKAD v2/v3 path")
-    ap.add_argument("--src-layer", type=int, default=0, help="Engram source layer index (0 or 1)")
+    ap.add_argument("--src-layer", type=int, default=0, help="Engram source layer index in RKCE (0 or 1)")
+    ap.add_argument("--export-src-layer", type=int, default=-1, help="Engram source layer index written to RKAD (default: same as --src-layer)")
     ap.add_argument("--rank", type=int, default=128)
     ap.add_argument("--scale", type=float, default=0.05)
     ap.add_argument("--epochs", type=int, default=8)
-    ap.add_argument("--batch-size", type=int, default=128)
-    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--batch-size", type=int, default=256)
+    ap.add_argument("--lr", type=float, default=8e-4)
     ap.add_argument("--wd", type=float, default=2e-2)
-    ap.add_argument("--kl-beta", type=float, default=0.25)
-    ap.add_argument("--shuf-kl-beta", type=float, default=0.0,
-                    help="Contrastive shuffled-batch KL(p_base || p_shuf) penalty to prevent RMSNorm logit-softening shortcuts")
-    ap.add_argument("--delta-reg", type=float, default=0.0,
-                    help="L2 penalty on mean ||delta||_rms / ||h||_rms to keep perturbations small and well-calibrated")
-    ap.add_argument("--calibrate-base-temp", action="store_true",
-                    help="Fit optimal scalar base temperature tau* before training so dCE/d(cos theta)=0 (eliminates RMSNorm logit-softening shortcut!)")
-    ap.add_argument("--dropout", type=float, default=0.0)
+    ap.add_argument("--kl-beta", type=float, default=0.5)
+    ap.add_argument("--shuf-kl-beta", type=float, default=1.5)
+    ap.add_argument("--delta-reg", type=float, default=1.0)
+    ap.add_argument("--calibrate-base-temp", action="store_true")
+    ap.add_argument("--dropout", type=float, default=0.25)
     ap.add_argument("--val-frac", type=float, default=0.1)
-    ap.add_argument("--rkad-v3", action="store_true", help="Emit self-describing RKAD v3 with strict JSON contract manifest")
+    ap.add_argument("--max-val", type=int, default=40000)
+    ap.add_argument("--rkad-v3", action="store_true")
     ap.add_argument("--provider-arch", default="deepseek41")
     ap.add_argument("--provider-fingerprint", default="")
     ap.add_argument("--host-arch", default="maxwell-moe")
     ap.add_argument("--host-n-layers", type=int, default=45)
-    ap.add_argument("--delta-clip", type=float, default=0.0)
+    ap.add_argument("--delta-clip", type=float, default=0.15)
     args = ap.parse_args()
 
     t0 = time.time()
@@ -402,40 +511,74 @@ def main():
 
     h_all, e_all, y_all, meta = load_rkce(args.rkce, args.src_layer)
     N = h_all.shape[0]
-    n_val = max(256, int(N * args.val_frac))
+    n_val = min(args.max_val, max(256, int(N * args.val_frac)))
     n_tr = N - n_val
-    print(f"Loaded {args.rkce}: N={N} valid tokens (train={n_tr}, val={n_val}), "
-          f"src_layer={args.src_layer}, target_layer={meta['target_layer']}, "
-          f"d_eng={meta['d_eng']}, hc={meta['hc']}, d_host={meta['d_host']}")
+    export_src = args.export_src_layer if args.export_src_layer >= 0 else args.src_layer
+    print(
+        f"Loaded {args.rkce}: N={N:,} valid tokens (train={n_tr:,}, val={n_val:,}), "
+        f"src_layer={args.src_layer} (export={export_src}), target_layer={meta['target_layer']}, "
+        f"d_eng={meta['d_eng']}, hc={meta['hc']}, d_host={meta['d_host']}",
+        flush=True,
+    )
 
     h_tr, e_tr, y_tr = h_all[:n_tr], e_all[:n_tr], y_all[:n_tr]
     h_va, e_va, y_va = h_all[n_tr:], e_all[n_tr:], y_all[n_tr:]
 
-    # Exact training-set mean centering vector mu_E
-    mu_e = e_tr.astype(np.float64).mean(axis=0).astype(np.float32)
+    # Optional training-set mean centering vector mu_E (use --no-center for exact e=0 -> delta=0 invariance)
+    if args.no_center:
+        mu_e = np.zeros(meta["d_eng"], dtype=np.float32)
+    else:
+        step_mu = max(1, n_tr // 200000)
+        mu_e = e_tr[::step_mu].astype(np.float64).mean(axis=0).astype(np.float32)
     mu_e_t = torch.from_numpy(mu_e).to(device=device, dtype=torch.float32)
+
+    # Optional provider pre-decoder W_V / W_K with exact unit-RMS normalization!
+    W_V_norm, W_K_norm = None, None
+    d_bridge_in = meta["d_eng"]
+    kv_tag = ""
+    if args.engram_kv_gguf:
+        W_V_raw, W_K_raw, kv_name = load_provider_engram_kv(
+            args.engram_kv_gguf, export_src, args.engram_kv_tensor, args.engram_kv_hc, device
+        )
+        # Measure exact RMS of projected training vectors so bridge inputs have exact unit RMS 1.0!
+        with torch.no_grad():
+            sub_e = torch.from_numpy(e_tr[:: max(1, n_tr // 16384)]).to(device=device, dtype=torch.float32) - mu_e_t
+            v_ss = F.linear(sub_e, W_V_raw).pow(2).mean().item()
+            k_ss = F.linear(sub_e, W_K_raw).pow(2).mean().item()
+            rms_v = math.sqrt(max(v_ss, 1e-12))
+            rms_k = math.sqrt(max(k_ss, 1e-12))
+            W_V_norm = W_V_raw / rms_v
+            W_K_norm = W_K_raw / rms_k
+        d_bridge_in = int(W_V_norm.shape[0])
+        kv_tag = f"_kvfold"
+        print(
+            f"[ProviderKV] Loaded {kv_name} ({d_bridge_in}x{meta['d_eng']}): "
+            f"pre-decoded rms_v={rms_v:.4f}, rms_k={rms_k:.4f} -> unit-RMS normalized for folding",
+            flush=True,
+        )
 
     if args.safetensors_dir:
         head_tensors = load_maxwell_head(args.safetensors_dir, device)
     elif args.gguf:
         head_tensors = load_gguf_tail_head(args.gguf, device)
     else:
-        raise ValueError("Must specify either --safetensors-dir (for maxwell-moe) or --gguf (for hc=1 models like qwen35moe)")
+        raise ValueError("Must specify either --safetensors-dir or --gguf")
     hc_fn, hc_scale, hc_base, out_norm, lm_head = head_tensors
 
-    bridge = RookeryGatedBridge(meta["d_eng"], meta["d_host"], meta["hc"], args.rank, args.scale, args.dropout).to(device)
+    bridge = RookeryGatedBridge(d_bridge_in, meta["d_host"], meta["hc"], args.rank, args.scale, args.dropout).to(device)
     opt = torch.optim.AdamW(bridge.parameters(), lr=args.lr, weight_decay=args.wd)
     total_steps = args.epochs * ((n_tr + args.batch_size - 1) // args.batch_size)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, total_steps), eta_min=args.lr * 0.05)
 
-    b_nll, b_ppl, b_t1, r_nll, r_ppl, r_t1 = evaluate(bridge, h_va, e_va, y_va, mu_e_t, head_tensors)
-    print(f"[Epoch 0] val BASE: NLL={b_nll:.5f} PPL={b_ppl:.3f} top1={b_t1:.2f}% | init PPL={r_ppl:.3f}")
+    b_nll, b_ppl, b_t1, r_nll, r_ppl, r_t1 = evaluate(
+        bridge, h_va, e_va, y_va, mu_e_t, head_tensors, W_V_norm, W_K_norm
+    )
+    print(f"[Epoch 0] val BASE: NLL={b_nll:.5f} PPL={b_ppl:.3f} top1={b_t1:.2f}% | init PPL={r_ppl:.3f}", flush=True)
 
-    # Optional: fit scalar base temperature tau* on a 16K training subset so dCE/d(cos theta)=0 during training
     train_tau = 1.0
     if args.calibrate_base_temp:
         sub_n = min(n_tr, 16384)
-        taus = [0.85, 0.95, 1.0, 1.05, 1.1, 1.15, 1.2, 1.25, 1.3, 1.4, 1.5]
+        taus = [0.85, 0.90, 0.95, 1.00, 1.05, 1.10, 1.15, 1.20, 1.25, 1.30, 1.35, 1.40, 1.50]
         nll_sums = [0.0 for _ in taus]
         with torch.no_grad():
             for i in range(0, sub_n, 256):
@@ -447,21 +590,24 @@ def main():
                     nll_sums[ti] += F.cross_entropy(bl / tval, yb, reduction="sum").item()
         best_ti = int(np.argmin(nll_sums))
         train_tau = taus[best_ti]
-        print(f"[TempCalib] Optimal base temperature tau*={train_tau:.2f} "
-              f"(base NLL@1.0={nll_sums[taus.index(1.0)]/sub_n:.4f} -> @{train_tau:.2f}={nll_sums[best_ti]/sub_n:.4f})")
+        print(
+            f"[TempCalib] Optimal base temperature tau*={train_tau:.2f} "
+            f"(base NLL@1.0={nll_sums[taus.index(1.00)]/sub_n:.4f} -> @{train_tau:.2f}={nll_sums[best_ti]/sub_n:.4f})",
+            flush=True,
+        )
 
-    best_val_score = float("inf")
-    best_val_nll = b_nll
-    best_state = {k: v.detach().cpu().clone() for k, v in bridge.state_dict().items()}
+    best_clean_score = float("inf")
+    best_clean_state = None
+    best_clean_nll = b_nll
+    best_any_score = float("inf")
+    best_any_state = {k: v.detach().cpu().clone() for k, v in bridge.state_dict().items()}
+    best_any_nll = b_nll
 
     rng = np.random.default_rng(42)
     for ep in range(1, args.epochs + 1):
         bridge.train()
         order = rng.permutation(n_tr)
-        tr_ce_sum = 0.0
-        tr_kl_sum = 0.0
-        tr_skl_sum = 0.0
-        tr_rel_sum = 0.0
+        tr_ce_sum = tr_kl_sum = tr_skl_sum = tr_rel_sum = 0.0
         steps = 0
 
         for i in range(0, n_tr, args.batch_size):
@@ -474,23 +620,23 @@ def main():
                 base_logits = maxwell_head_logits(hb, hc_fn, hc_scale, hc_base, out_norm, lm_head)
                 base_logp = F.log_softmax(base_logits / train_tau, dim=-1)
                 base_p = base_logp.exp()
+                ev = F.linear(eb, W_V_norm) if W_V_norm is not None else eb
+                ek = F.linear(eb, W_K_norm) if W_K_norm is not None else ev
 
-            h_out, rel_norm, _ = bridge(hb, eb, return_stats=True)
+            h_out, rel_norm, _ = bridge(hb, ev, ek, return_stats=True)
             logits = maxwell_head_logits(h_out, hc_fn, hc_scale, hc_base, out_norm, lm_head)
             logp = F.log_softmax(logits / train_tau, dim=-1)
 
             ce = F.nll_loss(logp, yb)
-            # KL(p_base || p_grafted) = sum p_base * (log p_base - log p_grafted)
             kl = (base_p * (base_logp - logp)).sum(dim=-1).mean()
             loss = ce + args.kl_beta * kl
 
             skl_val = 0.0
             if args.shuf_kl_beta > 0.0 and eb.shape[0] > 1:
                 perm = torch.roll(torch.arange(eb.shape[0], device=device), shifts=1)
-                h_shuf = bridge(hb, eb[perm])
+                h_shuf = bridge(hb, ev[perm], ek[perm])
                 shuf_logits = maxwell_head_logits(h_shuf, hc_fn, hc_scale, hc_base, out_norm, lm_head)
                 shuf_logp = F.log_softmax(shuf_logits / train_tau, dim=-1)
-                # Force shuffled Engram inputs to leave base distribution unchanged (prevents isotropic softening!)
                 skl = (base_p * (base_logp - shuf_logp)).sum(dim=-1).mean()
                 loss = loss + args.shuf_kl_beta * skl
                 skl_val = skl.item()
@@ -510,22 +656,37 @@ def main():
             tr_rel_sum += rel_norm.item()
             steps += 1
 
-        _, _, _, r_nll, r_ppl, r_t1 = evaluate(bridge, h_va, e_va, y_va, mu_e_t, head_tensors, shuffled=False)
-        _, _, _, s_nll, s_ppl, s_t1 = evaluate(bridge, h_va, e_va, y_va, mu_e_t, head_tensors, shuffled=True)
+        _, _, _, r_nll, r_ppl, r_t1 = evaluate(
+            bridge, h_va, e_va, y_va, mu_e_t, head_tensors, W_V_norm, W_K_norm, shuffled=False
+        )
+        _, _, _, s_nll, s_ppl, s_t1 = evaluate(
+            bridge, h_va, e_va, y_va, mu_e_t, head_tensors, W_V_norm, W_K_norm, shuffled=True
+        )
         print(
             f"[Epoch {ep:2d}] tr_CE={tr_ce_sum/steps:.4f} tr_KL={tr_kl_sum/steps:.4f} "
             f"shuf_KL={tr_skl_sum/steps:.4f} ||d||/||h||={tr_rel_sum/steps:.4f} | "
             f"val REAL: PPL={r_ppl:.3f} (vs base {r_ppl-b_ppl:+.3f}, top1={r_t1:.2f}%) | "
-            f"SHUF: PPL={s_ppl:.3f} (shuf-real={s_ppl-r_ppl:+.3f})"
+            f"SHUF: PPL={s_ppl:.3f} (shuf-real={s_ppl-r_ppl:+.3f})",
+            flush=True,
         )
-        # Model selection: require genuine transfer (REAL must beat both BASE and SHUF when shuf_kl_beta > 0)
-        sel_score = r_nll if (args.shuf_kl_beta <= 0.0 or r_nll < s_nll) else float("inf")
-        if sel_score < best_val_score:
-            best_val_score = sel_score
-            best_val_nll = r_nll
-            best_state = {k: v.detach().cpu().clone() for k, v in bridge.state_dict().items()}
+        if args.shuf_kl_beta <= 0.0 or r_nll < s_nll:
+            if r_nll < best_any_score:
+                best_any_score = r_nll
+                best_any_nll = r_nll
+                best_any_state = {k: v.detach().cpu().clone() for k, v in bridge.state_dict().items()}
+            # Prefer strictly non-softening checkpoints (SHUF NLL >= BASE NLL - 0.002)
+            if s_nll >= b_nll - 0.002 and r_nll < best_clean_score:
+                best_clean_score = r_nll
+                best_clean_nll = r_nll
+                best_clean_state = {k: v.detach().cpu().clone() for k, v in bridge.state_dict().items()}
 
-    bridge.load_state_dict(best_state)
+    if best_clean_state is not None:
+        bridge.load_state_dict(best_clean_state)
+        best_val_nll = best_clean_nll
+    else:
+        bridge.load_state_dict(best_any_state)
+        best_val_nll = best_any_nll
+
     if args.rkad_v3:
         manifest = {
             "schema": "rookery.engram.adapter.v3",
@@ -536,13 +697,31 @@ def main():
             "host_n_layers": args.host_n_layers,
             "host_d_embd": meta["d_host"],
             "host_hc_mult": meta["hc"],
-            "calibration": f"level3_ce_kl_N{n_tr}_drop{args.dropout}",
+            "calibration": f"level3_ce_kl_N{n_tr}_drop{args.dropout}{kv_tag}{'_nc' if args.no_center else ''}",
         }
-        write_rkad_v3(args.out, meta["target_layer"], args.src_layer, mu_e, bridge, manifest, args.delta_clip)
-        print(f"Saved best Level-3 gated RKAD v3 -> {args.out} (best val PPL={math.exp(best_val_nll):.3f} vs base {b_ppl:.3f}) in {time.time()-t0:.1f}s")
+        write_rkad_v3(
+            args.out,
+            meta["target_layer"],
+            export_src,
+            None if args.no_center else mu_e,
+            bridge,
+            manifest,
+            args.delta_clip,
+            W_V_norm,
+            W_K_norm,
+        )
+        print(
+            f"Saved best Level-3 gated RKAD v3 -> {args.out} "
+            f"(best val PPL={math.exp(best_val_nll):.3f} vs base {b_ppl:.3f}) in {time.time()-t0:.1f}s",
+            flush=True,
+        )
     else:
-        write_rkad_v2(args.out, meta["target_layer"], args.src_layer, mu_e, bridge)
-        print(f"Saved best Level-3 gated RKAD v2 -> {args.out} (best val PPL={math.exp(best_val_nll):.3f} vs base {b_ppl:.3f}) in {time.time()-t0:.1f}s")
+        write_rkad_v2(args.out, meta["target_layer"], export_src, mu_e, bridge, W_V_norm, W_K_norm)
+        print(
+            f"Saved best Level-3 gated RKAD v2 -> {args.out} "
+            f"(best val PPL={math.exp(best_val_nll):.3f} vs base {b_ppl:.3f}) in {time.time()-t0:.1f}s",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":

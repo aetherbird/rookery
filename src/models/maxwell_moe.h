@@ -14,6 +14,7 @@ namespace rookery {
 
 struct LayerHook {
     virtual ~LayerHook() = default;
+    virtual bool hooks_layer(int /*layer_idx*/) const { return true; }
     virtual void on_post_layer(int layer_idx, int device, float * d_inpL, int n_tokens, int n_embd, int hc, cudaStream_t stream) = 0;
 };
 
@@ -40,8 +41,8 @@ struct MaxwellConfig {
     float hc_eps               = 1e-6f;
     float rms_eps              = 1e-6f;
     float rope_freq_base       = 20000000.0f;
-    int   max_ctx              = 4096;
-    bool  kv_q8_0              = true;
+    int         max_ctx        = 4096;
+    KvCacheType kv_type        = KvCacheType::Q8_0;
     // MSA block-sparse attention params
     int   idx_n_head           = 4;
     int   idx_head_dim         = 128;
@@ -97,7 +98,7 @@ public:
               const std::vector<int> & gpu_ids,
               const std::vector<float> & split_weights,
               int max_ctx = 4096,
-              bool kv_q8_0 = true,
+              KvCacheType kv_type = KvCacheType::Q8_0,
               bool load_mtp = true);
 
     void set_layer_hook(LayerHook * hook) { hook_ = hook; invalidate_graphs(); }

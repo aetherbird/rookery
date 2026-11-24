@@ -115,9 +115,22 @@ static void test_engram_rkad_v3_contract() {
     std::printf("[PASS] RKAD v3 manifest contract & EngramSeqState unit tests\n");
 }
 
+static void test_kv_cache_types() {
+    static_assert(sizeof(rookery::BlockQ8_0) == 34, "BlockQ8_0 size");
+    static_assert(sizeof(rookery::BlockQ4_0) == 18, "BlockQ4_0 size");
+    assert(rookery::parse_kv_cache_type("f16")  == rookery::KvCacheType::F16);
+    assert(rookery::parse_kv_cache_type("F16")  == rookery::KvCacheType::F16);
+    assert(rookery::parse_kv_cache_type("q8_0") == rookery::KvCacheType::Q8_0);
+    assert(rookery::parse_kv_cache_type("q4_0") == rookery::KvCacheType::Q4_0);
+    assert(rookery::parse_kv_cache_type("Q4_0") == rookery::KvCacheType::Q4_0);
+    assert(std::string(rookery::kv_cache_type_name(rookery::KvCacheType::Q4_0)) == "Q4_0");
+    std::printf("[PASS] KvCacheType & BlockQ4_0 unit tests\n");
+}
+
 int main(int argc, char ** argv) {
     test_chat_parser();
     test_engram_rkad_v3_contract();
+    test_kv_cache_types();
 
     // Optional tokenizer check mode: rookery_unit_test <model.gguf> <text1> [text2 ...]
     if (argc >= 3) {

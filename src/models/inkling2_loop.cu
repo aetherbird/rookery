@@ -114,7 +114,7 @@ Inkling2LoopModel::~Inkling2LoopModel() {
 void Inkling2LoopModel::load(const std::string & gguf_path,
                              const std::vector<int> & gpu_ids,
                              int max_ctx,
-                             bool kv_q8_0) {
+                             KvCacheType kv_type) {
     if (gpu_ids.empty()) throw std::runtime_error("Inkling2LoopModel::load requires >= 1 GPU");
 
     const auto t0 = std::chrono::steady_clock::now();
@@ -150,7 +150,7 @@ void Inkling2LoopModel::load(const std::string & gguf_path,
     cfg_.logit_softcap        = static_cast<float>(sg.get_f64(pfx + "final_logit_softcapping", 30.0));
     cfg_.rms_eps              = static_cast<float>(sg.get_f64(pfx + "attention.layer_norm_rms_epsilon", 1e-6));
     cfg_.max_ctx              = max_ctx;
-    cfg_.kv_q8_0              = kv_q8_0;
+    cfg_.kv_type              = kv_type;
     cfg_.swa_cap              = std::min(max_ctx, std::max(cfg_.swa_window * 4, 4096));
     cfg_.is_swa               = read_bool_arr(sg, pfx + "attention.sliding_window_pattern", cfg_.n_phys);
 
@@ -182,7 +182,8 @@ void Inkling2LoopModel::load(const std::string & gguf_path,
 
     const int d_kv = cfg_.n_head_kv * cfg_.head_dim; // 1024
     auto kv_bytes_for = [&](int cap) -> size_t {
-        if (kv_q8_0) return static_cast<size_t>(cap) * (d_kv / 32) * sizeof(BlockQ8_0);
+        if (kv_type == KvCacheType::Q8_0) return static_cast<size_t>(cap) * (d_kv / 32) * sizeof(BlockQ8_0);
+        if (kv_type == KvCacheType::Q4_0) return static_cast<size_t>(cap) * (d_kv / 32) * sizeof(BlockQ4_0);
         return static_cast<size_t>(cap) * d_kv * sizeof(uint16_t);
     };
 
@@ -210,11 +211,14 @@ void Inkling2LoopModel::load(const std::string & gguf_path,
         cudaSetDevice(runtimes_[1].device); cudaMemGetInfo(&free1, &tot1);
         const size_t core_margin = 1400ULL * 1024 * 1024;
         if (free1 < core_b + core_margin) {
-            // Pick largest split_ip in [core_end, n_phys-1] that fits both GPUs with SoA staging + KV headroom
-            // Staging is released BEFORE KV + runtime buffer allocation!
-            // Runtime + 80 MiB scratch + CUDA graphs + cuBLAS workspace take ~420 MiB per GPU.
-            const size_t headroom0 = 600ULL * 1024 * 1024;
-            const size_t headroom1 = 960ULL * 1024 * 1024;
+            // Pick largest split_ip in [core_end, n_phys-1] that fits both GPUs during both
+            // weight upload (staging peak, freed before KV alloc) AND runtime (weights + KV + runtime).
+            const size_t staging_peak0 = std::max<size_t>(out_b, 384ULL << 20);
+            const size_t staging_peak1 = std::max<size_t>(embd_b, 384ULL << 20);
+            const size_t load_margin0  = staging_peak0 + (220ULL << 20);
+            const size_t load_margin1  = staging_peak1 + (220ULL << 20);
+            const size_t rt_margin0    = 600ULL << 20;
+            const size_t rt_margin1    = 580ULL << 20;
             int best_s = -1;
             for (int s = cfg_.n_phys - 1; s >= cfg_.core_end; --s) {
                 size_t g0 = out_b, g1 = embd_b;
@@ -227,21 +231,32 @@ void Inkling2LoopModel::load(const std::string & gguf_path,
                     const size_t kb = 2 * kv_bytes_for(cfg_.is_swa[ip] ? cfg_.swa_cap : cfg_.max_ctx);
                     if (ip < s) kv0 += kb; else kv1 += kb;
                 }
-                if (g0 + kv0 + headroom0 <= free0 && g1 + kv1 + headroom1 <= free1) {
+                const bool ok0 = (g0 + load_margin0 <= free0) && (g0 + kv0 + rt_margin0 <= free0);
+                const bool ok1 = (g1 + load_margin1 <= free1) && (g1 + kv1 + rt_margin1 <= free1);
+                if (ok0 && ok1) {
                     best_s = s;
                     break;
                 }
             }
             if (best_s < 0) {
-                // Fallback: minimize max fraction of free VRAM across the two GPUs
-                double best_ratio = 1e9;
-                for (int s = cfg_.core_end; s < cfg_.n_phys; ++s) {
+                // Fallback: maximize minimum remaining VRAM slack across both GPUs (including KV!)
+                int64_t best_slack = INT64_MIN;
+                const size_t rt_est = 460ULL << 20;
+                for (int s = cfg_.n_phys - 1; s >= cfg_.core_end; --s) {
                     size_t g0 = out_b, g1 = embd_b;
                     for (int ip = 0; ip < s; ++ip) g0 += layer_b[ip];
                     for (int ip = s; ip < cfg_.n_phys; ++ip) g1 += layer_b[ip];
-                    const double r = std::max(static_cast<double>(g0) / std::max<size_t>(1, free0),
-                                              static_cast<double>(g1) / std::max<size_t>(1, free1));
-                    if (r < best_ratio) { best_ratio = r; best_s = s; }
+                    size_t kv0 = 0, kv1 = 0;
+                    for (int il = 0; il < cfg_.n_slots; ++il) {
+                        const int ip = (il < cfg_.n_phys)
+                            ? il : (cfg_.core_start + (il - cfg_.n_phys) % (cfg_.core_end - cfg_.core_start));
+                        const size_t kb = 2 * kv_bytes_for(cfg_.is_swa[ip] ? cfg_.swa_cap : cfg_.max_ctx);
+                        if (ip < s) kv0 += kb; else kv1 += kb;
+                    }
+                    const int64_t s0 = static_cast<int64_t>(free0) - static_cast<int64_t>(std::max(g0 + load_margin0, g0 + kv0 + rt_est));
+                    const int64_t s1 = static_cast<int64_t>(free1) - static_cast<int64_t>(std::max(g1 + load_margin1, g1 + kv1 + rt_est));
+                    const int64_t slack = std::min(s0, s1);
+                    if (slack > best_slack) { best_slack = slack; best_s = s; }
                 }
             }
             postlude_split_ip_ = best_s;
@@ -476,7 +491,17 @@ void Inkling2LoopModel::load(const std::string & gguf_path,
             std::printf(" [sym:core-on-gpu1]");
         }
     }
-    std::printf(" | ctx=%d (SWA cap=%d, KV=%s)\n", cfg_.max_ctx, cfg_.swa_cap, kv_q8_0 ? "Q8_0" : "F16");
+    std::printf(" | ctx=%d (SWA cap=%d, KV=%s)\n", cfg_.max_ctx, cfg_.swa_cap, kv_cache_type_name(cfg_.kv_type));
+    for (const auto & rt : runtimes_) {
+        cudaSetDevice(rt.device);
+        size_t fb = 0, tb = 0;
+        cudaMemGetInfo(&fb, &tb);
+        std::printf("  GPU%d: VRAM used %.2f / %.2f GiB (%.2f GiB free)\n",
+                    rt.device,
+                    static_cast<double>(tb - fb) / (1024.0 * 1024.0 * 1024.0),
+                    static_cast<double>(tb) / (1024.0 * 1024.0 * 1024.0),
+                    static_cast<double>(fb) / (1024.0 * 1024.0 * 1024.0));
+    }
 }
 
 void Inkling2LoopModel::reset_state() {
@@ -686,11 +711,11 @@ void Inkling2LoopModel::run_layer(DevRuntime & rt, int il, int ip, int T, int & 
     }
 
     const int32_t * tau_pos = L.is_swa ? nullptr : rt.d_pos;
-    if (T == 1 && cfg_.kv_q8_0 && cfg_.head_dim == 128 && cfg_.n_rel <= 32) {
-        launch_inkling2_kv_conv_norm_write_q8_0_t1(
+    if (T == 1 && cfg_.kv_type != KvCacheType::F16 && cfg_.head_dim == 128 && cfg_.n_rel <= 32) {
+        launch_inkling2_kv_conv_norm_write_t1(
             rt.d_k_raw, static_cast<const float *>(L.attn_k_conv.ptr), L.is_swa ? nullptr : rt.d_k_dyn, conv_k_[il],
             rt.d_v_raw, static_cast<const float *>(L.attn_v_conv.ptr), L.is_swa ? nullptr : rt.d_v_dyn, conv_v_[il],
-            k_cache_[il], v_cache_[il], rt.d_pos,
+            k_cache_[il], v_cache_[il], cfg_.kv_type, rt.d_pos,
             cfg_.n_head_kv, cfg_.head_dim, cap, cfg_.qk_clip, cfg_.rms_eps, st);
         launch_inkling2_qr_l2_clip_fused_t1(
             rt.d_q, static_cast<const float *>(L.attn_q_clip.ptr),
@@ -713,12 +738,12 @@ void Inkling2LoopModel::run_layer(DevRuntime & rt, int il, int ip, int T, int & 
         launch_inkling2_l2_clip(rt.d_r, static_cast<const float *>(L.attn_rel_clip.ptr), tau_pos,
                                 cfg_.rel_clip, static_cast<float>(cfg_.log_scale_floor), cfg_.log_scale_alpha,
                                 T, cfg_.n_head, cfg_.n_rel, st);
-        launch_inkling2_kv_write(rt.d_k, rt.d_v, k_cache_[il], v_cache_[il], cfg_.kv_q8_0,
+        launch_inkling2_kv_write(rt.d_k, rt.d_v, k_cache_[il], v_cache_[il], cfg_.kv_type,
                                  rt.d_pos, T, cfg_.n_head_kv, cfg_.head_dim, cap, st);
     }
     launch_inkling2_rel_bias_table(rt.d_r, static_cast<const float *>(L.attn_rel_bias.ptr),
                                    rt.d_sinks, rt.d_bias_table, T, cfg_.n_head, cfg_.n_rel, n_ext, st);
-    launch_inkling2_attn(rt.d_q, k_cache_[il], v_cache_[il], cfg_.kv_q8_0,
+    launch_inkling2_attn(rt.d_q, k_cache_[il], v_cache_[il], cfg_.kv_type,
                          rt.d_bias_table, rt.d_pos, rt.d_attn_out,
                          rt.d_scratch, rt.scratch_bytes,
                          T, cfg_.n_head, cfg_.n_head_kv, cfg_.head_dim,

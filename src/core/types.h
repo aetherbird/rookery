@@ -113,4 +113,34 @@ struct BlockQ8_0 {
 };
 static_assert(sizeof(BlockQ8_0) == 34, "BlockQ8_0 must be 34 bytes");
 
+// Pair-packed Q4_0 block for KV & indexer caches:
+//   qs[j] stores elem 2*j in low nibble (bits 0..3) and elem 2*j+1 in high nibble (bits 4..7),
+//   each nibble in [0..15], dequant = d * (nibble - 8).
+struct BlockQ4_0 {
+    uint16_t d;       // fp16 scale
+    uint8_t  qs[16];  // 32 x 4-bit unsigned nibbles
+};
+static_assert(sizeof(BlockQ4_0) == 18, "BlockQ4_0 must be 18 bytes");
+
+enum class KvCacheType : uint8_t {
+    F16  = 0,
+    Q8_0 = 1,
+    Q4_0 = 2,
+};
+
+inline const char * kv_cache_type_name(KvCacheType t) {
+    switch (t) {
+        case KvCacheType::F16:  return "F16";
+        case KvCacheType::Q8_0: return "Q8_0";
+        case KvCacheType::Q4_0: return "Q4_0";
+    }
+    return "UNKNOWN";
+}
+
+inline KvCacheType parse_kv_cache_type(const std::string & s) {
+    if (s == "f16" || s == "F16" || s == "fp16" || s == "FP16") return KvCacheType::F16;
+    if (s == "q4_0" || s == "Q4_0" || s == "q4" || s == "Q4")   return KvCacheType::Q4_0;
+    return KvCacheType::Q8_0;
+}
+
 } // namespace rookery
