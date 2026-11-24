@@ -205,6 +205,8 @@ struct ServerEngine {
     std::vector<rookery::Qwen4ExpModel::StateCheckpoint>    qwen4_checkpoints;
     size_t  mtp_kv_valid_len  = 0;
     int32_t mtp_last_next_tok = -1;
+    bool    has_cached_engram_params = false;
+    rookery::EngramRuntimeParams cached_engram_params{};
 
     void prune_state_checkpoints_after(int pos) {
         kda_checkpoints.erase(
@@ -362,9 +364,16 @@ static GenResult run_generation(
     const bool run_mtp = use_mtp && engine.has_mtp() && !prompt_ids.empty() &&
                          (sampler.is_greedy() || engine.supports_sample_mtp());
 
-    // Prompt Prefix Cache: find longest matching prefix with cached KV (+ KDA checkpoint for GLM-5)
+    // Prompt Prefix Cache: find longest matching prefix with cached KV (+ recurrent/Engram checkpoints).
+    // Safe with Engram whenever runtime params (scale, gate_bias, delta_clip) match the cached request,
+    // because EngramSeqState::rollback_to(reuse_pos) keeps tokenizer/hash state exact!
+    const bool engram_cache_ok = !engram ||
+        (engine.has_cached_engram_params &&
+         engine.cached_engram_params.scale == engram_params.scale &&
+         engine.cached_engram_params.gate_bias == engram_params.gate_bias &&
+         engine.cached_engram_params.delta_clip_ratio == engram_params.delta_clip_ratio);
     size_t common = 0;
-    if (!engram && !prompt_ids.empty()) {
+    if (engram_cache_ok && !prompt_ids.empty()) {
         const size_t lim = std::min(engine.cached_tokens.size(), prompt_ids.size());
         while (common < lim && engine.cached_tokens[common] == prompt_ids[common]) ++common;
     }
@@ -475,12 +484,12 @@ static GenResult run_generation(
         }
         // Keep SSE connections alive during multi-second cold prefills; preserve partial cache on disconnect!
         if (on_prefill_progress && !on_prefill_progress()) {
-            if (!engram) {
-                const size_t done_pos = off + len;
-                engine.cached_tokens.assign(prompt_ids.begin(), prompt_ids.begin() + static_cast<ptrdiff_t>(done_pos));
-                if (engine.has_state_checkpoints()) engine.save_state_checkpoint(static_cast<int>(done_pos));
-                engine.mtp_kv_valid_len = (run_mtp && done_pos < prompt_ids.size()) ? done_pos : std::min(engine.mtp_kv_valid_len, reuse_pos);
-            }
+            const size_t done_pos = off + len;
+            engine.cached_tokens.assign(prompt_ids.begin(), prompt_ids.begin() + static_cast<ptrdiff_t>(done_pos));
+            engine.has_cached_engram_params = (engram != nullptr);
+            engine.cached_engram_params     = engram_params;
+            if (engine.has_state_checkpoints()) engine.save_state_checkpoint(static_cast<int>(done_pos));
+            engine.mtp_kv_valid_len = (run_mtp && done_pos < prompt_ids.size()) ? done_pos : std::min(engine.mtp_kv_valid_len, reuse_pos);
             gr.pp_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_pp0).count();
             return gr;
         }
@@ -532,7 +541,7 @@ static GenResult run_generation(
             rookery::MtpStats ms{};
             size_t next_gen_ckpt = 128;
             while (static_cast<int>(gr.tokens.size()) < max_tokens && cur_pos + 2 < engine.max_ctx()) {
-                if (!engram && engine.has_state_checkpoints() &&
+                if (engine.has_state_checkpoints() &&
                     (static_cast<int>(gr.tokens.size()) + 2 >= max_tokens || gr.tokens.size() >= next_gen_ckpt)) {
                     engine.save_state_checkpoint(cur_pos);
                     if (gr.tokens.size() >= next_gen_ckpt) next_gen_ckpt = gr.tokens.size() + 128;
@@ -595,24 +604,17 @@ static GenResult run_generation(
     gr.tg_ms = std::chrono::duration<double, std::milli>(t_tg1 - t_tg0).count();
 
     // Update prompt prefix cache & end-of-generation state checkpoint
-    if (!engram) {
-        engine.cached_tokens = std::move(processed_tokens);
-        if (engine.has_state_checkpoints() && cur_pos > static_cast<int32_t>(prompt_ids.size())) {
-            engine.save_state_checkpoint(cur_pos);
-        }
-        if (run_mtp) {
-            engine.mtp_kv_valid_len  = mtp_ran_decode ? static_cast<size_t>(cur_pos) : last_off;
-            engine.mtp_last_next_tok = mtp_ran_decode ? cur_tok : -1;
-        } else {
-            engine.mtp_kv_valid_len  = std::min(engine.mtp_kv_valid_len, reuse_pos);
-            engine.mtp_last_next_tok = -1;
-        }
+    engine.cached_tokens            = std::move(processed_tokens);
+    engine.has_cached_engram_params = (engram != nullptr);
+    engine.cached_engram_params     = engram_params;
+    if (engine.has_state_checkpoints() && cur_pos > static_cast<int32_t>(prompt_ids.size())) {
+        engine.save_state_checkpoint(cur_pos);
+    }
+    if (run_mtp) {
+        engine.mtp_kv_valid_len  = mtp_ran_decode ? static_cast<size_t>(cur_pos) : last_off;
+        engine.mtp_last_next_tok = mtp_ran_decode ? cur_tok : -1;
     } else {
-        engine.cached_tokens.clear();
-        engine.kda_checkpoints.clear();
-        engine.conv_checkpoints.clear();
-        engine.gdn_checkpoints.clear();
-        engine.mtp_kv_valid_len = 0;
+        engine.mtp_kv_valid_len  = std::min(engine.mtp_kv_valid_len, reuse_pos);
         engine.mtp_last_next_tok = -1;
     }
 
