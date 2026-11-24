@@ -43,7 +43,8 @@ Measured against `llama.cpp` (`-fa 1 -ctk q8_0 -ctv q8_0`) on heterogeneous mult
 | **Ling-3.0-tiny** (`Q4_K_M`) | RTX 3090 (`sm_86`) | Decode `tg128` (`d=0` / `4K` / `16K`) | `241.4` / `239.2` / `220.8 tok/s` | **`383.9` / `355.2` / `294.0 tok/s`** | **+59% / +49% / +33%** |
 | **Qwen3.6-35B-A3B** (`UD-Q3_K_XL`) | P100 + GTX 1060 (`sm_60/61`) | Decode `tg128` | `38.0 tok/s` | **`53.4 tok/s`** | **+41%** |
 | **Maxwell-V1-Flash** (`Q3_K_M`) | P100 + GTX 1060 (`sm_60/61`) | Decode `tg64` | Unsupported | **`26.3 tok/s`** | — |
-| **Inkling-2-Mini** (`IQ4_NL`) | P100 + GTX 1060 (`sm_60/61`) | Decode `tg64` (asym 2-GPU) | Unsupported | **`27.7 tok/s`** | — |
+| **Inkling-2-Mini** (`IQ4_NL`, `36K` ctx) | P100 + GTX 1060 (`sm_60/61`) | Prefill `pp512` / `pp8192` | Unsupported | **`543.7` / `504.7 tok/s`** | **7.87× vs baseline** |
+| **Inkling-2-Mini** (`IQ4_NL`, `36K` ctx) | P100 + GTX 1060 (`sm_60/61`) | Decode `tg128` (`d=0` / `16K` / `32K`) | Unsupported | **`64.0` / `54.6` / `49.0 tok/s`** | **2.31×–2.57× vs baseline** |
 
 See [bench/baseline.md](bench/baseline.md), [bench/engram_audit_v1.md](bench/engram_audit_v1.md), and [bench/engram_vertical_slice_v2.md](bench/engram_vertical_slice_v2.md) for detailed logs and Engram vertical-slice audits.
 

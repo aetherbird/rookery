@@ -435,7 +435,101 @@ void launch_inkling2_shortconv(
     const float * d_dyn,        // optional [T, n_head_kv, 4] (nullptr for static conv)
     float *       d_state,      // [3, C] (oldest=0 .. newest=2)
     float *       d_out,        // [T, C]
-    int T, int C, int n_head_kv, cudaStream_t stream);
+    int T, int C, int n_head_kv, cudaStream_t stream,
+    const float * d_res = nullptr);
+
+void launch_inkling2_rmsnorm_fast(
+    const float * d_x, const float * d_w, float * d_out,
+    int n_embd, int T, float eps, cudaStream_t stream);
+
+void launch_inkling2_rmsnorm3_fast(
+    const float * d_x0, const float * d_x1, const float * d_x2,
+    const float * d_w0, const float * d_w1, const float * d_w2,
+    float * d_o0, float * d_o1, float * d_o2,
+    int n_embd, int T, float eps, cudaStream_t stream);
+
+void launch_inkling2_loop_ctrl_up_combine(
+    const DeviceTensor & W_gain,   // F32 [gate_rank, n_embd]
+    const DeviceTensor & W_forget, // F32 [gate_rank, n_embd]
+    const float * d_hid,           // [T, gate_rank]
+    const float * d_cur,           // [T, n_embd]
+    const float * d_msg,           // [T, n_embd]
+    float *       d_out,           // [T, n_embd]
+    int T, cudaStream_t stream);
+
+void launch_inkling2_loop_ctrl_qkv_decode(
+    const float * d_in0, const float * d_in1, const float * d_in2,
+    const float * d_msg0, const float * d_msg1, const float * d_msg2,
+    const DeviceTensor * ctrl_down,   // [3] F32 [2*n_embd, gate_rank]
+    const DeviceTensor * ctrl_gain,   // [3] F32 [gate_rank, n_embd]
+    const DeviceTensor * ctrl_forget, // [3] F32 [gate_rank, n_embd]
+    float * d_ctrl_in3,               // scratch [3, 2*n_embd]
+    float * d_ctrl_hid3,              // scratch [3, gate_rank]
+    float * d_out0, float * d_out1, float * d_out2,
+    int n_embd, int gate_rank, float eps, cudaStream_t stream);
+
+void launch_inkling2_qkv_fused_q8_0(
+    int n_projs,
+    const DeviceTensor * const * Ws, // up to 6 Q8_0 SoA weights sharing the same d_xq8
+    float * const * Ys,              // corresponding output buffers [T, N_i]
+    const void * d_xq8,              // pre-quantized BlockQ8_1_Act [T, K/32]
+    int T, cudaStream_t stream);
+
+void launch_inkling2_sigmoid_gate_quant_q8_1(
+    const float * d_x, const float * d_gate, void * d_xq8,
+    int K, int T, cudaStream_t stream);
+
+void launch_inkling2_rmsnorm_quant_f16_contig(
+    int n_inputs,
+    const float * d_x0, const float * d_x1, const float * d_x2,
+    const float * d_w0, const float * d_w1, const float * d_w2,
+    void * d_out_h2_d, int n_embd, int T, float eps, cudaStream_t stream);
+
+void launch_inkling2_qkv_fused_q8_0_h2(
+    int n_projs, int n_inputs,
+    const DeviceTensor * const * Ws,
+    const int * in_idx,
+    float * const * Ys,
+    const void * d_in_h2_d, int T, cudaStream_t stream);
+
+void launch_inkling2_sigmoid_gate_quant_f16_contig(
+    const float * d_x, const float * d_gate, void * d_out_h2_d,
+    int K, int T, cudaStream_t stream);
+
+void launch_inkling2_gemv_q8_0_h2(
+    const DeviceTensor & W, const void * d_in_h2_d, float * d_y,
+    int T, cudaStream_t stream);
+
+void launch_inkling2_quant_f16_contig(
+    const float * d_x, void * d_out_h2_d, int K, int T, cudaStream_t stream);
+
+void launch_inkling2_kv_conv_norm_write_q8_0_t1(
+    const float * d_k_raw, const float * d_k_w, const float * d_k_dyn, float * d_k_state,
+    const float * d_v_raw, const float * d_v_w, const float * d_v_dyn, float * d_v_state,
+    void * d_k_cache, void * d_v_cache, const int32_t * d_pos,
+    int n_head_kv, int head_dim, int cache_cap, float qk_clip, float rms_eps,
+    cudaStream_t stream);
+
+void launch_inkling2_qr_l2_clip_fused_t1(
+    float * d_q, const float * d_q_scale,
+    float * d_r, const float * d_r_scale,
+    const int32_t * d_pos,
+    float qk_clip, float rel_clip, float log_floor, float log_alpha,
+    int n_head, int head_dim, int n_rel, cudaStream_t stream);
+
+void launch_inkling2_linear_sm60_or_default(
+    cublasHandle_t cublas, const DeviceTensor & W,
+    const float * d_x, float * d_y, int T,
+    void * d_scratch, size_t scratch_bytes, cudaStream_t stream);
+
+void launch_inkling2_router_gemv_f32(
+    const DeviceTensor & W, const float * d_x, float * d_y,
+    int T, cudaStream_t stream);
+
+void launch_inkling2_moe_route_sigmoid_fast(
+    const float * d_logits, const float * d_bias,
+    int32_t * d_top_ids, float * d_top_w,
+    int T, int n_expert, int k_used, bool renorm, float scale, cudaStream_t stream);
 
 void launch_inkling2_l2_clip(
     float * d_x,                // [T, n_head, head_dim] in-place

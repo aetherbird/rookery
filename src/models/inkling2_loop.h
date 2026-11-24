@@ -208,6 +208,7 @@ private:
     void run_core(int T, int kv_len_max);
     void run_postlude_prefix(int T, int kv_len_max);
     void run_postlude_and_head(int T, bool run_argmax, int kv_len_max);
+    void run_head_only(bool run_argmax);
     void run_single_gpu_all(int T, bool run_argmax, int kv_len_max);
     void capture_decode_graphs();
     void invalidate_graphs() noexcept;
@@ -235,7 +236,8 @@ private:
     cudaGraphExec_t         graph_all_         = nullptr; // 1-GPU
     cudaGraphExec_t         graph_prelude_     = nullptr; // 2-GPU GPU0 (prelude, or prelude+core+postlude_prefix when asymmetric)
     cudaGraphExec_t         graph_core_        = nullptr; // 2-GPU GPU1 (symmetric mode only)
-    cudaGraphExec_t         graph_postlude_    = nullptr; // 2-GPU postlude+head (GPU0 symmetric, GPU1 asymmetric)
+    cudaGraphExec_t         graph_postlude_    = nullptr; // 2-GPU postlude (GPU0 symmetric, GPU1 asymmetric)
+    cudaGraphExec_t         graph_head_        = nullptr; // 2-GPU asymmetric lm_head on GPU0
 
     int         max_batch_       = 256;
     bool        use_cuda_graphs_ = true;

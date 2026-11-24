@@ -59,6 +59,7 @@ void Inkling2LoopModel::invalidate_graphs() noexcept {
         cudaSetDevice(runtimes_[0].device);
         if (graph_all_)     { cudaGraphExecDestroy(graph_all_);     graph_all_     = nullptr; }
         if (graph_prelude_) { cudaGraphExecDestroy(graph_prelude_); graph_prelude_ = nullptr; }
+        if (graph_head_)    { cudaGraphExecDestroy(graph_head_);    graph_head_    = nullptr; }
         if (!asym && graph_postlude_) {
             cudaGraphExecDestroy(graph_postlude_);
             graph_postlude_ = nullptr;
@@ -210,11 +211,13 @@ void Inkling2LoopModel::load(const std::string & gguf_path,
         const size_t core_margin = 1400ULL * 1024 * 1024;
         if (free1 < core_b + core_margin) {
             // Pick largest split_ip in [core_end, n_phys-1] that fits both GPUs with SoA staging + KV headroom
-            const size_t headroom0 = 1536ULL * 1024 * 1024;
-            const size_t headroom1 = 1280ULL * 1024 * 1024;
+            // Staging is released BEFORE KV + runtime buffer allocation!
+            // Runtime + 80 MiB scratch + CUDA graphs + cuBLAS workspace take ~420 MiB per GPU.
+            const size_t headroom0 = 600ULL * 1024 * 1024;
+            const size_t headroom1 = 960ULL * 1024 * 1024;
             int best_s = -1;
             for (int s = cfg_.n_phys - 1; s >= cfg_.core_end; --s) {
-                size_t g0 = embd_b, g1 = out_b;
+                size_t g0 = out_b, g1 = embd_b;
                 for (int ip = 0; ip < s; ++ip) g0 += layer_b[ip];
                 for (int ip = s; ip < cfg_.n_phys; ++ip) g1 += layer_b[ip];
                 size_t kv0 = 0, kv1 = 0;
@@ -233,7 +236,7 @@ void Inkling2LoopModel::load(const std::string & gguf_path,
                 // Fallback: minimize max fraction of free VRAM across the two GPUs
                 double best_ratio = 1e9;
                 for (int s = cfg_.core_end; s < cfg_.n_phys; ++s) {
-                    size_t g0 = embd_b, g1 = out_b;
+                    size_t g0 = out_b, g1 = embd_b;
                     for (int ip = 0; ip < s; ++ip) g0 += layer_b[ip];
                     for (int ip = s; ip < cfg_.n_phys; ++ip) g1 += layer_b[ip];
                     const double r = std::max(static_cast<double>(g0) / std::max<size_t>(1, free0),
@@ -252,7 +255,8 @@ void Inkling2LoopModel::load(const std::string & gguf_path,
     }
 
     const bool asym = (two_gpu && postlude_split_ip_ >= 0);
-    const size_t head_rt_idx = asym ? 1 : 0;
+    const size_t embd_rt_idx = asym ? 1 : 0; // cold token_embd on GPU1 in asym mode
+    const size_t head_rt_idx = 0;            // hot output lm_head ALWAYS on GPU0!
 
     auto phys_dev = [&](int ip) -> int {
         if (!two_gpu) return runtimes_[0].device;
@@ -280,13 +284,17 @@ void Inkling2LoopModel::load(const std::string & gguf_path,
                 const int dev = runtimes_[gi].device;
                 cuda_ok(cudaSetDevice(dev), "inkling2 parallel load setDevice");
 
-                if (gi == 0) {
+                if (gi == embd_rt_idx) {
                     tok_embd_         = pool_.upload(sg, "token_embd.weight",       dev, false);
+                }
+                if (gi == 0) {
                     tok_norm_         = pool_.upload(sg, "token_embd_norm.weight",  dev, false);
                 }
-                if (gi == head_rt_idx) {
+                if (gi == (asym ? 1u : 0u)) {
                     output_res_query_ = pool_.upload(sg, "output_res_query.weight", dev, false);
                     output_norm_      = pool_.upload(sg, "output_norm.weight",      dev, false);
+                }
+                if (gi == head_rt_idx) {
                     output_           = pool_.upload(sg, "output.weight",           dev, false);
                 }
 
@@ -345,22 +353,7 @@ void Inkling2LoopModel::load(const std::string & gguf_path,
                     }
                 }
 
-                // Allocate logical KV caches & ShortConv states for slots owned by this GPU
-                for (int il = 0; il < cfg_.n_slots; ++il) {
-                    const int ip = (il < cfg_.n_phys)
-                        ? il
-                        : (cfg_.core_start + (il - cfg_.n_phys) % (cfg_.core_end - cfg_.core_start));
-                    if (phys_dev(ip) != dev) continue;
-                    slot_device_[il] = dev;
-                    const int cap = cfg_.is_swa[ip] ? cfg_.swa_cap : cfg_.max_ctx;
-                    const size_t kb = kv_bytes_for(cap);
-                    cuda_ok(cudaMalloc(&k_cache_[il], kb), "inkling2 malloc k_cache");
-                    cuda_ok(cudaMalloc(&v_cache_[il], kb), "inkling2 malloc v_cache");
-                    conv_k_[il]    = dev_alloc<float>(dev, static_cast<size_t>(cfg_.n_conv - 1) * d_kv);
-                    conv_v_[il]    = dev_alloc<float>(dev, static_cast<size_t>(cfg_.n_conv - 1) * d_kv);
-                    conv_attn_[il] = dev_alloc<float>(dev, static_cast<size_t>(cfg_.n_conv - 1) * cfg_.n_embd);
-                    conv_ffn_[il]  = dev_alloc<float>(dev, static_cast<size_t>(cfg_.n_conv - 1) * cfg_.n_embd);
-                }
+
 
                 cuda_ok(cudaDeviceSynchronize(), "inkling2 load sync");
             } catch (...) {
@@ -372,12 +365,30 @@ void Inkling2LoopModel::load(const std::string & gguf_path,
     for (auto & ep : load_errs) if (ep) std::rethrow_exception(ep);
     pool_.release_staging();
 
+    // Allocate logical KV caches & ShortConv states AFTER staging is freed (saves ~722 MiB peak VRAM!)
+    for (int il = 0; il < cfg_.n_slots; ++il) {
+        const int ip = (il < cfg_.n_phys)
+            ? il
+            : (cfg_.core_start + (il - cfg_.n_phys) % (cfg_.core_end - cfg_.core_start));
+        const int dev = phys_dev(ip);
+        slot_device_[il] = dev;
+        cuda_ok(cudaSetDevice(dev), "inkling2 kv alloc setDevice");
+        const int cap = cfg_.is_swa[ip] ? cfg_.swa_cap : cfg_.max_ctx;
+        const size_t kb = kv_bytes_for(cap);
+        cuda_ok(cudaMalloc(&k_cache_[il], kb), "inkling2 malloc k_cache");
+        cuda_ok(cudaMalloc(&v_cache_[il], kb), "inkling2 malloc v_cache");
+        conv_k_[il]    = dev_alloc<float>(dev, static_cast<size_t>(cfg_.n_conv - 1) * d_kv);
+        conv_v_[il]    = dev_alloc<float>(dev, static_cast<size_t>(cfg_.n_conv - 1) * d_kv);
+        conv_attn_[il] = dev_alloc<float>(dev, static_cast<size_t>(cfg_.n_conv - 1) * cfg_.n_embd);
+        conv_ffn_[il]  = dev_alloc<float>(dev, static_cast<size_t>(cfg_.n_conv - 1) * cfg_.n_embd);
+    }
+
     // Allocate per-GPU runtime buffers & cuBLAS handles
     const int d_q      = cfg_.n_head * cfg_.head_dim; // 3072
     const int n_ext    = std::max(cfg_.swa_window, cfg_.n_rel_extent);
     const size_t B     = static_cast<size_t>(max_batch_);
     const size_t H     = static_cast<size_t>(cfg_.n_embd);
-    const size_t scratch_b = 128ULL * 1024 * 1024; // 128 MiB: covers FlashAttn Global prefill + grouped MoE + Q8_0 cuBLAS
+    const size_t scratch_b = 80ULL * 1024 * 1024; // 128 MiB: covers FlashAttn Global prefill + grouped MoE + Q8_0 cuBLAS
 
     for (size_t gi = 0; gi < runtimes_.size(); ++gi) {
         auto & rt = runtimes_[gi];
@@ -435,7 +446,7 @@ void Inkling2LoopModel::load(const std::string & gguf_path,
         rt.d_moe_raw    = dev_alloc<float>(dev, B * H);
 
         rt.d_pos        = dev_alloc<int32_t>(dev, B);
-        if (gi == 0) {
+        if (gi == embd_rt_idx) {
             rt.d_tokens = dev_alloc<int32_t>(dev, B);
         }
         if (gi == head_rt_idx) {
@@ -541,10 +552,17 @@ void Inkling2LoopModel::run_layer(DevRuntime & rt, int il, int ip, int T, int & 
     auto apply_ctrl = [&](const float * d_in, int ctrl_idx, float * d_out) {
         const float * d_msg = rt.d_messages + static_cast<size_t>(ctrl_idx) * TH;
         launch_inkling2_rmsnorm_concat2(d_in, d_msg, rt.d_ctrl_in, H, T, cfg_.rms_eps, st);
-        launch_linear(rt.cublas, L.loop.ctrl_down[ctrl_idx],   rt.d_ctrl_in,  rt.d_ctrl_hid,  T, rt.d_scratch, rt.scratch_bytes, st);
-        launch_linear(rt.cublas, L.loop.ctrl_gain[ctrl_idx],   rt.d_ctrl_hid, rt.d_ctrl_gain, T, rt.d_scratch, rt.scratch_bytes, st);
-        launch_linear(rt.cublas, L.loop.ctrl_forget[ctrl_idx], rt.d_ctrl_hid, rt.d_ctrl_forg, T, rt.d_scratch, rt.scratch_bytes, st);
-        launch_inkling2_loop_combine(d_in, d_msg, rt.d_ctrl_gain, rt.d_ctrl_forg, d_out, static_cast<int64_t>(TH), st);
+        launch_linear(rt.cublas, L.loop.ctrl_down[ctrl_idx], rt.d_ctrl_in, rt.d_ctrl_hid, T, rt.d_scratch, rt.scratch_bytes, st);
+        if (T < 16 && L.loop.ctrl_gain[ctrl_idx].dtype == DType::F32 &&
+            L.loop.ctrl_forget[ctrl_idx].dtype == DType::F32 && (cfg_.gate_rank & 3) == 0) {
+            launch_inkling2_loop_ctrl_up_combine(
+                L.loop.ctrl_gain[ctrl_idx], L.loop.ctrl_forget[ctrl_idx],
+                rt.d_ctrl_hid, d_in, d_msg, d_out, T, st);
+        } else {
+            launch_linear(rt.cublas, L.loop.ctrl_gain[ctrl_idx],   rt.d_ctrl_hid, rt.d_ctrl_gain, T, rt.d_scratch, rt.scratch_bytes, st);
+            launch_linear(rt.cublas, L.loop.ctrl_forget[ctrl_idx], rt.d_ctrl_hid, rt.d_ctrl_forg, T, rt.d_scratch, rt.scratch_bytes, st);
+            launch_inkling2_loop_combine(d_in, d_msg, rt.d_ctrl_gain, rt.d_ctrl_forg, d_out, static_cast<int64_t>(TH), st);
+        }
     };
 
     // 2. Attention inputs (Block Attention Residuals + Loop Control + RMSNorm)
@@ -562,9 +580,20 @@ void Inkling2LoopModel::run_layer(DevRuntime & rt, int il, int ip, int T, int & 
     }
 
     if (has_messages) {
-        apply_ctrl(inp_q, 0, rt.d_inputs[0]);
-        apply_ctrl(inp_k, 1, rt.d_inputs[1]);
-        apply_ctrl(inp_v, 2, rt.d_inputs[2]);
+        if (T == 1 && (H & 127) == 0 && (H >> 2) <= 1024 && (cfg_.gate_rank & 3) == 0 &&
+            L.loop.ctrl_down[0].dtype == DType::F32 && L.loop.ctrl_gain[0].dtype == DType::F32) {
+            launch_inkling2_loop_ctrl_qkv_decode(
+                inp_q, inp_k, inp_v,
+                rt.d_messages, rt.d_messages + TH, rt.d_messages + 2 * TH,
+                L.loop.ctrl_down, L.loop.ctrl_gain, L.loop.ctrl_forget,
+                rt.d_ctrl_in, rt.d_ctrl_hid,
+                rt.d_inputs[0], rt.d_inputs[1], rt.d_inputs[2],
+                H, cfg_.gate_rank, cfg_.rms_eps, st);
+        } else {
+            apply_ctrl(inp_q, 0, rt.d_inputs[0]);
+            apply_ctrl(inp_k, 1, rt.d_inputs[1]);
+            apply_ctrl(inp_v, 2, rt.d_inputs[2]);
+        }
         inp_q = rt.d_inputs[0];
         inp_k = rt.d_inputs[1];
         inp_v = rt.d_inputs[2];
@@ -573,75 +602,120 @@ void Inkling2LoopModel::run_layer(DevRuntime & rt, int il, int ip, int T, int & 
     float * norm_q = rt.d_inputs[0];
     float * norm_k = rt.d_inputs[1];
     float * norm_v = rt.d_inputs[2];
-    if (L.is_swa && !has_messages) {
-        launch_rmsnorm(inp_q, static_cast<const float *>(L.attn_norm.ptr), norm_q, H, T, cfg_.rms_eps, st);
-        norm_k = norm_q;
-        norm_v = norm_q;
-    } else if (L.is_swa) {
-        launch_rmsnorm(inp_q, static_cast<const float *>(L.attn_norm.ptr), norm_q, H, T, cfg_.rms_eps, st);
-        launch_rmsnorm(inp_k, static_cast<const float *>(L.attn_norm.ptr), norm_k, H, T, cfg_.rms_eps, st);
-        launch_rmsnorm(inp_v, static_cast<const float *>(L.attn_norm.ptr), norm_v, H, T, cfg_.rms_eps, st);
-    } else {
-        launch_rmsnorm(inp_q, static_cast<const float *>(L.attn_q_inp_norm.ptr), norm_q, H, T, cfg_.rms_eps, st);
-        launch_rmsnorm(inp_k, static_cast<const float *>(L.attn_k_inp_norm.ptr), norm_k, H, T, cfg_.rms_eps, st);
-        launch_rmsnorm(inp_v, static_cast<const float *>(L.attn_v_inp_norm.ptr), norm_v, H, T, cfg_.rms_eps, st);
-    }
-
-    // 3. Attention Q, K, V, R, Sink, Gate projections (reuse Q8_1 quantization on T < 16!)
-    if (T < 16 && L.wq.dtype == DType::Q8_0) {
-        launch_quantize_q8_1(norm_q, rt.d_scratch, H, T, st);
-        launch_linear_q8_0_prequant(L.wq,             rt.d_scratch, rt.d_q,         T, st);
-        launch_linear_q8_0_prequant(L.attn_rel,       rt.d_scratch, rt.d_r,         T, st);
-        launch_linear_q8_0_prequant(L.attn_sink_proj, rt.d_scratch, rt.d_sinks,     T, st);
-        launch_linear_q8_0_prequant(L.wqkv_gate,      rt.d_scratch, rt.d_attn_gate, T, st);
-        if (norm_k == norm_q) {
-            launch_linear_q8_0_prequant(L.wk, rt.d_scratch, rt.d_k_raw, T, st);
-            launch_linear_q8_0_prequant(L.wv, rt.d_scratch, rt.d_v_raw, T, st);
-        } else {
-            launch_quantize_q8_1(norm_k, rt.d_scratch, H, T, st);
-            launch_linear_q8_0_prequant(L.wk, rt.d_scratch, rt.d_k_raw, T, st);
-            if (!L.is_swa) launch_linear_q8_0_prequant(L.attn_k_conv_proj, rt.d_scratch, rt.d_k_dyn, T, st);
-
-            launch_quantize_q8_1(norm_v, rt.d_scratch, H, T, st);
-            launch_linear_q8_0_prequant(L.wv, rt.d_scratch, rt.d_v_raw, T, st);
-            if (!L.is_swa) launch_linear_q8_0_prequant(L.attn_v_conv_proj, rt.d_scratch, rt.d_v_dyn, T, st);
-        }
-    } else {
-        launch_linear(rt.cublas, L.wq,             norm_q, rt.d_q,         T, rt.d_scratch, rt.scratch_bytes, st);
-        launch_linear(rt.cublas, L.attn_rel,       norm_q, rt.d_r,         T, rt.d_scratch, rt.scratch_bytes, st);
-        launch_linear(rt.cublas, L.attn_sink_proj, norm_q, rt.d_sinks,     T, rt.d_scratch, rt.scratch_bytes, st);
-        launch_linear(rt.cublas, L.wqkv_gate,      norm_q, rt.d_attn_gate, T, rt.d_scratch, rt.scratch_bytes, st);
-        launch_linear(rt.cublas, L.wk,             norm_k, rt.d_k_raw,     T, rt.d_scratch, rt.scratch_bytes, st);
-        launch_linear(rt.cublas, L.wv,             norm_v, rt.d_v_raw,     T, rt.d_scratch, rt.scratch_bytes, st);
+    const bool sm60_q8_dec = (T < 16 && L.wq.dtype == DType::Q8_0 && L.wq.is_soa &&
+                              device_sm_version(rt.device) == 60 && (H & 127) == 0 && (H >> 2) <= 1024);
+    if (sm60_q8_dec) {
+        const bool shared_in = (L.is_swa && !has_messages);
+        const float * wq_n = static_cast<const float *>(L.is_swa ? L.attn_norm.ptr : L.attn_q_inp_norm.ptr);
+        const float * wk_n = static_cast<const float *>(L.is_swa ? L.attn_norm.ptr : L.attn_k_inp_norm.ptr);
+        const float * wv_n = static_cast<const float *>(L.is_swa ? L.attn_norm.ptr : L.attn_v_inp_norm.ptr);
+        const int n_in = shared_in ? 1 : 3;
+        launch_inkling2_rmsnorm_quant_f16_contig(n_in, inp_q, inp_k, inp_v, wq_n, wk_n, wv_n,
+                                                 rt.d_scratch, H, T, cfg_.rms_eps, st);
+        const int ik = shared_in ? 0 : 1;
+        const int iv = shared_in ? 0 : 2;
         if (!L.is_swa) {
-            launch_linear(rt.cublas, L.attn_k_conv_proj, norm_k, rt.d_k_dyn, T, rt.d_scratch, rt.scratch_bytes, st);
-            launch_linear(rt.cublas, L.attn_v_conv_proj, norm_v, rt.d_v_dyn, T, rt.d_scratch, rt.scratch_bytes, st);
+            const DeviceTensor * ws[8] = {&L.wq, &L.wqkv_gate, &L.wk, &L.wv, &L.attn_rel, &L.attn_sink_proj, &L.attn_k_conv_proj, &L.attn_v_conv_proj};
+            const int            ii[8] = {0, 0, ik, iv, 0, 0, ik, iv};
+            float *              ys[8] = {rt.d_q, rt.d_attn_gate, rt.d_k_raw, rt.d_v_raw, rt.d_r, rt.d_sinks, rt.d_k_dyn, rt.d_v_dyn};
+            launch_inkling2_qkv_fused_q8_0_h2(8, n_in, ws, ii, ys, rt.d_scratch, T, st);
+        } else {
+            const DeviceTensor * ws[6] = {&L.wq, &L.wqkv_gate, &L.wk, &L.wv, &L.attn_rel, &L.attn_sink_proj};
+            const int            ii[6] = {0, 0, ik, iv, 0, 0};
+            float *              ys[6] = {rt.d_q, rt.d_attn_gate, rt.d_k_raw, rt.d_v_raw, rt.d_r, rt.d_sinks};
+            launch_inkling2_qkv_fused_q8_0_h2(6, n_in, ws, ii, ys, rt.d_scratch, T, st);
+        }
+    } else {
+        if (L.is_swa && !has_messages) {
+            launch_inkling2_rmsnorm_fast(inp_q, static_cast<const float *>(L.attn_norm.ptr), norm_q, H, T, cfg_.rms_eps, st);
+            norm_k = norm_q;
+            norm_v = norm_q;
+        } else if (L.is_swa) {
+            const auto * nw = static_cast<const float *>(L.attn_norm.ptr);
+            launch_inkling2_rmsnorm3_fast(inp_q, inp_k, inp_v, nw, nw, nw, norm_q, norm_k, norm_v, H, T, cfg_.rms_eps, st);
+        } else {
+            launch_inkling2_rmsnorm3_fast(
+                inp_q, inp_k, inp_v,
+                static_cast<const float *>(L.attn_q_inp_norm.ptr),
+                static_cast<const float *>(L.attn_k_inp_norm.ptr),
+                static_cast<const float *>(L.attn_v_inp_norm.ptr),
+                norm_q, norm_k, norm_v, H, T, cfg_.rms_eps, st);
+        }
+
+        if (T < 16 && L.wq.dtype == DType::Q8_0 && L.wq.is_soa) {
+            launch_quantize_q8_1(norm_q, rt.d_scratch, H, T, st);
+            if (norm_k == norm_q) {
+                const DeviceTensor * ws[6] = {&L.wq, &L.wqkv_gate, &L.wk, &L.wv, &L.attn_rel, &L.attn_sink_proj};
+                float *              ys[6] = {rt.d_q, rt.d_attn_gate, rt.d_k_raw, rt.d_v_raw, rt.d_r, rt.d_sinks};
+                launch_inkling2_qkv_fused_q8_0(6, ws, ys, rt.d_scratch, T, st);
+            } else {
+                const DeviceTensor * ws_q[4] = {&L.wq, &L.wqkv_gate, &L.attn_rel, &L.attn_sink_proj};
+                float *              ys_q[4] = {rt.d_q, rt.d_attn_gate, rt.d_r, rt.d_sinks};
+                launch_inkling2_qkv_fused_q8_0(4, ws_q, ys_q, rt.d_scratch, T, st);
+
+                launch_quantize_q8_1(norm_k, rt.d_scratch, H, T, st);
+                if (!L.is_swa) {
+                    const DeviceTensor * ws_k[2] = {&L.wk, &L.attn_k_conv_proj};
+                    float *              ys_k[2] = {rt.d_k_raw, rt.d_k_dyn};
+                    launch_inkling2_qkv_fused_q8_0(2, ws_k, ys_k, rt.d_scratch, T, st);
+                } else {
+                    launch_linear_q8_0_prequant(L.wk, rt.d_scratch, rt.d_k_raw, T, st);
+                }
+
+                launch_quantize_q8_1(norm_v, rt.d_scratch, H, T, st);
+                if (!L.is_swa) {
+                    const DeviceTensor * ws_v[2] = {&L.wv, &L.attn_v_conv_proj};
+                    float *              ys_v[2] = {rt.d_v_raw, rt.d_v_dyn};
+                    launch_inkling2_qkv_fused_q8_0(2, ws_v, ys_v, rt.d_scratch, T, st);
+                } else {
+                    launch_linear_q8_0_prequant(L.wv, rt.d_scratch, rt.d_v_raw, T, st);
+                }
+            }
+        } else {
+            launch_inkling2_linear_sm60_or_default(rt.cublas, L.wq,             norm_q, rt.d_q,         T, rt.d_scratch, rt.scratch_bytes, st);
+            launch_inkling2_linear_sm60_or_default(rt.cublas, L.attn_rel,       norm_q, rt.d_r,         T, rt.d_scratch, rt.scratch_bytes, st);
+            launch_inkling2_linear_sm60_or_default(rt.cublas, L.attn_sink_proj, norm_q, rt.d_sinks,     T, rt.d_scratch, rt.scratch_bytes, st);
+            launch_inkling2_linear_sm60_or_default(rt.cublas, L.wqkv_gate,      norm_q, rt.d_attn_gate, T, rt.d_scratch, rt.scratch_bytes, st);
+            launch_inkling2_linear_sm60_or_default(rt.cublas, L.wk,             norm_k, rt.d_k_raw,     T, rt.d_scratch, rt.scratch_bytes, st);
+            launch_inkling2_linear_sm60_or_default(rt.cublas, L.wv,             norm_v, rt.d_v_raw,     T, rt.d_scratch, rt.scratch_bytes, st);
+            if (!L.is_swa) {
+                launch_inkling2_linear_sm60_or_default(rt.cublas, L.attn_k_conv_proj, norm_k, rt.d_k_dyn, T, rt.d_scratch, rt.scratch_bytes, st);
+                launch_inkling2_linear_sm60_or_default(rt.cublas, L.attn_v_conv_proj, norm_v, rt.d_v_dyn, T, rt.d_scratch, rt.scratch_bytes, st);
+            }
         }
     }
 
-    // 4. Causal ShortConvs on K & V (+ dynamic per-head taps on global layers)
-    launch_inkling2_shortconv(rt.d_k_raw, static_cast<const float *>(L.attn_k_conv.ptr),
-                              L.is_swa ? nullptr : rt.d_k_dyn, conv_k_[il], rt.d_k,
-                              T, d_kv, cfg_.n_head_kv, st);
-    launch_inkling2_shortconv(rt.d_v_raw, static_cast<const float *>(L.attn_v_conv.ptr),
-                              L.is_swa ? nullptr : rt.d_v_dyn, conv_v_[il], rt.d_v,
-                              T, d_kv, cfg_.n_head_kv, st);
-
-    // 5. L2 Clip (Q, K, R) + Head RMSNorm (V) + Log-scale tau on global Q, R
     const int32_t * tau_pos = L.is_swa ? nullptr : rt.d_pos;
-    launch_inkling2_l2_clip(rt.d_q, static_cast<const float *>(L.attn_q_clip.ptr), tau_pos,
-                            cfg_.qk_clip, static_cast<float>(cfg_.log_scale_floor), cfg_.log_scale_alpha,
-                            T, cfg_.n_head, cfg_.head_dim, st);
-    launch_inkling2_l2_clip(rt.d_k, nullptr, nullptr, cfg_.qk_clip, 1.0f, 0.0f,
-                            T, cfg_.n_head_kv, cfg_.head_dim, st);
-    launch_inkling2_head_rmsnorm(rt.d_v, T, cfg_.n_head_kv, cfg_.head_dim, cfg_.rms_eps, st);
-    launch_inkling2_l2_clip(rt.d_r, static_cast<const float *>(L.attn_rel_clip.ptr), tau_pos,
-                            cfg_.rel_clip, static_cast<float>(cfg_.log_scale_floor), cfg_.log_scale_alpha,
-                            T, cfg_.n_head, cfg_.n_rel, st);
-
-    // 6. KV Write + Relative Bias Table + Flash/Split-K Attention with Zero-Value Sink
-    launch_inkling2_kv_write(rt.d_k, rt.d_v, k_cache_[il], v_cache_[il], cfg_.kv_q8_0,
-                             rt.d_pos, T, cfg_.n_head_kv, cfg_.head_dim, cap, st);
+    if (T == 1 && cfg_.kv_q8_0 && cfg_.head_dim == 128 && cfg_.n_rel <= 32) {
+        launch_inkling2_kv_conv_norm_write_q8_0_t1(
+            rt.d_k_raw, static_cast<const float *>(L.attn_k_conv.ptr), L.is_swa ? nullptr : rt.d_k_dyn, conv_k_[il],
+            rt.d_v_raw, static_cast<const float *>(L.attn_v_conv.ptr), L.is_swa ? nullptr : rt.d_v_dyn, conv_v_[il],
+            k_cache_[il], v_cache_[il], rt.d_pos,
+            cfg_.n_head_kv, cfg_.head_dim, cap, cfg_.qk_clip, cfg_.rms_eps, st);
+        launch_inkling2_qr_l2_clip_fused_t1(
+            rt.d_q, static_cast<const float *>(L.attn_q_clip.ptr),
+            rt.d_r, static_cast<const float *>(L.attn_rel_clip.ptr),
+            tau_pos, cfg_.qk_clip, cfg_.rel_clip, static_cast<float>(cfg_.log_scale_floor), cfg_.log_scale_alpha,
+            cfg_.n_head, cfg_.head_dim, cfg_.n_rel, st);
+    } else {
+        launch_inkling2_shortconv(rt.d_k_raw, static_cast<const float *>(L.attn_k_conv.ptr),
+                                  L.is_swa ? nullptr : rt.d_k_dyn, conv_k_[il], rt.d_k,
+                                  T, d_kv, cfg_.n_head_kv, st);
+        launch_inkling2_shortconv(rt.d_v_raw, static_cast<const float *>(L.attn_v_conv.ptr),
+                                  L.is_swa ? nullptr : rt.d_v_dyn, conv_v_[il], rt.d_v,
+                                  T, d_kv, cfg_.n_head_kv, st);
+        launch_inkling2_l2_clip(rt.d_q, static_cast<const float *>(L.attn_q_clip.ptr), tau_pos,
+                                cfg_.qk_clip, static_cast<float>(cfg_.log_scale_floor), cfg_.log_scale_alpha,
+                                T, cfg_.n_head, cfg_.head_dim, st);
+        launch_inkling2_l2_clip(rt.d_k, nullptr, nullptr, cfg_.qk_clip, 1.0f, 0.0f,
+                                T, cfg_.n_head_kv, cfg_.head_dim, st);
+        launch_inkling2_head_rmsnorm(rt.d_v, T, cfg_.n_head_kv, cfg_.head_dim, cfg_.rms_eps, st);
+        launch_inkling2_l2_clip(rt.d_r, static_cast<const float *>(L.attn_rel_clip.ptr), tau_pos,
+                                cfg_.rel_clip, static_cast<float>(cfg_.log_scale_floor), cfg_.log_scale_alpha,
+                                T, cfg_.n_head, cfg_.n_rel, st);
+        launch_inkling2_kv_write(rt.d_k, rt.d_v, k_cache_[il], v_cache_[il], cfg_.kv_q8_0,
+                                 rt.d_pos, T, cfg_.n_head_kv, cfg_.head_dim, cap, st);
+    }
     launch_inkling2_rel_bias_table(rt.d_r, static_cast<const float *>(L.attn_rel_bias.ptr),
                                    rt.d_sinks, rt.d_bias_table, T, cfg_.n_head, cfg_.n_rel, n_ext, st);
     launch_inkling2_attn(rt.d_q, k_cache_[il], v_cache_[il], cfg_.kv_q8_0,
@@ -651,24 +725,30 @@ void Inkling2LoopModel::run_layer(DevRuntime & rt, int il, int ip, int T, int & 
                          swa_w, n_ext, cap, 1.0f / std::sqrt(static_cast<float>(cfg_.head_dim)),
                          rt.cublas, kv_len_max, st);
 
-    // 7. Sigmoid Gate + Wo + Post-Attention ShortConv
-    launch_inkling2_sigmoid_gate_mul(rt.d_attn_out, rt.d_attn_gate, static_cast<int64_t>(T) * d_q, st);
-    launch_linear(rt.cublas, L.wo, rt.d_attn_out, rt.d_wo_raw, T, rt.d_scratch, rt.scratch_bytes, st);
-    launch_inkling2_shortconv(rt.d_wo_raw, static_cast<const float *>(L.attn_post_conv.ptr),
-                              nullptr, conv_attn_[il], rt.d_cur, T, H, 0, st);
-
-    // 8. Block Residual Update: if ip % block_size == 0, push inpSA to blocks (no add); else cur += inpSA
+    if (T < 16 && L.wo.dtype == DType::Q8_0 && L.wo.is_soa) {
+        if (device_sm_version(rt.device) == 60) {
+            launch_inkling2_sigmoid_gate_quant_f16_contig(rt.d_attn_out, rt.d_attn_gate, rt.d_scratch, d_q, T, st);
+            launch_inkling2_gemv_q8_0_h2(L.wo, rt.d_scratch, rt.d_wo_raw, T, st);
+        } else {
+            launch_inkling2_sigmoid_gate_quant_q8_1(rt.d_attn_out, rt.d_attn_gate, rt.d_scratch, d_q, T, st);
+            launch_linear_q8_0_prequant(L.wo, rt.d_scratch, rt.d_wo_raw, T, st);
+        }
+    } else {
+        launch_inkling2_sigmoid_gate_mul(rt.d_attn_out, rt.d_attn_gate, static_cast<int64_t>(T) * d_q, st);
+        launch_inkling2_linear_sm60_or_default(rt.cublas, L.wo, rt.d_attn_out, rt.d_wo_raw, T, rt.d_scratch, rt.scratch_bytes, st);
+    }
+    // 8. Post-Attention ShortConv + Block Residual Update (fused residual add when ip % block_size != 0!)
     if (ip % cfg_.attn_res_block_size == 0) {
+        launch_inkling2_shortconv(rt.d_wo_raw, static_cast<const float *>(L.attn_post_conv.ptr),
+                                  nullptr, conv_attn_[il], rt.d_cur, T, H, 0, st, nullptr);
         cudaMemcpyAsync(rt.d_blocks[n_blocks], rt.d_inp_sa, TH * sizeof(float), cudaMemcpyDeviceToDevice, st);
         ++n_blocks;
     } else {
-        launch_add_inplace(rt.d_cur, rt.d_inp_sa, static_cast<int64_t>(TH), st);
+        launch_inkling2_shortconv(rt.d_wo_raw, static_cast<const float *>(L.attn_post_conv.ptr),
+                                  nullptr, conv_attn_[il], rt.d_cur, T, H, 0, st, rt.d_inp_sa);
     }
 
-    // Save ffn_inp = cur
-    cudaMemcpyAsync(rt.d_ffn_inp, rt.d_cur, TH * sizeof(float), cudaMemcpyDeviceToDevice, st);
-
-    // 9. FFN Depth Mix + Loop Control + RMSNorm
+    // 9. FFN Depth Mix + Loop Control + Fast RMSNorm (no need to copy d_cur -> d_ffn_inp: d_cur stays intact until fused post-FFN shortconv!)
     launch_inkling2_depth_mix(rt.d_block_ptrs, n_blocks, rt.d_cur,
                               static_cast<const float *>(L.ffn_res_query.ptr),
                               rt.d_mixed3, H, 1, T, cfg_.rms_eps, st);
@@ -677,23 +757,25 @@ void Inkling2LoopModel::run_layer(DevRuntime & rt, int il, int ip, int T, int & 
         apply_ctrl(ffn_x, 3, rt.d_inputs[0]);
         ffn_x = rt.d_inputs[0];
     }
-    launch_rmsnorm(ffn_x, static_cast<const float *>(L.ffn_norm.ptr), rt.d_x_norm, H, T, cfg_.rms_eps, st);
+    launch_inkling2_rmsnorm_fast(ffn_x, static_cast<const float *>(L.ffn_norm.ptr), rt.d_x_norm, H, T, cfg_.rms_eps, st);
 
-    // 10. MoE Router (Sigmoid + bias + renorm + scale=8.0) + Fused SiTU MoE + Post-FFN ShortConv + Residual
-    launch_linear(rt.cublas, L.ffn_gate_inp, rt.d_x_norm, rt.d_router, T, rt.d_scratch, rt.scratch_bytes, st);
-    launch_moe_route_sigmoid(rt.d_router,
-                             L.ffn_exp_probs_b.valid() ? static_cast<const float *>(L.ffn_exp_probs_b.ptr) : nullptr,
-                             rt.d_top_ids, rt.d_top_w,
-                             T, cfg_.n_expert, cfg_.n_expert_used, true, cfg_.expert_weights_scale, st);
+    // 10. MoE Router + Fused SiTU MoE + Fused Post-FFN ShortConv + Residual directly into rt.d_cur!
+    if (T < 16 && L.ffn_gate_inp.dtype == DType::F32 && (H & 3) == 0) {
+        launch_inkling2_router_gemv_f32(L.ffn_gate_inp, rt.d_x_norm, rt.d_router, T, st);
+    } else {
+        launch_linear(rt.cublas, L.ffn_gate_inp, rt.d_x_norm, rt.d_router, T, rt.d_scratch, rt.scratch_bytes, st);
+    }
+    launch_inkling2_moe_route_sigmoid_fast(
+        rt.d_router,
+        L.ffn_exp_probs_b.valid() ? static_cast<const float *>(L.ffn_exp_probs_b.ptr) : nullptr,
+        rt.d_top_ids, rt.d_top_w,
+        T, cfg_.n_expert, cfg_.n_expert_used, true, cfg_.expert_weights_scale, st);
     launch_inkling2_moe_ffn(rt.cublas, L.ffn_gate_up_exps, L.ffn_down_exps,
                             rt.d_x_norm, rt.d_top_ids, rt.d_top_w, rt.d_moe_raw,
                             rt.d_scratch, rt.scratch_bytes,
                             T, cfg_.n_expert_used, cfg_.situ_beta, cfg_.situ_linear_beta, st);
     launch_inkling2_shortconv(rt.d_moe_raw, static_cast<const float *>(L.ffn_post_conv.ptr),
-                              nullptr, conv_ffn_[il], rt.d_sub_out, T, H, 0, st);
-
-    cudaMemcpyAsync(rt.d_cur, rt.d_ffn_inp, TH * sizeof(float), cudaMemcpyDeviceToDevice, st);
-    launch_add_inplace(rt.d_cur, rt.d_sub_out, static_cast<int64_t>(TH), st);
+                              nullptr, conv_ffn_[il], rt.d_cur, T, H, 0, st, rt.d_cur);
     if (hook_ != nullptr) {
         hook_->on_post_layer(ip, rt.device, rt.d_cur, T, H, 1, st);
     }
@@ -703,7 +785,9 @@ void Inkling2LoopModel::run_prelude(int T, int kv_len_max) {
     auto & rt = runtimes_[0];
     cudaSetDevice(rt.device);
     const int H = cfg_.n_embd;
-    launch_embedding_lookup(tok_embd_, rt.d_tokens, rt.d_inp_sa, H, 1, T, rt.stream);
+    if (!(runtimes_.size() >= 2 && postlude_split_ip_ >= 0)) {
+        launch_embedding_lookup(tok_embd_, rt.d_tokens, rt.d_inp_sa, H, 1, T, rt.stream);
+    }
     launch_rmsnorm(rt.d_inp_sa, static_cast<const float *>(tok_norm_.ptr), rt.d_cur, H, T, cfg_.rms_eps, rt.stream);
 
     int n_blocks = 0;
@@ -762,14 +846,31 @@ void Inkling2LoopModel::run_postlude_and_head(int T, bool run_argmax, int kv_len
         run_layer(rt, ip, ip, T, n_blocks, false, kv_len_max);
     }
 
-    // Output head: depth mix -> RMSNorm -> lm_head (last token only!) -> softcap(30) -> argmax over n_vocab_unpadded
+    // Output depth mix + RMSNorm on postlude GPU (in asym mode, lm_head runs on GPU0 via run_head_only!)
     launch_inkling2_depth_mix(rt.d_block_ptrs, n_blocks, rt.d_cur,
                               static_cast<const float *>(output_res_query_.ptr),
                               rt.d_mixed3, H, 1, T, cfg_.rms_eps, rt.stream);
     launch_rmsnorm(rt.d_mixed3 + static_cast<size_t>(T - 1) * H,
                    static_cast<const float *>(output_norm_.ptr),
                    rt.d_x_norm, H, 1, cfg_.rms_eps, rt.stream);
-    launch_linear(rt.cublas, output_, rt.d_x_norm, rt.d_logits, 1, rt.d_scratch, rt.scratch_bytes, rt.stream);
+    if (!asym) {
+        launch_linear(rt.cublas, output_, rt.d_x_norm, rt.d_logits, 1, rt.d_scratch, rt.scratch_bytes, rt.stream);
+        launch_inkling2_logit_softcap(rt.d_logits, cfg_.n_vocab_unpadded, cfg_.logit_softcap, rt.stream);
+        if (run_argmax) {
+            launch_argmax_f32(rt.d_logits, rt.d_argmax, cfg_.n_vocab_unpadded, rt.stream);
+        }
+    }
+}
+
+void Inkling2LoopModel::run_head_only(bool run_argmax) {
+    auto & rt = runtimes_[0];
+    cudaSetDevice(rt.device);
+    if (output_.dtype == DType::Q8_0 && output_.is_soa && device_sm_version(rt.device) == 60) {
+        launch_inkling2_quant_f16_contig(rt.d_x_norm, rt.d_scratch, cfg_.n_embd, 1, rt.stream);
+        launch_inkling2_gemv_q8_0_h2(output_, rt.d_scratch, rt.d_logits, 1, rt.stream);
+    } else {
+        launch_linear(rt.cublas, output_, rt.d_x_norm, rt.d_logits, 1, rt.d_scratch, rt.scratch_bytes, rt.stream);
+    }
     launch_inkling2_logit_softcap(rt.d_logits, cfg_.n_vocab_unpadded, cfg_.logit_softcap, rt.stream);
     if (run_argmax) {
         launch_argmax_f32(rt.d_logits, rt.d_argmax, cfg_.n_vocab_unpadded, rt.stream);
@@ -810,6 +911,14 @@ void Inkling2LoopModel::capture_decode_graphs() {
             run_postlude_prefix(1, 0);
             cuda_ok(cudaStreamEndCapture(rt0.stream, &g), "end prelude+core");
             cuda_ok(cudaGraphInstantiate(&graph_prelude_, g, nullptr, nullptr, 0), "inst prelude+core");
+            cudaGraphDestroy(g);
+        }
+        {
+            cudaGraph_t g = nullptr;
+            cuda_ok(cudaStreamBeginCapture(rt0.stream, cudaStreamCaptureModeRelaxed), "begin head");
+            run_head_only(true);
+            cuda_ok(cudaStreamEndCapture(rt0.stream, &g), "end head");
+            cuda_ok(cudaGraphInstantiate(&graph_head_, g, nullptr, nullptr, 0), "inst head");
             cudaGraphDestroy(g);
         }
         cuda_ok(cudaSetDevice(rt1.device), "capture 2gpu-asym rt1");
@@ -879,34 +988,52 @@ void Inkling2LoopModel::forward(const std::vector<int32_t> & tokens,
 
     auto & rt0 = runtimes_[0];
     cuda_ok(cudaSetDevice(rt0.device), "fwd setDevice0");
-    cuda_ok(cudaMemcpyAsync(rt0.d_tokens, tokens.data(),    T * sizeof(int32_t), cudaMemcpyHostToDevice, rt0.stream), "copy tokens");
-    cuda_ok(cudaMemcpyAsync(rt0.d_pos,    positions.data(), T * sizeof(int32_t), cudaMemcpyHostToDevice, rt0.stream), "copy pos0");
+    if (!(runtimes_.size() >= 2 && postlude_split_ip_ >= 0)) {
+        cuda_ok(cudaMemcpyAsync(rt0.d_tokens, tokens.data(), T * sizeof(int32_t), cudaMemcpyHostToDevice, rt0.stream), "copy tokens");
+    }
+    cuda_ok(cudaMemcpyAsync(rt0.d_pos, positions.data(), T * sizeof(int32_t), cudaMemcpyHostToDevice, rt0.stream), "copy pos0");
 
     if (runtimes_.size() == 1) {
         run_single_gpu_all(T, false, kv_len_max);
     } else if (postlude_split_ip_ >= 0) {
         auto & rt1 = runtimes_[1];
-        const size_t TH_bytes = static_cast<size_t>(T) * cfg_.n_embd * sizeof(float);
+        const size_t H_bytes  = static_cast<size_t>(cfg_.n_embd) * sizeof(float);
+        const size_t TH_bytes = static_cast<size_t>(T) * H_bytes;
         const int n_total_blk = (postlude_split_ip_ + cfg_.attn_res_block_size - 1) / cfg_.attn_res_block_size;
 
+        // Cold token_embd lookup on GPU 1 -> peer copy to GPU 0
         cuda_ok(cudaSetDevice(rt1.device), "fwd asym setDevice1");
-        cuda_ok(cudaMemcpyAsync(rt1.d_pos, positions.data(), T * sizeof(int32_t), cudaMemcpyHostToDevice, rt1.stream), "copy pos1");
+        cuda_ok(cudaMemcpyAsync(rt1.d_tokens, tokens.data(),    T * sizeof(int32_t), cudaMemcpyHostToDevice, rt1.stream), "copy tokens1");
+        cuda_ok(cudaMemcpyAsync(rt1.d_pos,    positions.data(), T * sizeof(int32_t), cudaMemcpyHostToDevice, rt1.stream), "copy pos1");
+        launch_embedding_lookup(tok_embd_, rt1.d_tokens, rt1.d_inp_sa, cfg_.n_embd, 1, T, rt1.stream);
+        cuda_ok(cudaEventRecord(rt1.done_event, rt1.stream), "fwd rec embd");
 
         // Stage 0: Prelude + Looped Core (all 3 passes!) + Postlude prefix on GPU 0
+        cuda_ok(cudaSetDevice(rt0.device), "fwd asym stage0");
+        cuda_ok(cudaStreamWaitEvent(rt0.stream, rt1.done_event, 0), "fwd wait embd");
+        cuda_ok(cudaMemcpyPeerAsync(rt0.d_inp_sa, rt0.device, rt1.d_inp_sa, rt1.device, TH_bytes, rt0.stream), "fwd hop embd");
         run_prelude(T, kv_len_max);
         run_core(T, kv_len_max);
         run_postlude_prefix(T, kv_len_max);
-        cuda_ok(cudaStreamSynchronize(rt0.stream), "sync pre+core");
+        cuda_ok(cudaEventRecord(rt0.done_event, rt0.stream), "fwd rec pre+core");
 
-        // Single Hop: GPU0 -> GPU1 (cur, blocks[0..n_total_blk-1])
+        // Hop: GPU0 -> GPU1 (cur, blocks[0..n_total_blk-1])
         cuda_ok(cudaSetDevice(rt1.device), "asym hop setDevice1");
+        cuda_ok(cudaStreamWaitEvent(rt1.stream, rt0.done_event, 0), "fwd wait pre+core");
         cuda_ok(cudaMemcpyPeerAsync(rt1.d_cur, rt1.device, rt0.d_cur, rt0.device, TH_bytes, rt1.stream), "asym hop cur");
         for (int b = 0; b < n_total_blk; ++b) {
             cuda_ok(cudaMemcpyPeerAsync(rt1.d_blocks[b], rt1.device, rt0.d_blocks[b], rt0.device, TH_bytes, rt1.stream), "asym hop blk");
         }
 
-        // Stage 1: Postlude tail + Output Head on GPU 1
+        // Stage 1: Postlude tail + output depth_mix + output_norm on GPU 1 -> hop last-token x_norm (9 KB) to GPU 0
         run_postlude_and_head(T, false, kv_len_max);
+        cuda_ok(cudaEventRecord(rt1.done_event, rt1.stream), "fwd rec postlude");
+
+        // Stage 2: Hot lm_head on GPU 0!
+        cuda_ok(cudaSetDevice(rt0.device), "fwd asym head");
+        cuda_ok(cudaStreamWaitEvent(rt0.stream, rt1.done_event, 0), "fwd wait postlude");
+        cuda_ok(cudaMemcpyPeerAsync(rt0.d_x_norm, rt0.device, rt1.d_x_norm, rt1.device, H_bytes, rt0.stream), "fwd hop xnorm");
+        run_head_only(false);
     } else {
         auto & rt1 = runtimes_[1];
         const size_t TH_bytes = static_cast<size_t>(T) * cfg_.n_embd * sizeof(float);
@@ -944,7 +1071,7 @@ void Inkling2LoopModel::forward(const std::vector<int32_t> & tokens,
         run_postlude_and_head(T, false, kv_len_max);
     }
 
-    auto & head_rt = (runtimes_.size() >= 2 && postlude_split_ip_ >= 0) ? runtimes_[1] : runtimes_[0];
+    auto & head_rt = runtimes_[0];
     out_logits.resize(cfg_.n_vocab_unpadded);
     cuda_ok(cudaSetDevice(head_rt.device), "fwd readout setDevice");
     cuda_ok(cudaMemcpyAsync(out_logits.data(), head_rt.d_logits,
@@ -960,8 +1087,10 @@ int32_t Inkling2LoopModel::forward_decode_greedy(int32_t token, int32_t pos) {
 
     auto & rt0 = runtimes_[0];
     cuda_ok(cudaSetDevice(rt0.device), "dec setDevice0");
-    cuda_ok(cudaMemcpyAsync(rt0.d_tokens, &token, sizeof(int32_t), cudaMemcpyHostToDevice, rt0.stream), "dec tok");
-    cuda_ok(cudaMemcpyAsync(rt0.d_pos,    &pos,   sizeof(int32_t), cudaMemcpyHostToDevice, rt0.stream), "dec pos0");
+    if (!(runtimes_.size() >= 2 && postlude_split_ip_ >= 0)) {
+        cuda_ok(cudaMemcpyAsync(rt0.d_tokens, &token, sizeof(int32_t), cudaMemcpyHostToDevice, rt0.stream), "dec tok");
+    }
+    cuda_ok(cudaMemcpyAsync(rt0.d_pos, &pos, sizeof(int32_t), cudaMemcpyHostToDevice, rt0.stream), "dec pos0");
 
     if (runtimes_.size() == 1) {
         if (graphs_ready_ && graph_all_) {
@@ -974,10 +1103,16 @@ int32_t Inkling2LoopModel::forward_decode_greedy(int32_t token, int32_t pos) {
         const size_t H_bytes  = static_cast<size_t>(cfg_.n_embd) * sizeof(float);
         const int n_total_blk = (postlude_split_ip_ + cfg_.attn_res_block_size - 1) / cfg_.attn_res_block_size;
 
+        // Cold token_embd lookup on GPU 1 (9 KB peer copy to GPU 0)
         cuda_ok(cudaSetDevice(rt1.device), "dec asym setDevice1");
-        cuda_ok(cudaMemcpyAsync(rt1.d_pos, &pos, sizeof(int32_t), cudaMemcpyHostToDevice, rt1.stream), "dec pos1");
+        cuda_ok(cudaMemcpyAsync(rt1.d_tokens, &token, sizeof(int32_t), cudaMemcpyHostToDevice, rt1.stream), "dec tok1");
+        cuda_ok(cudaMemcpyAsync(rt1.d_pos,    &pos,   sizeof(int32_t), cudaMemcpyHostToDevice, rt1.stream), "dec pos1");
+        launch_embedding_lookup(tok_embd_, rt1.d_tokens, rt1.d_inp_sa, cfg_.n_embd, 1, 1, rt1.stream);
+        cuda_ok(cudaEventRecord(rt1.done_event, rt1.stream), "dec rec embd");
 
         cuda_ok(cudaSetDevice(rt0.device), "dec asym stage0");
+        cuda_ok(cudaStreamWaitEvent(rt0.stream, rt1.done_event, 0), "dec wait embd");
+        cuda_ok(cudaMemcpyPeerAsync(rt0.d_inp_sa, rt0.device, rt1.d_inp_sa, rt1.device, H_bytes, rt0.stream), "dec hop embd");
         if (graphs_ready_ && graph_prelude_) {
             cuda_ok(cudaGraphLaunch(graph_prelude_, rt0.stream), "launch pre+core");
         } else {
@@ -997,6 +1132,17 @@ int32_t Inkling2LoopModel::forward_decode_greedy(int32_t token, int32_t pos) {
             cuda_ok(cudaGraphLaunch(graph_postlude_, rt1.stream), "launch postlude");
         } else {
             run_postlude_and_head(1, true, pos + 1);
+        }
+        cuda_ok(cudaEventRecord(rt1.done_event, rt1.stream), "rec postlude");
+
+        // Hot lm_head on GPU 0 (732 GB/s HBM2!)
+        cuda_ok(cudaSetDevice(rt0.device), "dec asym head");
+        cuda_ok(cudaStreamWaitEvent(rt0.stream, rt1.done_event, 0), "wait postlude");
+        cuda_ok(cudaMemcpyPeerAsync(rt0.d_x_norm, rt0.device, rt1.d_x_norm, rt1.device, H_bytes, rt0.stream), "dec hop xnorm");
+        if (graphs_ready_ && graph_head_) {
+            cuda_ok(cudaGraphLaunch(graph_head_, rt0.stream), "launch head");
+        } else {
+            run_head_only(true);
         }
     } else {
         auto & rt1 = runtimes_[1];
@@ -1034,7 +1180,7 @@ int32_t Inkling2LoopModel::forward_decode_greedy(int32_t token, int32_t pos) {
         else run_postlude_and_head(1, true, pos + 1);
     }
 
-    auto & head_rt = (runtimes_.size() >= 2 && postlude_split_ip_ >= 0) ? runtimes_[1] : runtimes_[0];
+    auto & head_rt = runtimes_[0];
     int32_t next_tok = 0;
     cuda_ok(cudaSetDevice(head_rt.device), "dec readout");
     cuda_ok(cudaMemcpyAsync(&next_tok, head_rt.d_argmax, sizeof(int32_t), cudaMemcpyDeviceToHost, head_rt.stream), "copy argmax");
@@ -1044,7 +1190,7 @@ int32_t Inkling2LoopModel::forward_decode_greedy(int32_t token, int32_t pos) {
 
 void Inkling2LoopModel::forward_decode_logits(int32_t token, int32_t pos, std::vector<float> & out_logits) {
     forward_decode_greedy(token, pos);
-    auto & head_rt = (runtimes_.size() >= 2 && postlude_split_ip_ >= 0) ? runtimes_[1] : runtimes_[0];
+    auto & head_rt = runtimes_[0];
     out_logits.resize(cfg_.n_vocab_unpadded);
     cuda_ok(cudaSetDevice(head_rt.device), "dec logits setDevice");
     cuda_ok(cudaMemcpyAsync(out_logits.data(), head_rt.d_logits,
