@@ -1,5 +1,6 @@
 #include "engram/engram_sidecar.h"
 #include "gguf/reader.h"
+#include "models/inkling2_loop.h"
 #include "models/maxwell_moe.h"
 #include "models/qwen35_moe.h"
 #include "tokenizer/bpe.h"
@@ -18,8 +19,9 @@
 
 struct HostEvalModel {
     std::string arch;
-    std::unique_ptr<rookery::MaxwellMoeModel> maxwell;
-    std::unique_ptr<rookery::Qwen35MoeModel>  qwen35;
+    std::unique_ptr<rookery::MaxwellMoeModel>   maxwell;
+    std::unique_ptr<rookery::Qwen35MoeModel>    qwen35;
+    std::unique_ptr<rookery::Inkling2LoopModel> inkling2;
 
     void load(const std::string & path, const std::vector<int> & gpus, const std::vector<float> & split, int max_ctx) {
         auto gguf = rookery::GgufFile::open(path);
@@ -27,26 +29,58 @@ struct HostEvalModel {
         if (arch == "qwen35moe") {
             qwen35 = std::make_unique<rookery::Qwen35MoeModel>();
             qwen35->load(path, gpus, split, max_ctx, true, false);
+        } else if (arch == "inkling2_loop" || arch == "inkling2") {
+            inkling2 = std::make_unique<rookery::Inkling2LoopModel>();
+            inkling2->load(path, gpus, max_ctx, true);
         } else {
             maxwell = std::make_unique<rookery::MaxwellMoeModel>();
             maxwell->load(path, gpus, split, max_ctx, true, false);
         }
     }
-    int n_embd() const { return qwen35 ? qwen35->config().n_embd : maxwell->config().n_embd; }
-    int hc_mult() const { return qwen35 ? 1 : maxwell->config().hc_mult; }
-    std::vector<int> layer_devices() const { return qwen35 ? qwen35->layer_devices() : maxwell->layer_devices(); }
-    void set_layer_hook(rookery::LayerHook * h) { if (qwen35) qwen35->set_layer_hook(h); else maxwell->set_layer_hook(h); }
-    void set_use_cuda_graphs(bool en) { if (qwen35) qwen35->set_use_cuda_graphs(en); else maxwell->set_use_cuda_graphs(en); }
-    void warmup_decode_graphs() { if (qwen35) qwen35->warmup_decode_graphs(); else maxwell->warmup_decode_graphs(); }
-    void reset_state() { if (qwen35) qwen35->reset_state(); }
+    int n_embd() const {
+        if (qwen35) return qwen35->config().n_embd;
+        if (inkling2) return inkling2->config().n_embd;
+        return maxwell->config().n_embd;
+    }
+    int hc_mult() const { return (qwen35 || inkling2) ? 1 : maxwell->config().hc_mult; }
+    std::vector<int> layer_devices() const {
+        if (qwen35) return qwen35->layer_devices();
+        if (inkling2) return inkling2->layer_devices();
+        return maxwell->layer_devices();
+    }
+    void set_layer_hook(rookery::LayerHook * h) {
+        if (qwen35) qwen35->set_layer_hook(h);
+        else if (inkling2) inkling2->set_layer_hook(h);
+        else maxwell->set_layer_hook(h);
+    }
+    void set_use_cuda_graphs(bool en) {
+        if (qwen35) qwen35->set_use_cuda_graphs(en);
+        else if (inkling2) inkling2->set_use_cuda_graphs(en);
+        else maxwell->set_use_cuda_graphs(en);
+    }
+    void warmup_decode_graphs() {
+        if (qwen35) qwen35->warmup_decode_graphs();
+        else if (inkling2) inkling2->warmup_decode_graphs();
+        else maxwell->warmup_decode_graphs();
+    }
+    void reset_state() {
+        if (qwen35) qwen35->reset_state();
+        else if (inkling2) inkling2->reset_state();
+    }
     void forward(const std::vector<int32_t> & t, const std::vector<int32_t> & p, std::vector<float> & l) {
-        if (qwen35) qwen35->forward(t, p, l); else maxwell->forward(t, p, l);
+        if (qwen35) qwen35->forward(t, p, l);
+        else if (inkling2) inkling2->forward(t, p, l);
+        else maxwell->forward(t, p, l);
     }
     int32_t forward_decode_greedy(int32_t t, int32_t p) {
-        return qwen35 ? qwen35->forward_decode_greedy(t, p) : maxwell->forward_decode_greedy(t, p);
+        if (qwen35) return qwen35->forward_decode_greedy(t, p);
+        if (inkling2) return inkling2->forward_decode_greedy(t, p);
+        return maxwell->forward_decode_greedy(t, p);
     }
     void forward_decode_logits(int32_t t, int32_t p, std::vector<float> & l) {
-        if (qwen35) qwen35->forward_decode_logits(t, p, l); else maxwell->forward_decode_logits(t, p, l);
+        if (qwen35) qwen35->forward_decode_logits(t, p, l);
+        else if (inkling2) inkling2->forward_decode_logits(t, p, l);
+        else maxwell->forward_decode_logits(t, p, l);
     }
 };
 

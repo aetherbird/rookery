@@ -497,6 +497,86 @@ def cmd_compose(args):
           f"{im_meta['host_arch']} L{im_meta['target_host_layer']}, mode={mode}) -> {args.out}")
 
 
+def cmd_compose_multi(args):
+    """Algebraically fold ONE Exporter (.rkex) with MULTIPLE Importers (.rkim, e.g. L1 linear + L44 gated)
+    into a single multi-hook, ZERO-OVERHEAD RKAD v3 adapter file!
+    """
+    ex_meta, ex_arr = load_json_npz(args.exporter, "RKEX")
+    mu_e = ex_arr["mu_e"]
+    W_ex = ex_arr["W_ex"]
+    d_eng = ex_meta["d_engram"]
+
+    importers = [load_json_npz(p, "RKIM") for p in args.importers]
+    if not importers:
+        raise ValueError("compose-multi requires at least one --importer")
+
+    im0_meta = importers[0][0]
+    d_host = im0_meta["host_d_embd"]
+    for im_meta, _ in importers:
+        if ex_meta["z_space_id"] != im_meta["z_space_id"] or ex_meta["d_z"] != im_meta["d_z"]:
+            raise ValueError(f"Canonical Z mismatch: exporter={ex_meta['z_space_id']}({ex_meta['d_z']}) "
+                             f"vs importer={im_meta['z_space_id']}({im_meta['d_z']})")
+        if im_meta["host_arch"] != im0_meta["host_arch"] or im_meta["host_d_embd"] != d_host:
+            raise ValueError("All importers in compose-multi must target the same host model")
+
+    modes = "+".join(m["mode"] for m, _ in importers)
+    manifest = {
+        "schema": "rookery.engram.adapter.v3",
+        "provider_arch": ex_meta["provider_arch"],
+        "provider_mode": "ngram_hash",
+        "provider_fingerprint": ex_meta["provider_fingerprint"],
+        "host_arch": im0_meta["host_arch"],
+        "host_n_layers": im0_meta["host_n_layers"],
+        "host_d_embd": d_host,
+        "host_hc_mult": im0_meta["host_hc_mult"],
+        "calibration": f"canonical_z_multi:{ex_meta['z_space_id']}:{modes}",
+    }
+    m_bytes = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
+
+    with open(args.out, "wb") as f:
+        f.write(b"RKAD")
+        f.write(struct.pack("<6I", 3, len(importers), d_eng, d_host, args.rank, 0))
+        f.write(struct.pack("<I", len(m_bytes)))
+        f.write(m_bytes)
+        for idx, (im_meta, im_arr) in enumerate(importers):
+            mode = im_meta["mode"]
+            sc_mult = args.scale_mults[idx] if idx < len(args.scale_mults) else 1.0
+            eff_scale = float(im_meta["scale"]) * sc_mult
+            delta_clip = float(im_meta.get("delta_clip", 0.0))
+            if mode == "level2_linear":
+                W_eff = im_arr["W_im"] @ W_ex
+                U, S, Vt = np.linalg.svd(W_eff, full_matrices=False)
+                r = min(args.rank, len(S))
+                sq = np.sqrt(np.maximum(S[:r], 0.0)).astype(np.float32)
+                B_v = (U[:, :r] * sq[None, :]).astype(np.float32)
+                A_v = (sq[:, None] * Vt[:r, :]).astype(np.float32)
+                hflags = 1 | (4 if delta_clip > 0.0 else 0)
+                f.write(struct.pack("<2if2If", im_meta["target_host_layer"], ex_meta["src_engram_layer"],
+                                    eff_scale, r, hflags, delta_clip))
+                f.write(mu_e.astype(np.float32).tobytes())
+                f.write(A_v.tobytes())
+                f.write(B_v.tobytes())
+            elif mode == "level3_gated":
+                A_v_fold = (im_arr["A_v"] @ W_ex).astype(np.float32)
+                A_k_fold = (im_arr["A_k"] @ W_ex).astype(np.float32)
+                r = int(im_meta["rank"])
+                hflags = 1 | 2 | (4 if delta_clip > 0.0 else 0)
+                f.write(struct.pack("<2if2If", im_meta["target_host_layer"], ex_meta["src_engram_layer"],
+                                    eff_scale, r, hflags, delta_clip))
+                f.write(mu_e.astype(np.float32).tobytes())
+                f.write(A_v_fold.tobytes())
+                f.write(im_arr["B_v"].astype(np.float32).tobytes())
+                f.write(A_k_fold.tobytes())
+                f.write(im_arr["B_k"].astype(np.float32).tobytes())
+                f.write(im_arr["gate_w"].astype(np.float32).tobytes())
+            else:
+                raise ValueError(f"Unknown importer mode: {mode}")
+
+    layers_str = ",".join(f"L{m['target_host_layer']}({m['mode']})" for m, _ in importers)
+    print(f"[Compose-Multi N+M -> RKAD v3] Folded ({ex_meta['provider_arch']} -> {ex_meta['z_space_id']} -> "
+          f"{im0_meta['host_arch']} [{layers_str}]) -> {args.out}")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Canonical Shared Memory Z (engram-z-v1) N+M Exporter/Importer/Composer")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -567,6 +647,14 @@ def main():
     p5.add_argument("--rank", type=int, default=128)
     p5.add_argument("--out", required=True)
     p5.set_defaults(func=cmd_compose)
+
+    p6 = sub.add_parser("compose-multi")
+    p6.add_argument("--exporter", required=True)
+    p6.add_argument("--importers", nargs="+", required=True)
+    p6.add_argument("--scale-mults", nargs="*", type=float, default=[])
+    p6.add_argument("--rank", type=int, default=128)
+    p6.add_argument("--out", required=True)
+    p6.set_defaults(func=cmd_compose_multi)
 
     args = ap.parse_args()
     args.func(args)
