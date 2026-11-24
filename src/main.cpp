@@ -142,7 +142,11 @@ struct ServerEngine {
         if (inkling2 || qwen35 || bailing3) return 1;
         return maxwell->config().hc_mult;
     }
-    size_t prefill_chunk() const { return (glm5 || inkling2) ? 256 : 512; }
+    size_t prefill_chunk() const {
+        if (glm5 || inkling2) return 256;
+        if (bailing3 && bailing3->config().n_expert >= 256) return 1024;
+        return 512;
+    }
     bool has_mtp() const {
         if (glm5)     return glm5->has_mtp();
         if (inkling2 || qwen4) return false;

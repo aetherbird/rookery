@@ -35,10 +35,12 @@ Measured against `llama.cpp` (`-fa 1 -ctk q8_0 -ctv q8_0`) on heterogeneous mult
 | **Qwen3.6-35B-A3B-MTP** (`Q8_0`) | 3090 + V100 | Decode (no MTP / + MTP) | `113.2 tok/s` | `134.0` / **`195.6 tok/s`** | **+18% / +73%** |
 | **Qwen3.6-35B-A3B-MTP** (`Q8_0`) | 3090 + V100 | Prefill `pp2048` | — | **`1,887.4 tok/s`** | `0.000000` ckpt parity |
 | **Qwen3.8-Flash-Next** (`UD-Q6_K_XL`) | 3090 + 2×3060 + 3×V100 | Decode (`ctx=5` / `ctx=4096`) | `41.6 tok/s` | **`50.5` / `50.1 tok/s`** | **+21%** |
-| **Ling-3.2-Air** (`Q6_K`, `256K` ctx, MTP) | 3090 + 3×V100 | Decode `tg128` (no MTP / + MTP) | `55.4 tok/s` | `86.3` / **`116.4 tok/s`** | **+56% / +110%** |
-| **Ling-3.2-Air** (`Q6_K`, `256K` ctx, MTP) | 3090 + 3×V100 | Long-ctx decode (`20K` / `41K` / `82K`) | `50.1 tok/s` (`32K`) | **`75.0` / `58.0` / `44.7 tok/s`** | **100% needle up to 82K** |
-| **Ling-3.2-Air REAP-408** (`Q8_0`, `256K` ctx) | 3090 + 3×V100 | Decode `tg128` (no MTP) | — | **`76.4 tok/s`** | **pure `Q8_0` SoA** |
-| **Ling-3.0-tiny** (`Q4_K_M`) | RTX 3090 (`sm_86`) | Decode `tg128` | `225.3 tok/s` | **`288.6 tok/s`** | **+28%** |
+| **Ling-3.2-Air** (`Q6_K`, `256K` ctx, MTP) | 3090 + 3×V100 | Decode `tg128` (no MTP / + MTP) | `55.4 tok/s` | `97.7` / **`118.2–124.7 tok/s`** | **+76% / +113%–125%** |
+| **Ling-3.2-Air** (`Q6_K`, `256K` ctx, MTP) | 3090 + 3×V100 | Prefill `pp2048` / `pp8192` | `579.2 tok/s` | **`1,556.8` / `1,479.6 tok/s`** (`1,609.9` no MTP) | **2.69×–2.78×** |
+| **Ling-3.2-Air** (`Q6_K`, `256K` ctx, MTP) | 3090 + 3×V100 | Long-ctx decode (`16K` / `32K` / `64K`) | `50.1 tok/s` (`32K`) | **`88.6` / `67.5` / `53.5 tok/s`** (100% needle up to `82K`) | **+35% at 32K** |
+| **Ling-3.2-Air REAP-408** (`Q8_0`, `256K` ctx) | 3090 + 3×V100 | Prefill `pp2048` / Decode `tg128` (no MTP) | — | **`1,826.4` / `93.9 tok/s`** | **pure `Q8_0` SoA** |
+| **Ling-3.0-tiny** (`Q4_K_M`) | RTX 3090 (`sm_86`) | Prefill `pp128` / `pp512` | `3,809.9` / `9,174.8 tok/s` | **`6,555.2` / `9,471.4 tok/s`** | **+72% / +3%** |
+| **Ling-3.0-tiny** (`Q4_K_M`) | RTX 3090 (`sm_86`) | Decode `tg128` (`d=0` / `4K` / `16K`) | `241.4` / `239.2` / `220.8 tok/s` | **`383.9` / `355.2` / `294.0 tok/s`** | **+59% / +49% / +33%** |
 | **Qwen3.6-35B-A3B** (`UD-Q3_K_XL`) | P100 + GTX 1060 (`sm_60/61`) | Decode `tg128` | `38.0 tok/s` | **`53.4 tok/s`** | **+41%** |
 | **Maxwell-V1-Flash** (`Q3_K_M`) | P100 + GTX 1060 (`sm_60/61`) | Decode `tg64` | Unsupported | **`26.3 tok/s`** | — |
 | **Inkling-2-Mini** (`IQ4_NL`) | P100 + GTX 1060 (`sm_60/61`) | Decode `tg64` (asym 2-GPU) | Unsupported | **`27.7 tok/s`** | — |

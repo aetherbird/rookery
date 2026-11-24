@@ -201,7 +201,7 @@ void BailingMoe3Model::load(const std::string & gguf_path,
     const int d_inner = cfg_.n_head * cfg_.kda_head_dim;
     const int kv_dim_tot = cfg_.kv_lora_rank + cfg_.rope_dim; // 576
     const size_t mla_kv_bytes = kv_q8_0
-        ? static_cast<size_t>(cfg_.max_ctx) * (kv_dim_tot / 32) * sizeof(BlockQ8_0)
+        ? static_cast<size_t>(cfg_.max_ctx) * 640 // sizeof(MlaKv576Q8Pos) = 640B (64B-aligned SoA!)
         : static_cast<size_t>(cfg_.max_ctx) * kv_dim_tot * sizeof(uint16_t);
 
     // Parallel multi-GPU weight upload
@@ -395,7 +395,7 @@ void BailingMoe3Model::load(const std::string & gguf_path,
                 rt.d_mtp_argmax = dev_alloc<int32_t>(dev, 1);
             }
         }
-        rt.scratch_bytes = 96ULL << 20;
+        rt.scratch_bytes = 128ULL << 20;
         rt.d_scratch = dev_alloc<uint8_t>(dev, rt.scratch_bytes);
     }
 
@@ -517,10 +517,23 @@ void BailingMoe3Model::run_gpu_segment(size_t gi, int T, bool run_argmax, bool s
     auto & rt = runtimes_[gi];
     cuda_ok(cudaSetDevice(rt.device), "bailing3 seg setDevice");
 
-    const int   d_inner   = cfg_.n_head * cfg_.kda_head_dim;
     const int   qk_nope   = cfg_.qk_head_dim_mla - cfg_.rope_dim;
     const float kda_scale = 1.0f / std::sqrt(static_cast<float>(cfg_.kda_head_dim));
     const float mla_scale = 1.0f / std::sqrt(static_cast<float>(cfg_.qk_head_dim_mla));
+
+    const bool prof = (std::getenv("ROOKERY_PROFILE") != nullptr) && !use_cuda_graphs_;
+    double ms_kda_proj = 0, ms_kda_conv = 0, ms_kda_rec = 0, ms_kda_out = 0;
+    double ms_mla_proj = 0, ms_mla_prep = 0, ms_mla_attn = 0, ms_mla_out = 0;
+    double ms_dense = 0, ms_router = 0, ms_moe = 0, ms_head = 0, ms_norm = 0;
+    auto mark = [&](double & acc, auto fn) {
+        if (!prof) { fn(); return; }
+        cudaStreamSynchronize(rt.stream);
+        const auto a = std::chrono::steady_clock::now();
+        fn();
+        cudaStreamSynchronize(rt.stream);
+        const auto b = std::chrono::steady_clock::now();
+        acc += std::chrono::duration<double, std::milli>(b - a).count();
+    };
 
     if (gi == 0) {
         launch_embedding_lookup(tok_embd_, rt.d_tokens, rt.d_cur, cfg_.n_embd, 1, T, rt.stream);
@@ -534,133 +547,201 @@ void BailingMoe3Model::run_gpu_segment(size_t gi, int T, bool run_argmax, bool s
         }
     };
 
+    bool attn_norm_ready = false;
     for (int il = rt.layer_start; il < rt.layer_end; ++il) {
         const auto & L = layers_[il];
 
-        launch_rmsnorm(rt.d_cur, static_cast<const float *>(L.attn_norm.ptr), rt.d_x_norm, cfg_.n_embd, T, cfg_.rms_eps, rt.stream);
+        if (!attn_norm_ready) {
+            mark(ms_norm, [&]() {
+                launch_rmsnorm(rt.d_cur, static_cast<const float *>(L.attn_norm.ptr), rt.d_x_norm, cfg_.n_embd, T, cfg_.rms_eps, rt.stream);
+            });
+        }
+        attn_norm_ready = false;
 
         if (L.is_kda) {
-            if (T < 16) launch_quantize_q8_1(rt.d_x_norm, rt.d_scratch, cfg_.n_embd, T, rt.stream);
-            linear_preq(L.wq,       rt.d_x_norm, rt.d_kda_q);
-            linear_preq(L.wk,       rt.d_x_norm, rt.d_kda_k);
-            linear_preq(L.wv,       rt.d_x_norm, rt.d_kda_v);
-            linear_preq(L.ssm_f_a,  rt.d_x_norm, rt.d_kda_g);
-            linear_preq(L.ssm_beta, rt.d_x_norm, rt.d_kda_beta);
-            linear_preq(L.ssm_g_a,  rt.d_x_norm, rt.d_kda_gate);
+            mark(ms_kda_proj, [&]() {
+                if (T < 16) {
+                    launch_quantize_q8_1(rt.d_x_norm, rt.d_scratch, cfg_.n_embd, T, rt.stream);
+                    const DeviceTensor * ws[6] = {&L.wq, &L.wk, &L.wv, &L.ssm_f_a, &L.ssm_beta, &L.ssm_g_a};
+                    float * ys[6] = {rt.d_kda_q, rt.d_kda_k, rt.d_kda_v, rt.d_kda_g, rt.d_kda_beta, rt.d_kda_gate};
+                    const DeviceTensor * preq_ws[6];
+                    float * preq_ys[6];
+                    int n_preq = 0;
+                    for (int i = 0; i < 6; ++i) {
+                        if (ws[i]->dtype == DType::Q8_0 || is_kquant_dtype(ws[i]->dtype)) {
+                            preq_ws[n_preq] = ws[i];
+                            preq_ys[n_preq] = ys[i];
+                            ++n_preq;
+                        } else {
+                            launch_linear(rt.cublas, *ws[i], rt.d_x_norm, ys[i], T, rt.d_scratch, rt.scratch_bytes, rt.stream);
+                        }
+                    }
+                    if (n_preq > 0) {
+                        launch_linear_multi_prequant(preq_ws, preq_ys, n_preq, rt.d_scratch, T, rt.stream);
+                    }
+                } else {
+                    linear_preq(L.wq,       rt.d_x_norm, rt.d_kda_q);
+                    linear_preq(L.wk,       rt.d_x_norm, rt.d_kda_k);
+                    linear_preq(L.wv,       rt.d_x_norm, rt.d_kda_v);
+                    linear_preq(L.ssm_f_a,  rt.d_x_norm, rt.d_kda_g);
+                    linear_preq(L.ssm_beta, rt.d_x_norm, rt.d_kda_beta);
+                    linear_preq(L.ssm_g_a,  rt.d_x_norm, rt.d_kda_gate);
+                }
+            });
 
             float * cq_snap = (save_kda_snap && has_mtp_) ? kda_conv_q_snap_[il] : nullptr;
             float * ck_snap = (save_kda_snap && has_mtp_) ? kda_conv_k_snap_[il] : nullptr;
             float * cv_snap = (save_kda_snap && has_mtp_) ? kda_conv_v_snap_[il] : nullptr;
             float * st_snap = (save_kda_snap && has_mtp_) ? kda_state_snap_[il]  : nullptr;
 
-            launch_ssm_conv1d_silu(rt.d_kda_q, static_cast<const float *>(L.ssm_conv_q.ptr), kda_conv_q_[il], rt.d_kda_qc, T, d_inner, rt.stream, cq_snap);
-            launch_ssm_conv1d_silu(rt.d_kda_k, static_cast<const float *>(L.ssm_conv_k.ptr), kda_conv_k_[il], rt.d_kda_kc, T, d_inner, rt.stream, ck_snap);
-            launch_ssm_conv1d_silu(rt.d_kda_v, static_cast<const float *>(L.ssm_conv_v.ptr), kda_conv_v_[il], rt.d_kda_vc, T, d_inner, rt.stream, cv_snap);
+            mark(ms_kda_conv, [&]() {
+                launch_ssm_conv1d_silu_qkv_l2(
+                    rt.d_kda_q, rt.d_kda_k, rt.d_kda_v,
+                    static_cast<const float *>(L.ssm_conv_q.ptr),
+                    static_cast<const float *>(L.ssm_conv_k.ptr),
+                    static_cast<const float *>(L.ssm_conv_v.ptr),
+                    kda_conv_q_[il], kda_conv_k_[il], kda_conv_v_[il],
+                    rt.d_kda_qc, rt.d_kda_kc, rt.d_kda_vc,
+                    T, cfg_.n_head, cfg_.rms_eps, rt.stream, cq_snap, ck_snap, cv_snap);
+                launch_kda_gate_and_beta(
+                    rt.d_kda_g, static_cast<const float *>(L.ssm_dt_bias.ptr),
+                    static_cast<const float *>(L.ssm_a.ptr), rt.d_kda_beta,
+                    cfg_.kda_gate_lower_bound, T, cfg_.n_head, cfg_.kda_head_dim, rt.stream, /*negate_a=*/false);
+            });
 
-            launch_l2_norm_d128(rt.d_kda_qc, T, cfg_.n_head, cfg_.rms_eps, rt.stream);
-            launch_l2_norm_d128(rt.d_kda_kc, T, cfg_.n_head, cfg_.rms_eps, rt.stream);
+            mark(ms_kda_rec, [&]() {
+                launch_gated_delta_net_d128(
+                    rt.d_kda_qc, rt.d_kda_kc, rt.d_kda_vc, rt.d_kda_g, rt.d_kda_beta,
+                    kda_state_[il], rt.d_kda_out, T, cfg_.n_head, kda_scale, true, rt.stream, st_snap);
+            });
 
-            launch_kda_gate_and_beta(
-                rt.d_kda_g, static_cast<const float *>(L.ssm_dt_bias.ptr),
-                static_cast<const float *>(L.ssm_a.ptr), rt.d_kda_beta,
-                cfg_.kda_gate_lower_bound, T, cfg_.n_head, cfg_.kda_head_dim, rt.stream, /*negate_a=*/false);
-
-            launch_gated_delta_net_d128(
-                rt.d_kda_qc, rt.d_kda_kc, rt.d_kda_vc, rt.d_kda_g, rt.d_kda_beta,
-                kda_state_[il], rt.d_kda_out, T, cfg_.n_head, kda_scale, true, rt.stream, st_snap);
-
-            launch_rms_norm_sigmoid_gate_d128(rt.d_kda_out, static_cast<const float *>(L.ssm_norm.ptr),
-                                              rt.d_kda_gate, T, cfg_.n_head, cfg_.rms_eps, rt.stream);
-            launch_linear(rt.cublas, L.wo, rt.d_kda_out, rt.d_sub_out, T, rt.d_scratch, rt.scratch_bytes, rt.stream);
+            mark(ms_kda_out, [&]() {
+                launch_rms_norm_sigmoid_gate_d128(rt.d_kda_out, static_cast<const float *>(L.ssm_norm.ptr),
+                                                  rt.d_kda_gate, T, cfg_.n_head, cfg_.rms_eps, rt.stream);
+                launch_linear(rt.cublas, L.wo, rt.d_kda_out, rt.d_sub_out, T, rt.d_scratch, rt.scratch_bytes, rt.stream);
+            });
         } else {
-            if (T < 16) launch_quantize_q8_1(rt.d_x_norm, rt.d_scratch, cfg_.n_embd, T, rt.stream);
-            if (cfg_.q_lora_rank > 0) {
-                linear_preq(L.wq_a, rt.d_x_norm, rt.d_mla_qr);
-            } else {
-                linear_preq(L.wq,   rt.d_x_norm, rt.d_mla_qall);
-            }
-            linear_preq(L.wkv_a_mqa, rt.d_x_norm, rt.d_mla_kvall);
-            linear_preq(L.attn_gate, rt.d_x_norm, rt.d_mla_gate);
+            mark(ms_mla_proj, [&]() {
+                if (T < 16) launch_quantize_q8_1(rt.d_x_norm, rt.d_scratch, cfg_.n_embd, T, rt.stream);
+                if (cfg_.q_lora_rank > 0) {
+                    linear_preq(L.wq_a, rt.d_x_norm, rt.d_mla_qr);
+                } else {
+                    linear_preq(L.wq,   rt.d_x_norm, rt.d_mla_qall);
+                }
+                linear_preq(L.wkv_a_mqa, rt.d_x_norm, rt.d_mla_kvall);
+                linear_preq(L.attn_gate, rt.d_x_norm, rt.d_mla_gate);
+                if (cfg_.q_lora_rank > 0) {
+                    launch_rmsnorm(rt.d_mla_qr, static_cast<const float *>(L.attn_q_a_norm.ptr), rt.d_mla_qr, cfg_.q_lora_rank, T, cfg_.rms_eps, rt.stream);
+                    launch_linear(rt.cublas, L.wq_b, rt.d_mla_qr, rt.d_mla_qall, T, rt.d_scratch, rt.scratch_bytes, rt.stream);
+                }
+            });
 
-            if (cfg_.q_lora_rank > 0) {
-                launch_rmsnorm(rt.d_mla_qr, static_cast<const float *>(L.attn_q_a_norm.ptr), rt.d_mla_qr, cfg_.q_lora_rank, T, cfg_.rms_eps, rt.stream);
-                launch_linear(rt.cublas, L.wq_b, rt.d_mla_qr, rt.d_mla_qall, T, rt.d_scratch, rt.scratch_bytes, rt.stream);
-            }
+            mark(ms_mla_prep, [&]() {
+                launch_mla_rope_split_q(rt.d_mla_qall, rt.d_pos, rt.d_mla_qnope, rt.d_mla_qpe,
+                                        T, cfg_.n_head, qk_nope, cfg_.rope_dim, cfg_.rope_freq_base, rt.stream);
+                launch_mla_kv_norm_rope_write_576(rt.d_mla_kvall, static_cast<const float *>(L.attn_kv_a_norm.ptr),
+                                                  rt.d_pos, mla_kv_cache_[il], cfg_.kv_q8_0,
+                                                  T, cfg_.rms_eps, cfg_.rope_freq_base, rt.stream);
+                launch_batched_head_proj_f16(L.wk_b, rt.d_mla_qnope, rt.d_mla_qabs, T, rt.stream, rt.cublas, rt.d_scratch, rt.scratch_bytes);
+                launch_mla_concat_q576(rt.d_mla_qabs, rt.d_mla_qpe, rt.d_mla_q576, T, cfg_.n_head, rt.stream);
+            });
 
-            launch_mla_rope_split_q(rt.d_mla_qall, rt.d_pos, rt.d_mla_qnope, rt.d_mla_qpe,
-                                    T, cfg_.n_head, qk_nope, cfg_.rope_dim, cfg_.rope_freq_base, rt.stream);
-            launch_mla_kv_norm_rope_write_576(rt.d_mla_kvall, static_cast<const float *>(L.attn_kv_a_norm.ptr),
-                                              rt.d_pos, mla_kv_cache_[il], cfg_.kv_q8_0,
-                                              T, cfg_.rms_eps, cfg_.rope_freq_base, rt.stream);
+            mark(ms_mla_attn, [&]() {
+                launch_mla_attn_d576_v512(rt.d_mla_q576, mla_kv_cache_[il], cfg_.kv_q8_0,
+                                          rt.d_pos, rt.d_mla_olat, rt.d_scratch, T, cfg_.n_head, mla_scale, rt.stream,
+                                          rt.cublas, rt.scratch_bytes, kv_len_max);
+            });
 
-            launch_batched_head_proj_f16(L.wk_b, rt.d_mla_qnope, rt.d_mla_qabs, T, rt.stream, rt.cublas, rt.d_scratch, rt.scratch_bytes);
-            launch_mla_concat_q576(rt.d_mla_qabs, rt.d_mla_qpe, rt.d_mla_q576, T, cfg_.n_head, rt.stream);
-
-            launch_mla_attn_d576_v512(rt.d_mla_q576, mla_kv_cache_[il], cfg_.kv_q8_0,
-                                      rt.d_pos, rt.d_mla_olat, rt.d_scratch, T, cfg_.n_head, mla_scale, rt.stream,
-                                      rt.cublas, rt.scratch_bytes, kv_len_max);
-
-            launch_batched_head_proj_f16(L.wv_b, rt.d_mla_olat, rt.d_mla_o, T, rt.stream, rt.cublas, rt.d_scratch, rt.scratch_bytes);
-            launch_mla_head_sigmoid_gate(rt.d_mla_o, rt.d_mla_gate, T, cfg_.n_head, cfg_.v_head_dim_mla, rt.stream);
-            launch_linear(rt.cublas, L.wo, rt.d_mla_o, rt.d_sub_out, T, rt.d_scratch, rt.scratch_bytes, rt.stream);
+            mark(ms_mla_out, [&]() {
+                launch_batched_head_proj_f16(L.wv_b, rt.d_mla_olat, rt.d_mla_o, T, rt.stream, rt.cublas, rt.d_scratch, rt.scratch_bytes);
+                launch_mla_head_sigmoid_gate(rt.d_mla_o, rt.d_mla_gate, T, cfg_.n_head, cfg_.v_head_dim_mla, rt.stream);
+                launch_linear(rt.cublas, L.wo, rt.d_mla_o, rt.d_sub_out, T, rt.d_scratch, rt.scratch_bytes, rt.stream);
+            });
         }
 
-        launch_add_inplace(rt.d_cur, rt.d_sub_out, static_cast<int64_t>(T) * cfg_.n_embd, rt.stream);
-        launch_rmsnorm(rt.d_cur, static_cast<const float *>(L.ffn_norm.ptr), rt.d_x_norm, cfg_.n_embd, T, cfg_.rms_eps, rt.stream);
+        mark(ms_norm, [&]() {
+            launch_add_rmsnorm(rt.d_cur, rt.d_sub_out, static_cast<const float *>(L.ffn_norm.ptr), rt.d_x_norm, cfg_.n_embd, T, cfg_.rms_eps, rt.stream);
+        });
 
         if (il < cfg_.n_dense_lead) {
-            if (T < 16) launch_quantize_q8_1(rt.d_x_norm, rt.d_scratch, cfg_.n_embd, T, rt.stream);
-            linear_preq(L.ffn_gate, rt.d_x_norm, rt.d_ffn_g);
-            linear_preq(L.ffn_up,   rt.d_x_norm, rt.d_ffn_u);
-            launch_silu_mul(rt.d_ffn_g, rt.d_ffn_u, rt.d_ffn_g, static_cast<int64_t>(T) * cfg_.n_ff_dense, rt.stream);
-            launch_linear(rt.cublas, L.ffn_down, rt.d_ffn_g, rt.d_sub_out, T, rt.d_scratch, rt.scratch_bytes, rt.stream);
+            mark(ms_dense, [&]() {
+                if (T < 16) launch_quantize_q8_1(rt.d_x_norm, rt.d_scratch, cfg_.n_embd, T, rt.stream);
+                linear_preq(L.ffn_gate, rt.d_x_norm, rt.d_ffn_g);
+                linear_preq(L.ffn_up,   rt.d_x_norm, rt.d_ffn_u);
+                launch_silu_mul(rt.d_ffn_g, rt.d_ffn_u, rt.d_ffn_g, static_cast<int64_t>(T) * cfg_.n_ff_dense, rt.stream);
+                launch_linear(rt.cublas, L.ffn_down, rt.d_ffn_g, rt.d_sub_out, T, rt.d_scratch, rt.scratch_bytes, rt.stream);
+            });
         } else {
-            launch_linear(rt.cublas, L.ffn_gate_inp, rt.d_x_norm, rt.d_router, T, rt.d_scratch, rt.scratch_bytes, rt.stream);
-            launch_moe_route_sigmoid(
-                rt.d_router, static_cast<const float *>(L.ffn_exp_probs_b.ptr),
-                rt.d_top_ids, rt.d_top_w,
-                T, cfg_.n_expert, cfg_.n_expert_used, cfg_.expert_weights_norm, cfg_.expert_weights_scale,
-                rt.stream, cfg_.n_expert_groups, cfg_.n_group_used);
-            const float c_exp = (il < static_cast<int>(cfg_.swiglu_clamp_exp.size())) ? cfg_.swiglu_clamp_exp[il] : 0.0f;
-            const float c_sh  = (il < static_cast<int>(cfg_.swiglu_clamp_shexp.size())) ? cfg_.swiglu_clamp_shexp[il] : 0.0f;
-            launch_moe_ffn_kquant_with_shared(
-                rt.cublas,
-                L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps,
-                L.ffn_gate_shexp, L.ffn_up_shexp, L.ffn_down_shexp,
-                rt.d_x_norm, rt.d_top_ids, rt.d_top_w, rt.d_sub_out,
-                rt.d_scratch, rt.scratch_bytes, T, cfg_.n_expert_used, c_exp, c_sh, rt.stream);
+            mark(ms_router, [&]() {
+                launch_linear(rt.cublas, L.ffn_gate_inp, rt.d_x_norm, rt.d_router, T, rt.d_scratch, rt.scratch_bytes, rt.stream);
+                launch_moe_route_sigmoid(
+                    rt.d_router, static_cast<const float *>(L.ffn_exp_probs_b.ptr),
+                    rt.d_top_ids, rt.d_top_w,
+                    T, cfg_.n_expert, cfg_.n_expert_used, cfg_.expert_weights_norm, cfg_.expert_weights_scale,
+                    rt.stream, cfg_.n_expert_groups, cfg_.n_group_used);
+            });
+            mark(ms_moe, [&]() {
+                const float c_exp = (il < static_cast<int>(cfg_.swiglu_clamp_exp.size())) ? cfg_.swiglu_clamp_exp[il] : 0.0f;
+                const float c_sh  = (il < static_cast<int>(cfg_.swiglu_clamp_shexp.size())) ? cfg_.swiglu_clamp_shexp[il] : 0.0f;
+                launch_moe_ffn_kquant_with_shared(
+                    rt.cublas,
+                    L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps,
+                    L.ffn_gate_shexp, L.ffn_up_shexp, L.ffn_down_shexp,
+                    rt.d_x_norm, rt.d_top_ids, rt.d_top_w, rt.d_sub_out,
+                    rt.d_scratch, rt.scratch_bytes, T, cfg_.n_expert_used, c_exp, c_sh, rt.stream);
+            });
         }
 
-        launch_add_inplace(rt.d_cur, rt.d_sub_out, static_cast<int64_t>(T) * cfg_.n_embd, rt.stream);
-
-        if (hook_ != nullptr) {
-            hook_->on_post_layer(il, rt.device, rt.d_cur, T, cfg_.n_embd, 1, rt.stream);
+        if (hook_ == nullptr && il + 1 < rt.layer_end) {
+            mark(ms_norm, [&]() {
+                launch_add_rmsnorm(rt.d_cur, rt.d_sub_out, static_cast<const float *>(layers_[il + 1].attn_norm.ptr),
+                                   rt.d_x_norm, cfg_.n_embd, T, cfg_.rms_eps, rt.stream);
+            });
+            attn_norm_ready = true;
+        } else {
+            mark(ms_norm, [&]() {
+                launch_add_inplace(rt.d_cur, rt.d_sub_out, static_cast<int64_t>(T) * cfg_.n_embd, rt.stream);
+            });
+            if (hook_ != nullptr) {
+                hook_->on_post_layer(il, rt.device, rt.d_cur, T, cfg_.n_embd, 1, rt.stream);
+            }
         }
     }
 
     if (gi + 1 == runtimes_.size()) {
-        if (has_mtp_) {
-            // Save post-output_norm hidden state for ALL T tokens (exact match to bailingmoe3.cpp:407!)
-            launch_rmsnorm(rt.d_cur, static_cast<const float *>(output_norm_.ptr),
-                           rt.d_h_nextn, cfg_.n_embd, T, cfg_.rms_eps, rt.stream);
-            if (T == 2 && run_argmax) {
-                launch_linear(rt.cublas, output_, rt.d_h_nextn, rt.d_logits, 2, rt.d_scratch, rt.scratch_bytes, rt.stream);
-                launch_argmax_f32_batch(rt.d_logits, rt.d_argmax, cfg_.n_vocab, 2, rt.stream);
+        mark(ms_head, [&]() {
+            if (has_mtp_) {
+                launch_rmsnorm(rt.d_cur, static_cast<const float *>(output_norm_.ptr),
+                               rt.d_h_nextn, cfg_.n_embd, T, cfg_.rms_eps, rt.stream);
+                if (T == 2 && run_argmax) {
+                    launch_linear(rt.cublas, output_, rt.d_h_nextn, rt.d_logits, 2, rt.d_scratch, rt.scratch_bytes, rt.stream);
+                    launch_argmax_f32_batch(rt.d_logits, rt.d_argmax, cfg_.n_vocab, 2, rt.stream);
+                } else {
+                    const float * last_h = rt.d_h_nextn + static_cast<size_t>(T - 1) * cfg_.n_embd;
+                    launch_linear(rt.cublas, output_, last_h, rt.d_logits, 1, rt.d_scratch, rt.scratch_bytes, rt.stream);
+                    if (run_argmax) {
+                        launch_argmax_f32_batch(rt.d_logits, rt.d_argmax, cfg_.n_vocab, 1, rt.stream);
+                    }
+                }
             } else {
-                const float * last_h = rt.d_h_nextn + static_cast<size_t>(T - 1) * cfg_.n_embd;
-                launch_linear(rt.cublas, output_, last_h, rt.d_logits, 1, rt.d_scratch, rt.scratch_bytes, rt.stream);
+                const float * last_h = rt.d_cur + static_cast<size_t>(T - 1) * cfg_.n_embd;
+                launch_rmsnorm(last_h, static_cast<const float *>(output_norm_.ptr), rt.d_x_norm, cfg_.n_embd, 1, cfg_.rms_eps, rt.stream);
+                launch_linear(rt.cublas, output_, rt.d_x_norm, rt.d_logits, 1, rt.d_scratch, rt.scratch_bytes, rt.stream);
                 if (run_argmax) {
                     launch_argmax_f32_batch(rt.d_logits, rt.d_argmax, cfg_.n_vocab, 1, rt.stream);
                 }
             }
-        } else {
-            const float * last_h = rt.d_cur + static_cast<size_t>(T - 1) * cfg_.n_embd;
-            launch_rmsnorm(last_h, static_cast<const float *>(output_norm_.ptr), rt.d_x_norm, cfg_.n_embd, 1, cfg_.rms_eps, rt.stream);
-            launch_linear(rt.cublas, output_, rt.d_x_norm, rt.d_logits, 1, rt.d_scratch, rt.scratch_bytes, rt.stream);
-            if (run_argmax) {
-                launch_argmax_f32_batch(rt.d_logits, rt.d_argmax, cfg_.n_vocab, 1, rt.stream);
-            }
-        }
+        });
+    }
+    if (prof) {
+        const double tot = ms_norm + ms_kda_proj + ms_kda_conv + ms_kda_rec + ms_kda_out +
+                           ms_mla_proj + ms_mla_prep + ms_mla_attn + ms_mla_out +
+                           ms_dense + ms_router + ms_moe + ms_head;
+        std::printf("  [PROF GPU%d T=%d L%d..%d] norm=%.2f kda(p=%.2f c=%.2f r=%.2f o=%.2f) mla(p=%.2f pr=%.2f a=%.2f o=%.2f) dense=%.2f rtr=%.2f moe=%.2f head=%.2f | tot=%.2f ms\n",
+                    rt.device, T, rt.layer_start, rt.layer_end, ms_norm,
+                    ms_kda_proj, ms_kda_conv, ms_kda_rec, ms_kda_out,
+                    ms_mla_proj, ms_mla_prep, ms_mla_attn, ms_mla_out,
+                    ms_dense, ms_router, ms_moe, ms_head, tot);
     }
 }
 

@@ -1,6 +1,7 @@
 #include "core/device.h"
 #include "kernels/kernels.h"
 #include "kernels/q8_1_act.cuh"
+#include "kernels/q8_1_act.cuh"
 
 #include <cuda_fp16.h>
 #include <cfloat>
@@ -999,6 +1000,15 @@ void launch_mla_attn_d512(
 // ============================================================================
 namespace {
 
+// 64-byte-aligned SoA-per-position Q8_0 MLA KV entry (640 B/pos = 10 cache lines):
+// qs[576] = 36 contiguous int4 (100% coalesced LDG.128!), d[18] = FP16 block scales!
+struct alignas(64) MlaKv576Q8Pos {
+    int8_t   qs[576];
+    uint16_t d[18];
+    uint16_t pad[14];
+};
+static_assert(sizeof(MlaKv576Q8Pos) == 640, "MlaKv576Q8Pos must be 640 bytes");
+
 __global__ void mla_rope_split_q_kernel(
     const float * __restrict__ q_all,   // [T, n_heads, qk_nope + rope_dim]
     const int32_t * __restrict__ pos,   // [T]
@@ -1080,8 +1090,8 @@ __global__ void mla_kv_norm_rope_write_576_kernel(
 
     const int p = pos[t];
     if constexpr (KV_Q8_0) {
-        // 18 Q8_0 blocks (576 / 32 = 18), 8 warps loop over blocks
-        BlockQ8_0 * dst = static_cast<BlockQ8_0 *>(kv_cache) + static_cast<size_t>(p) * 18;
+        // 18 Q8_0 blocks (576 / 32 = 18) stored in 64B-aligned MlaKv576Q8Pos!
+        MlaKv576Q8Pos & dst = static_cast<MlaKv576Q8Pos *>(kv_cache)[p];
         for (int b = warp; b < 18; b += 8) {
             const float v = s_buf[b * 32 + lane];
             const float amax = __shfl_sync(0xffffffffu, warp_max(fabsf(v)), 0);
@@ -1089,9 +1099,9 @@ __global__ void mla_kv_norm_rope_write_576_kernel(
             const float inv_d = (d > 0.0f) ? (127.0f / amax) : 0.0f;
             if (lane == 0) {
                 __half dh = __float2half_rn(d);
-                dst[b].d = *reinterpret_cast<uint16_t *>(&dh);
+                dst.d[b] = *reinterpret_cast<uint16_t *>(&dh);
             }
-            dst[b].qs[lane] = static_cast<int8_t>(__float2int_rn(v * inv_d));
+            dst.qs[b * 32 + lane] = static_cast<int8_t>(__float2int_rn(v * inv_d));
         }
     } else {
         __half * dst = static_cast<__half *>(kv_cache) + static_cast<size_t>(p) * 576;
@@ -1168,13 +1178,21 @@ __global__ void mla_dequant_kv576_tile_kernel(
     if constexpr (KV_Q8_0) {
         const int lane = tid & 31;
         const int warp = tid >> 5;
-        const BlockQ8_0 * kb = static_cast<const BlockQ8_0 *>(kv_cache) + static_cast<size_t>(p) * 18;
+        const MlaKv576Q8Pos & kv = static_cast<const MlaKv576Q8Pos *>(kv_cache)[p];
         for (int b = warp; b < 18; b += 8) {
             __half dh;
-            *reinterpret_cast<uint16_t *>(&dh) = __ldg(&kb[b].d);
-            const float val = __half2float(dh) * static_cast<float>(kb[b].qs[lane]);
-            if constexpr (std::is_same_v<OutT, __half>) dst[b * 32 + lane] = __float2half_rn(val);
-            else dst[b * 32 + lane] = val;
+            *reinterpret_cast<uint16_t *>(&dh) = __ldg(&kv.d[b]);
+            const float sc = __half2float(dh);
+            if constexpr (std::is_same_v<OutT, __half>) {
+                if (lane < 16) {
+                    const uint16_t q2 = __ldg(&reinterpret_cast<const uint16_t *>(kv.qs + b * 32)[lane]);
+                    const float v0 = sc * static_cast<float>(static_cast<int8_t>(q2 & 0xFFu));
+                    const float v1 = sc * static_cast<float>(static_cast<int8_t>(q2 >> 8));
+                    reinterpret_cast<__half2 *>(dst + b * 32)[lane] = __float22half2_rn(make_float2(v0, v1));
+                }
+            } else {
+                dst[b * 32 + lane] = sc * static_cast<float>(__ldg(&kv.qs[b * 32 + lane]));
+            }
         }
     } else {
         const __half * src = static_cast<const __half *>(kv_cache) + static_cast<size_t>(p) * 576;
@@ -1183,6 +1201,381 @@ __global__ void mla_dequant_kv576_tile_kernel(
             else dst[i] = __half2float(src[i]);
         }
     }
+}
+
+// Ultra-fast Coalesced LDG.128 Q8_0 dp4a + Tile-Softmax Split-K RoPE-576 MLA Decode!
+// - Loads P_TILE=8 MlaKv576Q8Pos structs via 100% coalesced int4 LDG.128 (zero bank conflicts!)
+// - Rescales ov[0..15] ONCE per 8-token tile (8x fewer expf & alpha rescales + tile sparsity skip!)
+template <int SPLITS, int H_PER_BLK>
+__global__ __launch_bounds__(512) void mla_mqa_d576_q8_dp4a_decode_kernel(
+    const float *   __restrict__ q576,     // [T, n_heads, 576]
+    const void *    __restrict__ kv_cache, // [max_ctx] MlaKv576Q8Pos
+    const int32_t * __restrict__ pos,      // [T]
+    float *         __restrict__ part_m,   // [T, n_heads, SPLITS]
+    float *         __restrict__ part_l,   // [T, n_heads, SPLITS]
+    float *         __restrict__ part_o,   // [T, n_heads, SPLITS, 512]
+    int n_heads, float scale) {
+
+    constexpr int P_TILE = 8;
+    __shared__ int32_t s_kv_qs[P_TILE][18][8]; // 4,608 B = 288 int4
+    __shared__ float   s_kv_d[P_TILE][18];     //   576 B -> 5.2 KB total!
+
+    const int h0   = blockIdx.x * H_PER_BLK;
+    const int s    = blockIdx.y;
+    const int t    = blockIdx.z;
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    const int tid  = warp * 32 + lane;
+    const int nthr = H_PER_BLK * 32;
+    const int h    = h0 + warp;
+    const bool valid_h = (h < n_heads);
+
+    const int kv_len = pos[t] + 1;
+    const int chunk  = (kv_len + SPLITS - 1) / SPLITS;
+    const int p0     = s * chunk;
+    const int p1     = (p0 + chunk < kv_len) ? (p0 + chunk) : kv_len;
+
+    const int grp = lane >> 3; // 0..3
+    const int sub = lane & 7;  // 0..7
+
+    int32_t q_i32[5] = {0, 0, 0, 0, 0};
+    float   q_d[5]   = {0, 0, 0, 0, 0};
+    if (valid_h) {
+        const float * qp = q576 + (static_cast<size_t>(t) * n_heads + h) * 576;
+        #pragma unroll
+        for (int k = 0; k < 5; ++k) {
+            const int b = grp + 4 * k;
+            float x0 = 0.0f, x1 = 0.0f, x2 = 0.0f, x3 = 0.0f;
+            if (b < 18) {
+                const float4 qv = __ldg(reinterpret_cast<const float4 *>(qp + b * 32 + sub * 4));
+                x0 = qv.x * scale; x1 = qv.y * scale; x2 = qv.z * scale; x3 = qv.w * scale;
+            }
+            float am = fmaxf(fmaxf(fabsf(x0), fabsf(x1)), fmaxf(fabsf(x2), fabsf(x3)));
+            am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, 4));
+            am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, 2));
+            am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, 1));
+            if (b < 18) {
+                const float d = am * (1.0f / 127.0f);
+                const float inv_d = (d > 0.0f) ? (127.0f / am) : 0.0f;
+                q_d[k] = d;
+                const uint32_t b0 = static_cast<uint8_t>(static_cast<int8_t>(__float2int_rn(x0 * inv_d)));
+                const uint32_t b1 = static_cast<uint8_t>(static_cast<int8_t>(__float2int_rn(x1 * inv_d)));
+                const uint32_t b2 = static_cast<uint8_t>(static_cast<int8_t>(__float2int_rn(x2 * inv_d)));
+                const uint32_t b3 = static_cast<uint8_t>(static_cast<int8_t>(__float2int_rn(x3 * inv_d)));
+                q_i32[k] = static_cast<int32_t>(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
+            }
+        }
+    }
+
+    float m_i = -FLT_MAX;
+    float l_i = 0.0f;
+    float ov[16] = {0};
+
+    const MlaKv576Q8Pos * kv_base = static_cast<const MlaKv576Q8Pos *>(kv_cache);
+    int4 * s_qs_i4 = reinterpret_cast<int4 *>(s_kv_qs);
+
+    for (int p = p0; p < p1; p += P_TILE) {
+        const int n_p    = (p + P_TILE < p1) ? P_TILE : (p1 - p);
+        const int tot_i4 = n_p * 36;
+        for (int idx = tid; idx < tot_i4; idx += nthr) {
+            const int pi = (idx * 1821) >> 16; // exact idx / 36 for 0 <= idx < 288
+            const int c  = idx - pi * 36;
+            s_qs_i4[idx] = __ldg(&reinterpret_cast<const int4 *>(kv_base[p + pi].qs)[c]);
+        }
+        const int tot_d = n_p * 18;
+        for (int idx = tid; idx < tot_d; idx += nthr) {
+            const int pi = (idx * 3641) >> 16;
+            const int b  = idx - pi * 18;
+            __half dh;
+            *reinterpret_cast<uint16_t *>(&dh) = __ldg(&kv_base[p + pi].d[b]);
+            s_kv_d[pi][b] = __half2float(dh);
+        }
+        __syncthreads();
+
+        if (valid_h) {
+            float scores[P_TILE];
+            float m_tile = -FLT_MAX;
+            #pragma unroll
+            for (int pi = 0; pi < P_TILE; ++pi) {
+                if (pi < n_p) {
+                    float dot = 0.0f;
+                    #pragma unroll
+                    for (int k = 0; k < 5; ++k) {
+                        const int b = grp + 4 * k;
+                        if (b < 18) {
+                            const int dp = dp4a_s32(q_i32[k], s_kv_qs[pi][b][sub], 0);
+                            dot += (q_d[k] * s_kv_d[pi][b]) * static_cast<float>(dp);
+                        }
+                    }
+                    dot = warp_sum(dot);
+                    const float sc = __shfl_sync(0xffffffffu, dot, 0);
+                    scores[pi] = sc;
+                    m_tile = fmaxf(m_tile, sc);
+                } else {
+                    scores[pi] = -FLT_MAX;
+                }
+            }
+
+            if (m_tile > m_i - 20.0f) {
+                const float m_new = fmaxf(m_i, m_tile);
+                const float alpha = (m_i == -FLT_MAX) ? 0.0f : expf(m_i - m_new);
+                l_i *= alpha;
+                #pragma unroll
+                for (int i = 0; i < 16; ++i) ov[i] *= alpha;
+
+                #pragma unroll
+                for (int pi = 0; pi < P_TILE; ++pi) {
+                    const float sc = scores[pi];
+                    if (sc > m_new - 18.0f) {
+                        const float beta = expf(sc - m_new);
+                        l_i += beta;
+                        #pragma unroll
+                        for (int k = 0; k < 4; ++k) {
+                            const int b = grp + 4 * k;
+                            const int32_t k4 = s_kv_qs[pi][b][sub];
+                            const float c = beta * s_kv_d[pi][b];
+                            ov[k * 4 + 0] += c * static_cast<float>(static_cast<int8_t>(k4));
+                            ov[k * 4 + 1] += c * static_cast<float>(static_cast<int8_t>(k4 >> 8));
+                            ov[k * 4 + 2] += c * static_cast<float>(static_cast<int8_t>(k4 >> 16));
+                            ov[k * 4 + 3] += c * static_cast<float>(static_cast<int8_t>(k4 >> 24));
+                        }
+                    }
+                }
+                m_i = m_new;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (valid_h) {
+        const size_t slot = (static_cast<size_t>(t) * n_heads + h) * SPLITS + s;
+        if (lane == 0) {
+            part_m[slot] = m_i;
+            part_l[slot] = l_i;
+        }
+        float * op = part_o + slot * 512;
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int b = grp + 4 * k;
+            *reinterpret_cast<float4 *>(op + b * 32 + sub * 4) =
+                make_float4(ov[k * 4 + 0], ov[k * 4 + 1], ov[k * 4 + 2], ov[k * 4 + 3]);
+        }
+    }
+}
+
+// Joint T=2 MTP Coalesced LDG.128 Q8_0 dp4a + Tile-Softmax Split-K RoPE-576 MLA Decode!
+template <int SPLITS>
+__global__ __launch_bounds__(512) void mla_mqa_d576_q8_dp4a_decode_t2_kernel(
+    const float *   __restrict__ q576,     // [2, n_heads, 576]
+    const void *    __restrict__ kv_cache, // [max_ctx] MlaKv576Q8Pos
+    const int32_t * __restrict__ pos,      // [2]
+    float *         __restrict__ part_m,   // [2, n_heads, SPLITS]
+    float *         __restrict__ part_l,   // [2, n_heads, SPLITS]
+    float *         __restrict__ part_o,   // [2, n_heads, SPLITS, 512]
+    int n_heads, float scale) {
+
+    constexpr int H_PER_BLK = 8;
+    constexpr int P_TILE    = 8;
+    __shared__ int32_t s_kv_qs[P_TILE][18][8];
+    __shared__ float   s_kv_d[P_TILE][18];
+
+    const int h0   = blockIdx.x * H_PER_BLK;
+    const int s    = blockIdx.y;
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    const int tid  = warp * 32 + lane;
+    const int t    = warp >> 3;
+    const int h    = h0 + (warp & 7);
+    const bool valid_h = (h < n_heads);
+
+    const int kv_len_0 = pos[0] + 1;
+    const int kv_len_1 = pos[1] + 1;
+    const int kv_max   = (kv_len_1 > kv_len_0) ? kv_len_1 : kv_len_0;
+    const int my_kv    = (t == 0) ? kv_len_0 : kv_len_1;
+
+    const int chunk = (kv_max + SPLITS - 1) / SPLITS;
+    const int p0    = s * chunk;
+    const int p1    = (p0 + chunk < kv_max) ? (p0 + chunk) : kv_max;
+
+    const int grp = lane >> 3;
+    const int sub = lane & 7;
+
+    int32_t q_i32[5] = {0, 0, 0, 0, 0};
+    float   q_d[5]   = {0, 0, 0, 0, 0};
+    if (valid_h) {
+        const float * qp = q576 + (static_cast<size_t>(t) * n_heads + h) * 576;
+        #pragma unroll
+        for (int k = 0; k < 5; ++k) {
+            const int b = grp + 4 * k;
+            float x0 = 0.0f, x1 = 0.0f, x2 = 0.0f, x3 = 0.0f;
+            if (b < 18) {
+                const float4 qv = __ldg(reinterpret_cast<const float4 *>(qp + b * 32 + sub * 4));
+                x0 = qv.x * scale; x1 = qv.y * scale; x2 = qv.z * scale; x3 = qv.w * scale;
+            }
+            float am = fmaxf(fmaxf(fabsf(x0), fabsf(x1)), fmaxf(fabsf(x2), fabsf(x3)));
+            am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, 4));
+            am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, 2));
+            am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, 1));
+            if (b < 18) {
+                const float d = am * (1.0f / 127.0f);
+                const float inv_d = (d > 0.0f) ? (127.0f / am) : 0.0f;
+                q_d[k] = d;
+                const uint32_t b0 = static_cast<uint8_t>(static_cast<int8_t>(__float2int_rn(x0 * inv_d)));
+                const uint32_t b1 = static_cast<uint8_t>(static_cast<int8_t>(__float2int_rn(x1 * inv_d)));
+                const uint32_t b2 = static_cast<uint8_t>(static_cast<int8_t>(__float2int_rn(x2 * inv_d)));
+                const uint32_t b3 = static_cast<uint8_t>(static_cast<int8_t>(__float2int_rn(x3 * inv_d)));
+                q_i32[k] = static_cast<int32_t>(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
+            }
+        }
+    }
+
+    float m_i = -FLT_MAX;
+    float l_i = 0.0f;
+    float ov[16] = {0};
+
+    const MlaKv576Q8Pos * kv_base = static_cast<const MlaKv576Q8Pos *>(kv_cache);
+    int4 * s_qs_i4 = reinterpret_cast<int4 *>(s_kv_qs);
+
+    for (int p = p0; p < p1; p += P_TILE) {
+        const int n_p    = (p + P_TILE < p1) ? P_TILE : (p1 - p);
+        const int tot_i4 = n_p * 36;
+        if (tid < tot_i4) {
+            const int pi = (tid * 1821) >> 16;
+            const int c  = tid - pi * 36;
+            s_qs_i4[tid] = __ldg(&reinterpret_cast<const int4 *>(kv_base[p + pi].qs)[c]);
+        }
+        const int tot_d = n_p * 18;
+        if (tid < tot_d) {
+            const int pi = (tid * 3641) >> 16;
+            const int b  = tid - pi * 18;
+            __half dh;
+            *reinterpret_cast<uint16_t *>(&dh) = __ldg(&kv_base[p + pi].d[b]);
+            s_kv_d[pi][b] = __half2float(dh);
+        }
+        __syncthreads();
+
+        if (valid_h) {
+            float scores[P_TILE];
+            float m_tile = -FLT_MAX;
+            #pragma unroll
+            for (int pi = 0; pi < P_TILE; ++pi) {
+                if (pi < n_p && (p + pi) < my_kv) {
+                    float dot = 0.0f;
+                    #pragma unroll
+                    for (int k = 0; k < 5; ++k) {
+                        const int b = grp + 4 * k;
+                        if (b < 18) {
+                            const int dp = dp4a_s32(q_i32[k], s_kv_qs[pi][b][sub], 0);
+                            dot += (q_d[k] * s_kv_d[pi][b]) * static_cast<float>(dp);
+                        }
+                    }
+                    dot = warp_sum(dot);
+                    const float sc = __shfl_sync(0xffffffffu, dot, 0);
+                    scores[pi] = sc;
+                    m_tile = fmaxf(m_tile, sc);
+                } else {
+                    scores[pi] = -FLT_MAX;
+                }
+            }
+
+            if (m_tile > m_i - 20.0f) {
+                const float m_new = fmaxf(m_i, m_tile);
+                const float alpha = (m_i == -FLT_MAX) ? 0.0f : expf(m_i - m_new);
+                l_i *= alpha;
+                #pragma unroll
+                for (int i = 0; i < 16; ++i) ov[i] *= alpha;
+
+                #pragma unroll
+                for (int pi = 0; pi < P_TILE; ++pi) {
+                    const float sc = scores[pi];
+                    if (sc > m_new - 18.0f) {
+                        const float beta = expf(sc - m_new);
+                        l_i += beta;
+                        #pragma unroll
+                        for (int k = 0; k < 4; ++k) {
+                            const int b = grp + 4 * k;
+                            const int32_t k4 = s_kv_qs[pi][b][sub];
+                            const float c = beta * s_kv_d[pi][b];
+                            ov[k * 4 + 0] += c * static_cast<float>(static_cast<int8_t>(k4));
+                            ov[k * 4 + 1] += c * static_cast<float>(static_cast<int8_t>(k4 >> 8));
+                            ov[k * 4 + 2] += c * static_cast<float>(static_cast<int8_t>(k4 >> 16));
+                            ov[k * 4 + 3] += c * static_cast<float>(static_cast<int8_t>(k4 >> 24));
+                        }
+                    }
+                }
+                m_i = m_new;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (valid_h) {
+        const size_t slot = (static_cast<size_t>(t) * n_heads + h) * SPLITS + s;
+        if (lane == 0) {
+            part_m[slot] = m_i;
+            part_l[slot] = l_i;
+        }
+        float * op = part_o + slot * 512;
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int b = grp + 4 * k;
+            *reinterpret_cast<float4 *>(op + b * 32 + sub * 4) =
+                make_float4(ov[k * 4 + 0], ov[k * 4 + 1], ov[k * 4 + 2], ov[k * 4 + 3]);
+        }
+    }
+}
+
+// Fast 4-warp (128 thr x float4 = 512 dims) coalesced Split-K MLA reduction!
+template <int SPLITS>
+__global__ void mla_mqa_d512_reduce_fast_kernel(
+    const float * __restrict__ part_m,
+    const float * __restrict__ part_l,
+    const float * __restrict__ part_o,
+    float *       __restrict__ out,
+    int n_heads) {
+
+    __shared__ float s_w[SPLITS];
+    __shared__ float s_inv_l;
+
+    const int h   = blockIdx.x;
+    const int t   = blockIdx.y;
+    const int tid = threadIdx.x; // 0..127 -> 128 float4 = 512 floats!
+    const size_t base = (static_cast<size_t>(t) * n_heads + h) * SPLITS;
+
+    if (tid == 0) {
+        float m_max = -FLT_MAX;
+        for (int s = 0; s < SPLITS; ++s) {
+            if (part_l[base + s] > 0.0f) m_max = fmaxf(m_max, part_m[base + s]);
+        }
+        float l_tot = 0.0f;
+        for (int s = 0; s < SPLITS; ++s) {
+            const float ls = part_l[base + s];
+            if (ls > 0.0f) {
+                const float w = expf(part_m[base + s] - m_max);
+                s_w[s] = w;
+                l_tot += ls * w;
+            } else {
+                s_w[s] = 0.0f;
+            }
+        }
+        s_inv_l = (l_tot > 0.0f) ? (1.0f / l_tot) : 0.0f;
+    }
+    __syncthreads();
+
+    float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    for (int s = 0; s < SPLITS; ++s) {
+        const float w = s_w[s];
+        if (w > 0.0f) {
+            const float4 v = reinterpret_cast<const float4 *>(part_o + (base + s) * 512)[tid];
+            acc.x += v.x * w;
+            acc.y += v.y * w;
+            acc.z += v.z * w;
+            acc.w += v.w * w;
+        }
+    }
+    const float inv_l = s_inv_l;
+    reinterpret_cast<float4 *>(out + (static_cast<size_t>(t) * n_heads + h) * 512)[tid] =
+        make_float4(acc.x * inv_l, acc.y * inv_l, acc.z * inv_l, acc.w * inv_l);
 }
 
 // Zero-bank-conflict stride-32 Multi-Head-Shared Split-K RoPE-576 MLA Decode (P_TILE=8, H_PER_BLK=16)
@@ -1530,77 +1923,120 @@ void launch_mla_attn_d576_v512(
     int T, int n_heads, float scale, cudaStream_t stream,
     cublasHandle_t cublas, size_t scratch_bytes, int kv_len_max) {
 
-    // Fast Tiled FlashMLA Prefill (T >= 8): FP16 Tensor Core (Q576 @ K576^T -> P @ V512!)
+    // Fast Tiled FlashMLA Prefill (T >= 8): FP16 Tensor Core with large K_TILE (up to 2048 -> 4x less O DRAM!)
     if (T >= 8 && cublas != nullptr && kv_len_max > 0 && device_has_tensor_cores(-1)) {
-        const int M = T * n_heads;
         auto align256 = [](size_t n) { return (n + 255) & ~size_t(255); };
-        constexpr int K_TILE = 512;
-        const size_t q16_b = align256(static_cast<size_t>(M) * 576 * sizeof(__half));
+        const int K_TILE = (kv_len_max > 2048) ? 2048 : ((kv_len_max > 512) ? 1024 : 512);
+        // Pick largest t_slice <= T whose scratch (q16 + k16 + s32 + p16 + m + l) fits in scratch_bytes!
         const size_t k16_b = align256(static_cast<size_t>(K_TILE) * 576 * sizeof(__half));
-        const size_t s32_b = align256(static_cast<size_t>(M) * K_TILE * sizeof(float));
-        const size_t p16_b = align256(static_cast<size_t>(M) * K_TILE * sizeof(__half));
-        const size_t ml_b  = align256(static_cast<size_t>(M) * sizeof(float));
-        const size_t need  = q16_b + k16_b + s32_b + p16_b + 2 * ml_b;
-
-        if (need <= scratch_bytes) {
-            auto * base = static_cast<uint8_t *>(d_scratch);
-            size_t off = 0;
-            auto * d_q16 = reinterpret_cast<__half *>(base + off); off += q16_b;
-            auto * d_k16 = reinterpret_cast<__half *>(base + off); off += k16_b;
-            auto * d_s32 = reinterpret_cast<float  *>(base + off); off += s32_b;
-            auto * d_p16 = reinterpret_cast<__half *>(base + off); off += p16_b;
-            auto * d_m   = reinterpret_cast<float  *>(base + off); off += ml_b;
-            auto * d_l   = reinterpret_cast<float  *>(base + off);
-
-            const int64_t nq = static_cast<int64_t>(M) * 576;
-            mla_scale_cast_kernel<__half><<<(nq + 255) / 256, 256, 0, stream>>>(d_q576, d_q16, nq, scale);
-            mla_init_flash_state_kernel<<<(M + 255) / 256, 256, 0, stream>>>(d_m, d_l, M);
-
+        const size_t per_m = 576 * sizeof(__half) + static_cast<size_t>(K_TILE) * (sizeof(float) + sizeof(__half)) + 2 * sizeof(float);
+        int max_m = (scratch_bytes > k16_b + 4096) ? static_cast<int>((scratch_bytes - k16_b - 4096) / per_m) : 0;
+        int t_slice = std::min(T, std::max(0, max_m / n_heads));
+        if (t_slice >= 8) {
             const float one = 1.0f, zero = 0.0f;
             cublasSetStream(cublas, stream);
+            for (int t0 = 0; t0 < T; t0 += t_slice) {
+                const int tc = std::min(t_slice, T - t0);
+                const int M  = tc * n_heads;
+                const size_t q16_b = align256(static_cast<size_t>(M) * 576 * sizeof(__half));
+                const size_t s32_b = align256(static_cast<size_t>(M) * K_TILE * sizeof(float));
+                const size_t p16_b = align256(static_cast<size_t>(M) * K_TILE * sizeof(__half));
+                const size_t ml_b  = align256(static_cast<size_t>(M) * sizeof(float));
 
-            for (int k0 = 0; k0 < kv_len_max; k0 += K_TILE) {
-                const int kc = (k0 + K_TILE < kv_len_max) ? K_TILE : (kv_len_max - k0);
-                if (kv_is_q8_0) {
-                    mla_dequant_kv576_tile_kernel<true, __half><<<kc, 256, 0, stream>>>(d_kv_cache, d_k16, k0, kc);
-                } else {
-                    mla_dequant_kv576_tile_kernel<false, __half><<<kc, 256, 0, stream>>>(d_kv_cache, d_k16, k0, kc);
+                auto * base = static_cast<uint8_t *>(d_scratch);
+                size_t off = 0;
+                auto * d_q16 = reinterpret_cast<__half *>(base + off); off += q16_b;
+                auto * d_k16 = reinterpret_cast<__half *>(base + off); off += k16_b;
+                auto * d_s32 = reinterpret_cast<float  *>(base + off); off += s32_b;
+                auto * d_p16 = reinterpret_cast<__half *>(base + off); off += p16_b;
+                auto * d_m   = reinterpret_cast<float  *>(base + off); off += ml_b;
+                auto * d_l   = reinterpret_cast<float  *>(base + off);
+
+                const float * q_ptr = d_q576 + static_cast<size_t>(t0) * n_heads * 576;
+                float *       o_ptr = d_out  + static_cast<size_t>(t0) * n_heads * 512;
+                const int32_t * p_ptr = d_pos + t0;
+
+                const int64_t nq = static_cast<int64_t>(M) * 576;
+                mla_scale_cast_kernel<__half><<<(nq + 255) / 256, 256, 0, stream>>>(q_ptr, d_q16, nq, scale);
+                mla_init_flash_state_kernel<<<(M + 255) / 256, 256, 0, stream>>>(d_m, d_l, M);
+
+                for (int k0 = 0; k0 < kv_len_max; k0 += K_TILE) {
+                    const int kc = (k0 + K_TILE < kv_len_max) ? K_TILE : (kv_len_max - k0);
+                    if (kv_is_q8_0) {
+                        mla_dequant_kv576_tile_kernel<true, __half><<<kc, 256, 0, stream>>>(d_kv_cache, d_k16, k0, kc);
+                    } else {
+                        mla_dequant_kv576_tile_kernel<false, __half><<<kc, 256, 0, stream>>>(d_kv_cache, d_k16, k0, kc);
+                    }
+
+                    cublasGemmEx(
+                        cublas,
+                        CUBLAS_OP_T, CUBLAS_OP_N,
+                        kc, M, 576,
+                        &one,
+                        d_k16, CUDA_R_16F, 576,
+                        d_q16, CUDA_R_16F, 576,
+                        &zero,
+                        d_s32, CUDA_R_32F, kc,
+                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+                    mla_flash_online_softmax_rescale_kernel<__half><<<M, 128, 0, stream>>>(
+                        d_s32, d_p16, p_ptr, d_m, d_l, o_ptr, n_heads, k0, kc);
+
+                    cublasGemmEx(
+                        cublas,
+                        CUBLAS_OP_N, CUBLAS_OP_N,
+                        512, M, kc,
+                        &one,
+                        d_k16, CUDA_R_16F, 576,
+                        d_p16, CUDA_R_16F, kc,
+                        &one,
+                        o_ptr, CUDA_R_32F, 512,
+                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
                 }
 
-                // S[kc, M] = K16[576, kc]^T @ Q16[576, M]
-                cublasGemmEx(
-                    cublas,
-                    CUBLAS_OP_T, CUBLAS_OP_N,
-                    kc, M, 576,
-                    &one,
-                    d_k16, CUDA_R_16F, 576,
-                    d_q16, CUDA_R_16F, 576,
-                    &zero,
-                    d_s32, CUDA_R_32F, kc,
-                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-
-                mla_flash_online_softmax_rescale_kernel<__half><<<M, 128, 0, stream>>>(
-                    d_s32, d_p16, d_pos, d_m, d_l, d_out, n_heads, k0, kc);
-
-                // O[512, M] += V16[512, kc] @ P16[kc, M]  (V16 is first 512 rows of K16 with ld=576!)
-                cublasGemmEx(
-                    cublas,
-                    CUBLAS_OP_N, CUBLAS_OP_N,
-                    512, M, kc,
-                    &one,
-                    d_k16, CUDA_R_16F, 576,
-                    d_p16, CUDA_R_16F, kc,
-                    &one,
-                    d_out, CUDA_R_32F, 512,
-                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                mla_flash_finalize_out_kernel<<<M, 128, 0, stream>>>(o_ptr, d_l, M);
             }
-
-            mla_flash_finalize_out_kernel<<<M, 128, 0, stream>>>(d_out, d_l, M);
             return;
         }
     }
 
-    // Multi-Head-Shared Split-K Decode (P_TILE=8, S=64: joint T=2 for MTP verify, or H_PER_BLK=16 for T=1!)
+    // Multi-Head-Shared Split-K Decode (Coalesced LDG.128 Q8_0 dp4a + Tile-Softmax!)
+    if (kv_is_q8_0) {
+        if (n_heads <= 16) {
+            constexpr int S = 128;
+            const size_t n_slots = static_cast<size_t>(T) * n_heads * S;
+            float * pm = static_cast<float *>(d_scratch);
+            float * pl = pm + n_slots;
+            float * po = pl + n_slots;
+            if (T == 2) {
+                constexpr int H_PER_BLK = 8;
+                mla_mqa_d576_q8_dp4a_decode_t2_kernel<S><<<dim3((n_heads + H_PER_BLK - 1) / H_PER_BLK, S), dim3(32, 16), 0, stream>>>(
+                    d_q576, d_kv_cache, d_pos, pm, pl, po, n_heads, scale);
+            } else {
+                constexpr int H_PER_BLK = 16;
+                mla_mqa_d576_q8_dp4a_decode_kernel<S, H_PER_BLK><<<dim3((n_heads + H_PER_BLK - 1) / H_PER_BLK, S, T), dim3(32, H_PER_BLK), 0, stream>>>(
+                    d_q576, d_kv_cache, d_pos, pm, pl, po, n_heads, scale);
+            }
+            mla_mqa_d512_reduce_fast_kernel<S><<<dim3(n_heads, T), 128, 0, stream>>>(pm, pl, po, d_out, n_heads);
+        } else {
+            constexpr int S = 64;
+            const size_t n_slots = static_cast<size_t>(T) * n_heads * S;
+            float * pm = static_cast<float *>(d_scratch);
+            float * pl = pm + n_slots;
+            float * po = pl + n_slots;
+            if (T == 2) {
+                constexpr int H_PER_BLK = 8;
+                mla_mqa_d576_q8_dp4a_decode_t2_kernel<S><<<dim3((n_heads + H_PER_BLK - 1) / H_PER_BLK, S), dim3(32, 16), 0, stream>>>(
+                    d_q576, d_kv_cache, d_pos, pm, pl, po, n_heads, scale);
+            } else {
+                constexpr int H_PER_BLK = 16;
+                mla_mqa_d576_q8_dp4a_decode_kernel<S, H_PER_BLK><<<dim3((n_heads + H_PER_BLK - 1) / H_PER_BLK, S, T), dim3(32, H_PER_BLK), 0, stream>>>(
+                    d_q576, d_kv_cache, d_pos, pm, pl, po, n_heads, scale);
+            }
+            mla_mqa_d512_reduce_fast_kernel<S><<<dim3(n_heads, T), 128, 0, stream>>>(pm, pl, po, d_out, n_heads);
+        }
+        return;
+    }
     constexpr int S = 64;
     const size_t n_slots = static_cast<size_t>(T) * n_heads * S;
     float * pm = static_cast<float *>(d_scratch);
@@ -1610,24 +2046,14 @@ void launch_mla_attn_d576_v512(
         constexpr int H_PER_BLK = 8;
         dim3 grid((n_heads + H_PER_BLK - 1) / H_PER_BLK, S);
         dim3 block(32, 16);
-        if (kv_is_q8_0) {
-            mla_mqa_d576_decode_shared_t2_kernel<true, S><<<grid, block, 0, stream>>>(
-                d_q576, d_kv_cache, d_pos, pm, pl, po, n_heads, scale);
-        } else {
-            mla_mqa_d576_decode_shared_t2_kernel<false, S><<<grid, block, 0, stream>>>(
-                d_q576, d_kv_cache, d_pos, pm, pl, po, n_heads, scale);
-        }
+        mla_mqa_d576_decode_shared_t2_kernel<false, S><<<grid, block, 0, stream>>>(
+            d_q576, d_kv_cache, d_pos, pm, pl, po, n_heads, scale);
     } else {
         constexpr int H_PER_BLK = 16;
         dim3 grid((n_heads + H_PER_BLK - 1) / H_PER_BLK, S, T);
         dim3 block(32, H_PER_BLK);
-        if (kv_is_q8_0) {
-            mla_mqa_d576_decode_shared_kernel<true, S, H_PER_BLK><<<grid, block, 0, stream>>>(
-                d_q576, d_kv_cache, d_pos, pm, pl, po, n_heads, scale);
-        } else {
-            mla_mqa_d576_decode_shared_kernel<false, S, H_PER_BLK><<<grid, block, 0, stream>>>(
-                d_q576, d_kv_cache, d_pos, pm, pl, po, n_heads, scale);
-        }
+        mla_mqa_d576_decode_shared_kernel<false, S, H_PER_BLK><<<grid, block, 0, stream>>>(
+            d_q576, d_kv_cache, d_pos, pm, pl, po, n_heads, scale);
     }
     mla_mqa_d512_reduce_strided_kernel<S><<<dim3(n_heads, T), 32, 0, stream>>>(pm, pl, po, d_out, n_heads);
 }

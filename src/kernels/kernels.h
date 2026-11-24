@@ -27,6 +27,16 @@ void launch_rmsnorm(
     float         eps,
     cudaStream_t  stream);
 
+void launch_add_rmsnorm(
+    float *       d_cur,
+    const float * d_sub,
+    const float * d_w,
+    float *       d_out,
+    int           dim,
+    int           n_rows,
+    float         eps,
+    cudaStream_t  stream);
+
 void launch_qk_norm_rope_neox(
     float *         d_x,
     const float *   d_norm_w,
@@ -296,6 +306,11 @@ void launch_linear_prequant(
     const DeviceTensor & W, const void * d_xq8, float * d_y,
     int T, cudaStream_t stream);
 
+// Fused multi-projection prequant GEMV: computes Ys[i] = Ws[i] @ x_q8 in minimal launches!
+void launch_linear_multi_prequant(
+    const DeviceTensor * const * Ws, float * const * Ys, int n_mat,
+    const void * d_xq8, int T, cudaStream_t stream);
+
 void launch_embedding_kquant(
     const DeviceTensor & tok_embd, const int32_t * d_tokens, float * d_out,
     int n_embd, int hc_mult, int n_tokens, cudaStream_t stream);
@@ -313,6 +328,14 @@ void launch_moe_ffn_kquant_with_shared(
 void launch_ssm_conv1d_silu(
     const float * d_x, const float * d_w, float * d_state, float * d_out,
     int T, int C, cudaStream_t stream, float * d_state_snap = nullptr);
+
+void launch_ssm_conv1d_silu_qkv_l2(
+    const float * d_q, const float * d_k, const float * d_v,
+    const float * d_wq, const float * d_wk, const float * d_wv,
+    float * d_sq, float * d_sk, float * d_sv,
+    float * d_qc, float * d_kc, float * d_vc,
+    int T, int n_heads, float eps, cudaStream_t stream,
+    float * d_sq_snap = nullptr, float * d_sk_snap = nullptr, float * d_sv_snap = nullptr);
 
 void launch_l2_norm_d128(float * d_x, int T, int n_heads, float eps, cudaStream_t stream);
 

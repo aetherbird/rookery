@@ -250,6 +250,49 @@ __global__ void gemv_f32_kernel(
     if (lane == 0) Y[static_cast<size_t>(t) * N + row] = acc;
 }
 
+// Fast shared-memory F32 GEMV for T=1 and T=2 (halves router DRAM reads on MTP T=2!)
+template <bool T2>
+__global__ void gemv_f32_smem_kernel(
+    const float * __restrict__ W,
+    const float * __restrict__ X,
+    float *       __restrict__ Y,
+    int K, int N) {
+
+    extern __shared__ float4 s_x4[];
+    const int K4   = K >> 2;
+    const int tid  = threadIdx.y * 32 + threadIdx.x;
+    const int nthr = blockDim.y * 32;
+    const int tot4 = T2 ? (2 * K4) : K4;
+    const float4 * gx4 = reinterpret_cast<const float4 *>(X);
+    for (int i = tid; i < tot4; i += nthr) s_x4[i] = gx4[i];
+    __syncthreads();
+
+    const int row = blockIdx.x * blockDim.y + threadIdx.y;
+    if (row >= N) return;
+
+    const int lane = threadIdx.x;
+    const float4 * w_row4 = reinterpret_cast<const float4 *>(W + static_cast<size_t>(row) * K);
+    const float4 * x0 = s_x4;
+    const float4 * x1 = T2 ? (s_x4 + K4) : nullptr;
+
+    float acc0 = 0.0f, acc1 = 0.0f;
+    for (int k = lane; k < K4; k += 32) {
+        const float4 wv = __ldg(&w_row4[k]);
+        const float4 a  = x0[k];
+        acc0 += wv.x * a.x + wv.y * a.y + wv.z * a.z + wv.w * a.w;
+        if constexpr (T2) {
+            const float4 b = x1[k];
+            acc1 += wv.x * b.x + wv.y * b.y + wv.z * b.z + wv.w * b.w;
+        }
+    }
+    acc0 = warp_sum(acc0);
+    if constexpr (T2) acc1 = warp_sum(acc1);
+    if (lane == 0) {
+        Y[row] = acc0;
+        if constexpr (T2) Y[N + row] = acc1;
+    }
+}
+
 // High-occupancy F32 GEMV for small-N projections (ssm_alpha/beta N=48, ffn_gate_inp_shexp N=1):
 // 1 CTA of 256 threads (8 warps) per (row, t) with 128-bit float4 loads!
 __global__ void gemv_f32_wide_kernel(
@@ -372,7 +415,12 @@ __global__ void dequant_q8_0_soa_to_f16_kernel(
     __half dh;
     *reinterpret_cast<uint16_t *>(&dh) = __ldg(&src_sc[b]);
     const float d = __half2float(dh);
-    dst[b * 32 + lane] = __float2half_rn(d * static_cast<float>(__ldg(&src_qs[b * 32 + lane])));
+    if (lane < 16) {
+        const uint16_t q2 = __ldg(&reinterpret_cast<const uint16_t *>(src_qs)[b * 16 + lane]);
+        const float v0 = d * static_cast<float>(static_cast<int8_t>(q2 & 0xFFu));
+        const float v1 = d * static_cast<float>(static_cast<int8_t>(q2 >> 8));
+        reinterpret_cast<__half2 *>(dst)[b * 16 + lane] = __float22half2_rn(make_float2(v0, v1));
+    }
 }
 
 __global__ void dequant_q8_0_soa_to_f32_kernel(
@@ -391,8 +439,19 @@ __global__ void dequant_q8_0_soa_to_f32_kernel(
 }
 
 __global__ void f32_to_f16_kernel(const float * __restrict__ src, __half * __restrict__ dst, int64_t n) {
-    const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i < n) dst[i] = __float2half_rn(src[i]);
+    const int64_t i4 = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t idx = i4 * 4;
+    if (idx + 3 < n) {
+        const float4 v = reinterpret_cast<const float4 *>(src)[i4];
+        const __half2 h0 = __float22half2_rn(make_float2(v.x, v.y));
+        const __half2 h1 = __float22half2_rn(make_float2(v.z, v.w));
+        uint2 pk;
+        pk.x = *reinterpret_cast<const uint32_t *>(&h0);
+        pk.y = *reinterpret_cast<const uint32_t *>(&h1);
+        reinterpret_cast<uint2 *>(dst)[i4] = pk;
+    } else {
+        for (int64_t i = idx; i < n; ++i) dst[i] = __float2half_rn(src[i]);
+    }
 }
 
 __global__ void argmax_f32_batch_kernel(const float * __restrict__ x, int32_t * __restrict__ out_idx, int n) {
@@ -498,7 +557,8 @@ void launch_linear(
             auto * d_wf16 = reinterpret_cast<__half *>(static_cast<uint8_t *>(d_scratch) + align_x);
 
             const int64_t nx = static_cast<int64_t>(T) * K;
-            f32_to_f16_kernel<<<(nx + 255) / 256, 256, 0, stream>>>(d_x, d_xf16, nx);
+            const int64_t nx4 = (nx + 3) >> 2;
+            f32_to_f16_kernel<<<(nx4 + 255) / 256, 256, 0, stream>>>(d_x, d_xf16, nx);
 
             const float alpha = 1.0f, beta = 0.0f;
             cublasSetStream(cublas, stream);
@@ -620,7 +680,8 @@ void launch_linear(
         if (use_tc && align_x <= scratch_bytes) {
             auto * d_xf16 = static_cast<__half *>(d_scratch);
             const int64_t nx = static_cast<int64_t>(T) * K;
-            f32_to_f16_kernel<<<(nx + 255) / 256, 256, 0, stream>>>(d_x, d_xf16, nx);
+            const int64_t nx4 = (nx + 3) >> 2;
+            f32_to_f16_kernel<<<(nx4 + 255) / 256, 256, 0, stream>>>(d_x, d_xf16, nx);
             const float alpha = 1.0f, beta = 0.0f;
             cublasSetStream(cublas, stream);
             cublasGemmEx(cublas, CUBLAS_OP_T, CUBLAS_OP_N, N, T, K,
@@ -657,6 +718,19 @@ void launch_linear(
         }
         gemv_f32_wide_kernel<<<dim3(N, T), 256, 0, stream>>>(
             static_cast<const float *>(W.ptr), d_x, d_y, K, N);
+        return;
+    }
+
+    if (W.dtype == DType::F32 && (T == 1 || T == 2) && (K & 3) == 0 && K <= 4096) {
+        constexpr int wpb_f = 8;
+        const size_t smem = static_cast<size_t>(T) * K * sizeof(float);
+        if (T == 2) {
+            gemv_f32_smem_kernel<true><<<(N + wpb_f - 1) / wpb_f, dim3(32, wpb_f), smem, stream>>>(
+                static_cast<const float *>(W.ptr), d_x, d_y, K, N);
+        } else {
+            gemv_f32_smem_kernel<false><<<(N + wpb_f - 1) / wpb_f, dim3(32, wpb_f), smem, stream>>>(
+                static_cast<const float *>(W.ptr), d_x, d_y, K, N);
+        }
         return;
     }
 

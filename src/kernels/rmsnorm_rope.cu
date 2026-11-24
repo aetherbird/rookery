@@ -114,9 +114,18 @@ __global__ void rmsnorm_kernel(
     float *       yr = out + static_cast<size_t>(row) * dim;
 
     float ss = 0.0f;
-    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
-        float v = xr[i];
-        ss += v * v;
+    if ((dim & 3) == 0) {
+        const int dim4 = dim >> 2;
+        const float4 * x4 = reinterpret_cast<const float4 *>(xr);
+        for (int i = threadIdx.x; i < dim4; i += blockDim.x) {
+            const float4 v = x4[i];
+            ss += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+        }
+    } else {
+        for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+            const float v = xr[i];
+            ss += v * v;
+        }
     }
 
     __shared__ float smem[32];
@@ -135,9 +144,96 @@ __global__ void rmsnorm_kernel(
     __syncthreads();
     const float inv_rms = smem[0];
 
-    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
-        float v = xr[i] * inv_rms;
-        yr[i] = w ? (v * w[i]) : v;
+    if ((dim & 3) == 0) {
+        const int dim4 = dim >> 2;
+        const float4 * x4 = reinterpret_cast<const float4 *>(xr);
+        const float4 * w4 = w ? reinterpret_cast<const float4 *>(w) : nullptr;
+        float4 *       y4 = reinterpret_cast<float4 *>(yr);
+        for (int i = threadIdx.x; i < dim4; i += blockDim.x) {
+            const float4 v = x4[i];
+            if (w4) {
+                const float4 wv = __ldg(&w4[i]);
+                y4[i] = make_float4(v.x * inv_rms * wv.x, v.y * inv_rms * wv.y,
+                                    v.z * inv_rms * wv.z, v.w * inv_rms * wv.w);
+            } else {
+                y4[i] = make_float4(v.x * inv_rms, v.y * inv_rms, v.z * inv_rms, v.w * inv_rms);
+            }
+        }
+    } else {
+        for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+            float v = xr[i] * inv_rms;
+            yr[i] = w ? (v * w[i]) : v;
+        }
+    }
+}
+
+__global__ void add_rmsnorm_kernel(
+    float *       __restrict__ cur,
+    const float * __restrict__ sub,
+    const float * __restrict__ w,
+    float *       __restrict__ out,
+    int dim, float eps) {
+
+    const int row = blockIdx.x;
+    float *       cr = cur + static_cast<size_t>(row) * dim;
+    const float * sr = sub + static_cast<size_t>(row) * dim;
+    float *       yr = out + static_cast<size_t>(row) * dim;
+
+    float ss = 0.0f;
+    if ((dim & 3) == 0) {
+        const int dim4 = dim >> 2;
+        float4 *       c4 = reinterpret_cast<float4 *>(cr);
+        const float4 * s4 = reinterpret_cast<const float4 *>(sr);
+        for (int i = threadIdx.x; i < dim4; i += blockDim.x) {
+            const float4 cv = c4[i];
+            const float4 sv = s4[i];
+            const float4 v  = make_float4(cv.x + sv.x, cv.y + sv.y, cv.z + sv.z, cv.w + sv.w);
+            c4[i] = v;
+            ss += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+        }
+    } else {
+        for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+            const float v = cr[i] + sr[i];
+            cr[i] = v;
+            ss += v * v;
+        }
+    }
+
+    __shared__ float smem[32];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    ss = warp_sum(ss);
+    if (lane == 0) smem[warp] = ss;
+    __syncthreads();
+
+    if (warp == 0) {
+        float total = (lane < (blockDim.x >> 5)) ? smem[lane] : 0.0f;
+        total = warp_sum(total);
+        if (lane == 0) smem[0] = rsqrtf(total / static_cast<float>(dim) + eps);
+    }
+    __syncthreads();
+    const float inv_rms = smem[0];
+
+    if ((dim & 3) == 0) {
+        const int dim4 = dim >> 2;
+        const float4 * c4 = reinterpret_cast<const float4 *>(cr);
+        const float4 * w4 = w ? reinterpret_cast<const float4 *>(w) : nullptr;
+        float4 *       y4 = reinterpret_cast<float4 *>(yr);
+        for (int i = threadIdx.x; i < dim4; i += blockDim.x) {
+            const float4 v = c4[i];
+            if (w4) {
+                const float4 wv = __ldg(&w4[i]);
+                y4[i] = make_float4(v.x * inv_rms * wv.x, v.y * inv_rms * wv.y,
+                                    v.z * inv_rms * wv.z, v.w * inv_rms * wv.w);
+            } else {
+                y4[i] = make_float4(v.x * inv_rms, v.y * inv_rms, v.z * inv_rms, v.w * inv_rms);
+            }
+        }
+    } else {
+        for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+            const float v = cr[i] * inv_rms;
+            yr[i] = w ? (v * w[i]) : v;
+        }
     }
 }
 
@@ -300,6 +396,13 @@ void launch_rmsnorm(
     int dim, int n_rows, float eps, cudaStream_t stream) {
     constexpr int threads = 256;
     rmsnorm_kernel<<<n_rows, threads, 0, stream>>>(d_x, d_w, d_out, dim, eps);
+}
+
+void launch_add_rmsnorm(
+    float * d_cur, const float * d_sub, const float * d_w, float * d_out,
+    int dim, int n_rows, float eps, cudaStream_t stream) {
+    constexpr int threads = 256;
+    add_rmsnorm_kernel<<<n_rows, threads, 0, stream>>>(d_cur, d_sub, d_w, d_out, dim, eps);
 }
 
 void launch_qk_norm_rope_neox(

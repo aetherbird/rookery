@@ -258,7 +258,7 @@ private:
     cudaGraphExec_t      mtp_graph_t1_  = nullptr;
     cudaGraphExec_t      mtp_graph_t2_  = nullptr;
 
-    int         max_batch_       = 512;
+    int         max_batch_       = 1024;
     LayerHook * hook_            = nullptr;
     bool        use_cuda_graphs_ = true;
     bool        graphs_ready_    = false;
