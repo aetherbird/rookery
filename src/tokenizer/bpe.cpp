@@ -145,6 +145,31 @@ void BpeTokenizer::load(const GgufFile & gguf) {
         }
     }
     extra_stop_ids_.clear();
+
+    // Precompute O(1) decoded UTF-8 byte strings for every token ID (eliminates per-token UTF-8 + hash lookup in decode_token)
+    decoded_tokens_.resize(id_to_token_.size());
+    for (size_t i = 0; i < id_to_token_.size(); ++i) {
+        if (token_types_[i] == 3 || token_types_[i] == 4) {
+            decoded_tokens_[i] = id_to_token_[i];
+            continue;
+        }
+        const std::string & tok = id_to_token_[i];
+        std::string out;
+        out.reserve(tok.size());
+        for (size_t pos = 0; pos < tok.size();) {
+            uint32_t cp = 0; size_t len = 0;
+            decode_utf8_at(tok, pos, cp, len);
+            std::string ch = tok.substr(pos, len);
+            auto it = unicode_to_byte_.find(ch);
+            if (it != unicode_to_byte_.end()) {
+                out.push_back(static_cast<char>(it->second));
+            } else {
+                out.append(ch);
+            }
+            pos += len;
+        }
+        decoded_tokens_[i] = std::move(out);
+    }
 }
 
 void BpeTokenizer::add_stop_token(const std::string & tok) {
@@ -454,26 +479,8 @@ std::vector<int32_t> BpeTokenizer::encode(const std::string & text, bool add_bos
 }
 
 std::string BpeTokenizer::decode_token(int32_t id) const {
-    if (id < 0 || static_cast<size_t>(id) >= id_to_token_.size()) return "";
-    if (token_types_[id] == 3 || token_types_[id] == 4) {
-        return id_to_token_[id];
-    }
-    const std::string & tok = id_to_token_[id];
-    std::string out;
-    out.reserve(tok.size());
-    for (size_t pos = 0; pos < tok.size();) {
-        uint32_t cp = 0; size_t len = 0;
-        decode_utf8_at(tok, pos, cp, len);
-        std::string ch = tok.substr(pos, len);
-        auto it = unicode_to_byte_.find(ch);
-        if (it != unicode_to_byte_.end()) {
-            out.push_back(static_cast<char>(it->second));
-        } else {
-            out.append(ch);
-        }
-        pos += len;
-    }
-    return out;
+    if (id < 0 || static_cast<size_t>(id) >= decoded_tokens_.size()) return "";
+    return decoded_tokens_[id];
 }
 
 std::string BpeTokenizer::decode(const std::vector<int32_t> & ids, bool skip_special) const {

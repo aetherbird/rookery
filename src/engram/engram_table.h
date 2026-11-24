@@ -15,6 +15,17 @@ enum class EngramMode {
     UNIGRAM_PLE,  // Gemma 3n/4 E2B/E4B or direct token-ID per-layer embedding lookup
 };
 
+// Per-token / per-sequence CUDA-Graph-safe runtime controls for Engram injection.
+// Stored in fixed-address pinned + device buffers so requests can independently scale,
+// disable (scale=0.0 -> exact no-op), shift gate selectivity, or clip delta norm WITHOUT
+// invalidating or recapturing CUDA Graphs!
+struct EngramRuntimeParams {
+    float scale            = 1.0f; // multiplier on adapter hook scale (0.0f = exact no-op)
+    float gate_bias        = 0.0f; // additive logit bias inside sigmoid gate
+    float delta_clip_ratio = 0.0f; // max ||g*v||_rms / ||h||_rms cap (0.0f = disabled)
+    float _pad             = 0.0f;
+};
+
 struct EngramConfig {
     EngramMode  mode            = EngramMode::NGRAM_HASH;
     std::string arch;
@@ -28,6 +39,7 @@ struct EngramConfig {
     int         head_dim        = 96;  // per-head embedding dim (96 for HY4, 256 for DeepSeek)
     uint64_t    total_rows      = 0;
     size_t      row_bytes       = 0;
+    uint64_t    fingerprint     = 0;   // FNV-1a 64-bit contract fingerprint over addressing spec + token_map
 
     int32_t     pad_token_id    = 0;
     std::vector<int32_t>  source_layers;     // e.g. [1, 11, 21, 31] or [1, 14]
@@ -37,6 +49,7 @@ struct EngramConfig {
     std::vector<int64_t>  token_map;         // [vocab_size] -> compressed token ID (or -1 if dead)
 
     int engram_dim() const { return n_cols * head_dim; }
+    std::string fingerprint_hex() const;
 };
 
 // Zero-copy mmap loader for standalone or multi-shard Engram / PLE tables (59 GiB HY4, 103 GiB DeepSeek, Gemma PLE).
@@ -49,6 +62,8 @@ public:
     void open(const std::string & path);
 
     const EngramConfig & cfg() const { return cfg_; }
+    uint64_t fingerprint() const { return cfg_.fingerprint; }
+    std::string fingerprint_hex() const { return cfg_.fingerprint_hex(); }
     bool has_tokenizer() const { return has_tokenizer_; }
     const BpeTokenizer & tokenizer() const { return tokenizer_; }
     void set_shuffle_salt(uint64_t salt) { shuffle_salt_ = salt; }

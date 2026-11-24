@@ -116,6 +116,29 @@ std::vector<std::string> discover_shards(const std::string & path) {
 
 } // namespace
 
+std::string EngramConfig::fingerprint_hex() const {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "0x%016llx", static_cast<unsigned long long>(fingerprint));
+    return std::string(buf);
+}
+
+namespace {
+
+inline void fnv1a_mix(uint64_t & h, const void * data, size_t nbytes) {
+    const uint8_t * p = static_cast<const uint8_t *>(data);
+    for (size_t i = 0; i < nbytes; ++i) {
+        h ^= static_cast<uint64_t>(p[i]);
+        h *= 1099511628211ULL;
+    }
+}
+
+template <typename T>
+inline void fnv1a_val(uint64_t & h, const T & v) {
+    fnv1a_mix(h, &v, sizeof(T));
+}
+
+} // namespace
+
 void EngramTable::open(const std::string & path) {
     const auto shards = discover_shards(path);
 
@@ -182,16 +205,43 @@ void EngramTable::open(const std::string & path) {
     table_base_   = static_cast<const uint8_t *>(table_gguf_.tensor_data(*tbl_info));
     table_nbytes_ = tbl_info->nbytes;
 
+    // Compute deterministic 64-bit FNV-1a contract fingerprint over addressing spec + token_map
+    {
+        uint64_t fp = 14695981039346656037ULL;
+        fnv1a_mix(fp, cfg_.arch.data(), cfg_.arch.size());
+        fnv1a_val(fp, static_cast<uint32_t>(cfg_.mode));
+        fnv1a_val(fp, static_cast<int32_t>(cfg_.n_layers));
+        fnv1a_val(fp, static_cast<int32_t>(cfg_.ngram_size));
+        fnv1a_val(fp, static_cast<int32_t>(cfg_.heads_per_ngram));
+        fnv1a_val(fp, static_cast<int32_t>(cfg_.n_cols));
+        fnv1a_val(fp, static_cast<int32_t>(cfg_.head_dim));
+        fnv1a_val(fp, static_cast<uint64_t>(cfg_.total_rows));
+        fnv1a_val(fp, static_cast<int32_t>(cfg_.pad_token_id));
+        fnv1a_val(fp, static_cast<uint64_t>(has_tokenizer_ ? tokenizer_.vocab_size() : 0));
+        if (!cfg_.source_layers.empty())
+            fnv1a_mix(fp, cfg_.source_layers.data(), cfg_.source_layers.size() * sizeof(int32_t));
+        if (!cfg_.layer_multipliers.empty())
+            fnv1a_mix(fp, cfg_.layer_multipliers.data(), cfg_.layer_multipliers.size() * sizeof(uint64_t));
+        if (!cfg_.head_offsets.empty())
+            fnv1a_mix(fp, cfg_.head_offsets.data(), cfg_.head_offsets.size() * sizeof(uint32_t));
+        if (!cfg_.head_vocab_sizes.empty())
+            fnv1a_mix(fp, cfg_.head_vocab_sizes.data(), cfg_.head_vocab_sizes.size() * sizeof(uint32_t));
+        if (!cfg_.token_map.empty())
+            fnv1a_mix(fp, cfg_.token_map.data(), cfg_.token_map.size() * sizeof(int64_t));
+        cfg_.fingerprint = fp;
+    }
+
     // Advise OS kernel for random row access over huge (59-103 GiB) mmap'd tables
     const size_t page_sz = 4096;
     const uintptr_t addr = reinterpret_cast<uintptr_t>(table_base_) & ~(page_sz - 1);
     const size_t len = table_nbytes_ + (reinterpret_cast<uintptr_t>(table_base_) - addr);
     madvise(reinterpret_cast<void *>(addr), len, MADV_RANDOM);
 
-    std::printf("Loaded EngramTable [%s, mode=%s]: %s\n"
+    std::printf("Loaded EngramTable [%s, mode=%s, fp=%s]: %s\n"
                 "  layers=%d, ngram=%d, heads=%d, head_dim=%d (engram_dim=%d), rows=%llu, dtype=%s (%.2f GiB mmap)\n",
                 cfg_.arch.c_str(),
                 cfg_.mode == EngramMode::NGRAM_HASH ? "ngram_hash" : "unigram_ple",
+                cfg_.fingerprint_hex().c_str(),
                 cfg_.table_path.c_str(),
                 cfg_.n_layers, cfg_.ngram_size, cfg_.n_cols, cfg_.head_dim, cfg_.engram_dim(),
                 static_cast<unsigned long long>(cfg_.total_rows),

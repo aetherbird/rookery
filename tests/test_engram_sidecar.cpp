@@ -271,7 +271,7 @@ int main(int argc, char ** argv) {
     rookery::EngramSidecar sidecar;
     sidecar.init(engram_path, &host_tok, model.layer_devices(),
                  model.config().n_embd, model.config().hc_mult,
-                 512, adapter_path, scale, engram_layers);
+                 512, adapter_path, scale, engram_layers, "maxwell-moe");
     if (shuffle_salt != 0) {
         sidecar.set_shuffle_salt(shuffle_salt);
         std::printf("CONTROL MODE: Engram hash shuffle_salt = 0x%llx\n", static_cast<unsigned long long>(shuffle_salt));

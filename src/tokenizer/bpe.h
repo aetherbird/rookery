@@ -16,6 +16,9 @@ public:
     std::vector<int32_t> encode(const std::string & text, bool add_bos = true, bool parse_special = true) const;
     std::string          decode(const std::vector<int32_t> & ids, bool skip_special = false) const;
     std::string          decode_token(int32_t id) const;
+    size_t               token_byte_len(int32_t id) const {
+        return (id >= 0 && static_cast<size_t>(id) < decoded_tokens_.size()) ? decoded_tokens_[id].size() : 0;
+    }
 
     int32_t bos_id() const { return bos_id_; }
     int32_t eos_id() const { return eos_id_; }
@@ -32,6 +35,7 @@ private:
     void bpe_encode_piece(const std::string & piece, std::vector<int32_t> & out) const;
 
     std::vector<std::string>                id_to_token_;
+    std::vector<std::string>                decoded_tokens_;
     std::vector<int32_t>                    token_types_;
     std::unordered_map<std::string, int32_t> token_to_id_;
     std::unordered_map<std::string, int32_t> merge_ranks_;

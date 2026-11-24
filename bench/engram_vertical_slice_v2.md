@@ -121,10 +121,42 @@ Trained a tiny gated RKAD v2 bridge (`src_layer=0 → host L44`, right before `h
 
 ---
 
+## 6. Runtime Contract Hardening (`RKAD v3`, Zero-Recapture Controls & Incremental Commit Cache)
+
+### A. Incremental Boundary-Anchored Commit Cache (`--verify-addressing`)
+Replacing per-step 256–352B suffix re-tokenization with a boundary-anchored incremental commit cache (`EngramSeqState`, `kCommitGuard = 48B`, O(1) precomputed `BpeTokenizer::token_byte_len`) maintained **100.00% exact parity** against the causal full-prefix oracle while shrinking average re-tokenized tail to ~60–66 bytes:
+
+| Test Corpus | Host Tokens | Commit Cache Active | Avg Tail | Source Token Match | N-Gram Hash Match |
+|---|---:|---:|---:|---:|---:|
+| Mixed prose / C++ / Python / JSON / UTF-8 / CJK | `851` | `838 / 851` | `60.4 B` | **`851 / 851` (100.00%)** | **`40,848 / 40,848` (100.00%)** |
+| Unseen technical documentation | `1,500` | `1,484 / 1,500` | `66.2 B` | **`1,500 / 1,500` (100.00%)** | **`72,000 / 72,000` (100.00%)** |
+
+### B. Updated Stage-by-Stage Latency (`tg128` + `pp1024`, 1 Active Gated `RKAD v3` Hook, `clip=0.15`)
+
+| Benchmark | Configuration | Throughput | Latency | Overhead vs Base | Measured Prep Breakdown |
+|---|---|---:|---:|---:|---|
+| **`tg128`** (CUDA Graph ON) | **1. Base** (`no hook`) | `105.20 tok/s` | `9,505.6 µs/tok` | — | — |
+| **`tg128`** (CUDA Graph ON) | **2. Disabled** (`scale=0`, zero recapture) | `104.94 tok/s` | `9,528.9 µs/tok` | `+23.3 µs` (**`+0.25%`**) | `tok=7.9`, `hash=0.2`, `gath=0.0`, `h2d=2.3 µs` |
+| **`tg128`** (CUDA Graph ON) | **3. Active** (gated `RKAD v3`, `clip=0.15`) | `104.26 tok/s` | `9,591.3 µs/tok` | `+85.7 µs` (**`+0.90%`**) | `tok=7.9`, `hash=0.2`, `gath=7.1`, `h2d=4.7 µs` |
+| **`pp1024`** (chunk=256) | **1. Base → 2. Active** | `379.3 → 377.5 tok/s` | `2,699.7 → 2,712.9 ms` | `+13.17 ms` (**`+0.49%`**) | `tok=1.16`, `hash=0.17`, `gath=9.46`, `h2d=0.06 ms` |
+
+- `tokenize_align_us` dropped **5.5×** (`43.4 µs/tok → 7.9 µs/tok`), bringing total active end-to-end decode overhead under **1.0%** (`+0.90%`) and prefill overhead under **0.5%** (`+0.49%`).
+- Per-token CUDA-Graph-safe `EngramRuntimeParams` (`scale`, `gate_bias`, `delta_clip_ratio`) allow per-request enabling/disabling and strength tuning in `rookery-server` without CUDA Graph recapture (verified exact `+0.000000` disabled PPL delta).
+- `RKAD v3` embeds a strict JSON manifest checked at load time against the table's 64-bit FNV-1a addressing fingerprint (`provider_fingerprint`), `provider_arch`, `host_arch`, `host_n_layers`, `host_d_embd`, and `host_hc_mult` (plus per-hook `has_gate`, `rank`, and `delta_clip`).
+
+### C. 200K Mixed-Domain Level-3 Findings & RMSNorm Logit-Softening Diagnostic
+
+Scaling the `L44` causal dump to `200,000` mixed Wiki + Tech tokens (`base val PPL = 15.091`) surfaced an important failure mode caught directly by our 4-way `[SHUFFLED]` control:
+- Under vanilla `CE + 0.5*KL` on high-entropy raw Wiki completions (`base PPL = 15.091`), a late-layer bridge placed directly before `output_norm` can exploit an **RMSNorm logit-softening shortcut** (increasing `||h + delta||` scales down logits like temperature `T > 1`), causing both `[REAL]` and `[SHUFFLED]` PPL to drop on raw prose/tech completions (`SHUFFLED` drops even more because uniform random hash rows have higher variance than frequent-token rows), while hurting calibrated `EVAL_FACTUAL` (`1.400 → 1.426`).
+- Adding **contrastive shuffled-batch KL regularization** (`--shuf-kl-beta 2.0`) + **relative delta-norm penalty** (`--delta-reg 2.0`) + `delta_clip=0.15` restored monotonic `EVAL_FACTUAL` gains (`1.400 → 1.397 → 1.396 → 1.395`, `SHUF − REAL = +0.030`, vs shuffled degrading `1.400 → 1.409 → 1.422 → 1.425`) and produced a `+0.444` in-distribution `SHUF − REAL` gap (`13.931` vs `14.321`), though residual norm-inflation before `output_norm` still left a small `-0.02` to `-0.09` shuffled bias on raw-text `EVAL_TECH`/`EVAL_PROSE`.
+- **Architectural conclusion:** Early-layer bridges (`L1`, 44 layers before `output_norm`) are naturally immune to logit-temperature shortcuts (beating both Base and Shuffled on `EVAL_TECH` and `EVAL_PROSE`). Future Level-3 late-layer bridges should project `delta` onto the hypersphere tangent plane (`delta ⊥ h`, preserving `||h||` identically) or backpropagate into early layers (`L1..L4`).
+
+---
+
 ## Honest Takeaways
 
-1. **Mechanical & latency viability is proven on real hardware:** 100.00% causal addressing parity, exact `0.000000` disabled-hook invariance, and **1.14% decode / 1.24% prefill** measured overhead (`~0.5%–1.08%` with 1 active hook) against a 103 GiB `mmap` table.
-2. **Real cross-model transfer is verified in BOTH Level-2 (`L1`) and Level-3 (`L44`):**
-   - Level-2 centered/auto-gated `L1` Ridge improves `EVAL_TECH` (`12.746 → 12.571`) and `EVAL_PROSE` (`4.759 → 4.725`, `top1 +0.63%`).
-   - Level-3 supervised gated `L44` CE+KL improves completely zero-shot **factual QA** monotonically across all scales (`ans_PPL 1.400 → 1.382`, exact answer accuracy `91.7% → 93.3%`, `SHUF − REAL = +0.040`) while shuffled degrades monotonically.
-3. **Clear next levers for stronger Level-3 generalization:** The 45K tech-only training corpus with `dropout=0` began memorizing after epoch 2 (`tr_CE 1.69 → 0.72`) and slightly regressed OOD prose (`+0.017` PPL). Scaling the training mix to `200K+` multi-domain tokens (prose + encyclopedic + tech) with `--dropout 0.3` and combining `L1` (early feature bridge) + `L44` (gated output bridge) is the clear next step before wiring `N × M` models.
+1. **Sub-1% systems & runtime viability is proven on real hardware:** 100.00% causal addressing parity (`2,351 / 2,351` tokens, `112,848 / 112,848` hash cols), exact `+0.000000` zero-recapture disabled invariance, strict `RKAD v3` manifest validation, and **`+0.90%` decode / `+0.49%` prefill** measured overhead (`tok = 7.9 µs/tok`) against a 103 GiB `mmap` table.
+2. **Real cross-model transfer is verified — and 4-way controls are non-negotiable:**
+   - Level-2 centered/auto-gated `L1` Ridge improves both `EVAL_TECH` (`12.746 → 12.571`) and `EVAL_PROSE` (`4.759 → 4.725`, `top1 +0.63%`) while beating `[SHUFFLED]` on both.
+   - Level-3 supervised gated `L44` improves completely zero-shot **factual QA** monotonically across all scales (`ans_PPL 1.400 → 1.382`, exact first-token accuracy `91.7% → 93.3%`, `SHUF − REAL = +0.040`).
+   - Without the `[SHUFFLED]` control, late-layer `L44` training on high-entropy raw text would have looked like a massive `-1.40` PPL win when it was actually RMSNorm logit softening — validating why every adapter must pass 4-way controls (`Base`, `Disabled`, `Real`, `Shuffled`) before promotion.

@@ -336,10 +336,19 @@ struct GenResult {
     double tg_ms            = 0.0;
 };
 
+static rookery::EngramRuntimeParams parse_engram_params(const json & j, const rookery::EngramSidecar * engram) {
+    rookery::EngramRuntimeParams ep = engram ? engram->default_params() : rookery::EngramRuntimeParams{};
+    if (j.contains("engram_scale") && j["engram_scale"].is_number())           ep.scale = j["engram_scale"].get<float>();
+    if (j.contains("engram_gate_bias") && j["engram_gate_bias"].is_number())   ep.gate_bias = j["engram_gate_bias"].get<float>();
+    if (j.contains("engram_delta_clip") && j["engram_delta_clip"].is_number()) ep.delta_clip_ratio = j["engram_delta_clip"].get<float>();
+    return ep;
+}
+
 static GenResult run_generation(
     ServerEngine & engine,
     const rookery::BpeTokenizer & tokenizer,
     rookery::EngramSidecar * engram,
+    const rookery::EngramRuntimeParams & engram_params,
     const std::vector<int32_t> & prompt_ids,
     const rookery::SamplingParams & sp,
     int max_tokens,
@@ -451,7 +460,7 @@ static GenResult run_generation(
                                 prompt_ids.begin() + static_cast<ptrdiff_t>(off + len));
         std::vector<int32_t> pp(pos.begin() + static_cast<ptrdiff_t>(off),
                                 pos.begin() + static_cast<ptrdiff_t>(off + len));
-        if (engram) engram->prepare_step(pt, static_cast<int>(off));
+        if (engram) engram->prepare_step(pt, static_cast<int>(off), engram_params, 0);
         engine.forward(pt, pp, logits);
         if (run_mtp && off + len < prompt_ids.size()) {
             std::vector<int32_t> next_t(len);
@@ -528,7 +537,7 @@ static GenResult run_generation(
                     engine.save_state_checkpoint(cur_pos);
                     if (gr.tokens.size() >= next_gen_ckpt) next_gen_ckpt = gr.tokens.size() + 128;
                 }
-                if (engram) engram->prepare_step({cur_tok, draft}, cur_pos);
+                if (engram) engram->prepare_step({cur_tok, draft}, cur_pos, engram_params, 0);
                 const int32_t old_cur   = cur_tok;
                 const int32_t old_draft = draft;
                 const int32_t old_pos   = cur_pos;
@@ -563,7 +572,7 @@ static GenResult run_generation(
             }
         } else if (keep_going) {
             while (static_cast<int>(gr.tokens.size()) < max_tokens && cur_pos + 1 < engine.max_ctx()) {
-                if (engram) engram->prepare_step({cur_tok}, cur_pos);
+                if (engram) engram->prepare_step({cur_tok}, cur_pos, engram_params, 0);
                 const int32_t fed_tok = cur_tok;
                 if (sampler.is_greedy()) {
                     cur_tok = engine.forward_decode_greedy(cur_tok, cur_pos++);
@@ -696,7 +705,18 @@ int main(int argc, char ** argv) {
             res.set_content(R"({"status":"loading model"})", "application/json");
             return;
         }
-        res.set_content(R"({"status":"ok"})", "application/json");
+        json body = {{"status", "ok"}, {"arch", engine.arch}};
+        if (engram_ptr) {
+            body["engram"] = {
+                {"provider_arch", engram_ptr->table().cfg().arch},
+                {"provider_fingerprint", engram_ptr->table().fingerprint_hex()},
+                {"rkad_version", engram_ptr->manifest().format_version},
+                {"calibration", engram_ptr->manifest().calibration},
+                {"default_scale", engram_ptr->default_params().scale},
+                {"hooks", engram_ptr->num_hooks()}
+            };
+        }
+        res.set_content(body.dump(), "application/json");
     });
 
     svr.Get("/v1/models", [&](const httplib::Request &, httplib::Response & res) {
@@ -741,9 +761,10 @@ int main(int argc, char ** argv) {
 
             const auto prompt_ids = tokenizer.encode(prompt_str, tokenizer.add_bos_default(), true);
             const auto stop_strs  = parse_stop_strings(j);
+            const auto ep         = parse_engram_params(j, engram_ptr);
             std::string acc_text;
             std::lock_guard<std::mutex> lock(infer_mu);
-            auto gr = run_generation(engine, tokenizer, engram_ptr, prompt_ids, sp, max_tokens, use_mtp,
+            auto gr = run_generation(engine, tokenizer, engram_ptr, ep, prompt_ids, sp, max_tokens, use_mtp,
                 stop_strs.empty() ? std::function<bool(int32_t)>(nullptr) : std::function<bool(int32_t)>([&](int32_t tid) -> bool {
                     acc_text += tokenizer.decode_token(tid);
                     return find_earliest_stop(acc_text, stop_strs) == std::string::npos;
@@ -844,10 +865,11 @@ int main(int argc, char ** argv) {
                 return rookery::parse_maxwell_output(raw, in_think);
             };
 
+            const auto ep = parse_engram_params(j, engram_ptr);
             if (!stream) {
                 std::lock_guard<std::mutex> lock(infer_mu);
                 std::string acc_raw;
-                auto gr = run_generation(engine, tokenizer, engram_ptr, prompt_ids, sp, max_tokens, use_mtp,
+                auto gr = run_generation(engine, tokenizer, engram_ptr, ep, prompt_ids, sp, max_tokens, use_mtp,
                     stop_strs.empty() ? std::function<bool(int32_t)>(nullptr) : std::function<bool(int32_t)>([&](int32_t tid) -> bool {
                         acc_raw += tokenizer.decode_token(tid);
                         return find_earliest_stop(acc_raw, stop_strs) == std::string::npos;
@@ -1069,7 +1091,7 @@ int main(int argc, char ** argv) {
                                 return !hit_stop_str;
                             };
 
-                            auto gr = run_generation(engine, tokenizer, engram_ptr, prompt_ids, sp, max_tokens, use_mtp,
+                            auto gr = run_generation(engine, tokenizer, engram_ptr, ep, prompt_ids, sp, max_tokens, use_mtp,
                                 [&](int32_t tid) -> bool {
                                     if (!sink.is_writable()) return false;
                                     pending += tokenizer.decode_token(tid);
@@ -1181,7 +1203,7 @@ int main(int argc, char ** argv) {
         const float eff_scale = (engram_scale >= 0.0f) ? engram_scale : (engram_adapter_path.empty() ? 0.0f : 1.0f);
         engram_sidecar.init(engram_path, &tokenizer, engine.layer_devices(),
                             engine.n_embd(), engine.hc_mult(),
-                            512, engram_adapter_path, eff_scale, engram_layers);
+                            512, engram_adapter_path, eff_scale, engram_layers, engine.arch);
         engram_ptr = &engram_sidecar;
         engine.set_layer_hook(engram_ptr);
     }

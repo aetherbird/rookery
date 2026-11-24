@@ -130,7 +130,7 @@ class RookeryGatedBridge(nn.Module):
         self.B_k = nn.Parameter(torch.randn(d_host, rank) * (1.0 / math.sqrt(rank)))
         self.gate_w = nn.Parameter(torch.ones(hc, d_host))
 
-    def forward(self, h_hc: torch.Tensor, e_c: torch.Tensor, rms_eps: float = 1e-6) -> torch.Tensor:
+    def forward(self, h_hc: torch.Tensor, e_c: torch.Tensor, rms_eps: float = 1e-6, return_stats: bool = False):
         e_in = self.drop(e_c)
         # v: [B, d_host], k: [B, d_host]
         v = F.linear(self.drop(F.linear(e_in, self.A_v)), self.B_v)
@@ -144,7 +144,41 @@ class RookeryGatedBridge(nn.Module):
         mag = torch.sqrt(torch.clamp(scaled.abs(), min=1e-6))
         sgn = torch.where(scaled >= 0.0, torch.ones_like(scaled), -torch.ones_like(scaled))
         g = torch.sigmoid(sgn * mag) * self.fixed_scale  # [B, hc]
-        return h_hc + g.unsqueeze(-1) * v.unsqueeze(1)
+        delta = g.unsqueeze(-1) * v.unsqueeze(1)
+        out = h_hc + delta
+        if return_stats:
+            h_rms = torch.sqrt(h_hc.pow(2).mean(dim=-1) + rms_eps)
+            d_rms = torch.sqrt(delta.pow(2).mean(dim=-1) + rms_eps)
+            rel_norm = (d_rms / h_rms).mean()
+            return out, rel_norm, g.mean()
+        return out
+
+
+def write_rkad_v3(
+    out_path: str,
+    target_layer: int,
+    src_layer: int,
+    mu_e: np.ndarray,
+    bridge: RookeryGatedBridge,
+    manifest: dict,
+    delta_clip: float = 0.0,
+):
+    m_bytes = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
+    hook_flags = 1 | 2 | (4 if delta_clip > 0.0 else 0)  # bit0=mu_e, bit1=gate, bit2=delta_clip
+    with open(out_path, "wb") as f:
+        f.write(b"RKAD")
+        # version=3, n_hooks=1, d_engram, d_host, default_rank, global_flags=0
+        f.write(struct.pack("<6I", 3, 1, bridge.d_eng, bridge.d_host, bridge.rank, 0))
+        f.write(struct.pack("<I", len(m_bytes)))
+        f.write(m_bytes)
+        f.write(struct.pack("<2if2If", target_layer, src_layer, float(bridge.fixed_scale),
+                            bridge.rank, hook_flags, float(delta_clip)))
+        f.write(mu_e.astype(np.float32).tobytes())
+        f.write(bridge.A_v.detach().cpu().float().numpy().tobytes())
+        f.write(bridge.B_v.detach().cpu().float().numpy().tobytes())
+        f.write(bridge.A_k.detach().cpu().float().numpy().tobytes())
+        f.write(bridge.B_k.detach().cpu().float().numpy().tobytes())
+        f.write(bridge.gate_w.detach().cpu().float().numpy().tobytes())
 
 
 def write_rkad_v2(
@@ -217,8 +251,18 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--wd", type=float, default=2e-2)
     ap.add_argument("--kl-beta", type=float, default=0.25)
+    ap.add_argument("--shuf-kl-beta", type=float, default=0.0,
+                    help="Contrastive shuffled-batch KL(p_base || p_shuf) penalty to prevent RMSNorm logit-softening shortcuts")
+    ap.add_argument("--delta-reg", type=float, default=0.0,
+                    help="L2 penalty on mean ||delta||_rms / ||h||_rms to keep perturbations small and well-calibrated")
     ap.add_argument("--dropout", type=float, default=0.0)
     ap.add_argument("--val-frac", type=float, default=0.1)
+    ap.add_argument("--rkad-v3", action="store_true", help="Emit self-describing RKAD v3 with strict JSON contract manifest")
+    ap.add_argument("--provider-arch", default="deepseek41")
+    ap.add_argument("--provider-fingerprint", default="")
+    ap.add_argument("--host-arch", default="maxwell-moe")
+    ap.add_argument("--host-n-layers", type=int, default=45)
+    ap.add_argument("--delta-clip", type=float, default=0.0)
     args = ap.parse_args()
 
     t0 = time.time()
@@ -251,6 +295,7 @@ def main():
     b_nll, b_ppl, b_t1, r_nll, r_ppl, r_t1 = evaluate(bridge, h_va, e_va, y_va, mu_e_t, head_tensors)
     print(f"[Epoch 0] val BASE: NLL={b_nll:.5f} PPL={b_ppl:.3f} top1={b_t1:.2f}% | init PPL={r_ppl:.3f}")
 
+    best_val_score = float("inf")
     best_val_nll = b_nll
     best_state = {k: v.detach().cpu().clone() for k, v in bridge.state_dict().items()}
 
@@ -260,6 +305,8 @@ def main():
         order = rng.permutation(n_tr)
         tr_ce_sum = 0.0
         tr_kl_sum = 0.0
+        tr_skl_sum = 0.0
+        tr_rel_sum = 0.0
         steps = 0
 
         for i in range(0, n_tr, args.batch_size):
@@ -273,7 +320,7 @@ def main():
                 base_logp = F.log_softmax(base_logits, dim=-1)
                 base_p = base_logp.exp()
 
-            h_out = bridge(hb, eb)
+            h_out, rel_norm, _ = bridge(hb, eb, return_stats=True)
             logits = maxwell_head_logits(h_out, hc_fn, hc_scale, hc_base, out_norm, lm_head)
             logp = F.log_softmax(logits, dim=-1)
 
@@ -281,6 +328,20 @@ def main():
             # KL(p_base || p_grafted) = sum p_base * (log p_base - log p_grafted)
             kl = (base_p * (base_logp - logp)).sum(dim=-1).mean()
             loss = ce + args.kl_beta * kl
+
+            skl_val = 0.0
+            if args.shuf_kl_beta > 0.0 and eb.shape[0] > 1:
+                perm = torch.roll(torch.arange(eb.shape[0], device=device), shifts=1)
+                h_shuf = bridge(hb, eb[perm])
+                shuf_logits = maxwell_head_logits(h_shuf, hc_fn, hc_scale, hc_base, out_norm, lm_head)
+                shuf_logp = F.log_softmax(shuf_logits, dim=-1)
+                # Force shuffled Engram inputs to leave base distribution unchanged (prevents isotropic softening!)
+                skl = (base_p * (base_logp - shuf_logp)).sum(dim=-1).mean()
+                loss = loss + args.shuf_kl_beta * skl
+                skl_val = skl.item()
+
+            if args.delta_reg > 0.0:
+                loss = loss + args.delta_reg * (rel_norm ** 2)
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -290,22 +351,43 @@ def main():
 
             tr_ce_sum += ce.item()
             tr_kl_sum += kl.item()
+            tr_skl_sum += skl_val
+            tr_rel_sum += rel_norm.item()
             steps += 1
 
         _, _, _, r_nll, r_ppl, r_t1 = evaluate(bridge, h_va, e_va, y_va, mu_e_t, head_tensors, shuffled=False)
         _, _, _, s_nll, s_ppl, s_t1 = evaluate(bridge, h_va, e_va, y_va, mu_e_t, head_tensors, shuffled=True)
         print(
-            f"[Epoch {ep:2d}] tr_CE={tr_ce_sum/steps:.4f} tr_KL={tr_kl_sum/steps:.4f} | "
+            f"[Epoch {ep:2d}] tr_CE={tr_ce_sum/steps:.4f} tr_KL={tr_kl_sum/steps:.4f} "
+            f"shuf_KL={tr_skl_sum/steps:.4f} ||d||/||h||={tr_rel_sum/steps:.4f} | "
             f"val REAL: PPL={r_ppl:.3f} (vs base {r_ppl-b_ppl:+.3f}, top1={r_t1:.2f}%) | "
             f"SHUF: PPL={s_ppl:.3f} (shuf-real={s_ppl-r_ppl:+.3f})"
         )
-        if r_nll < best_val_nll:
+        # Model selection: require genuine transfer (REAL must beat both BASE and SHUF when shuf_kl_beta > 0)
+        sel_score = r_nll if (args.shuf_kl_beta <= 0.0 or r_nll < s_nll) else float("inf")
+        if sel_score < best_val_score:
+            best_val_score = sel_score
             best_val_nll = r_nll
             best_state = {k: v.detach().cpu().clone() for k, v in bridge.state_dict().items()}
 
     bridge.load_state_dict(best_state)
-    write_rkad_v2(args.out, meta["target_layer"], args.src_layer, mu_e, bridge)
-    print(f"Saved best Level-3 gated RKAD v2 -> {args.out} (best val PPL={math.exp(best_val_nll):.3f} vs base {b_ppl:.3f}) in {time.time()-t0:.1f}s")
+    if args.rkad_v3:
+        manifest = {
+            "schema": "rookery.engram.adapter.v3",
+            "provider_arch": args.provider_arch,
+            "provider_mode": "ngram_hash",
+            "provider_fingerprint": args.provider_fingerprint,
+            "host_arch": args.host_arch,
+            "host_n_layers": args.host_n_layers,
+            "host_d_embd": meta["d_host"],
+            "host_hc_mult": meta["hc"],
+            "calibration": f"level3_ce_kl_N{n_tr}_drop{args.dropout}",
+        }
+        write_rkad_v3(args.out, meta["target_layer"], args.src_layer, mu_e, bridge, manifest, args.delta_clip)
+        print(f"Saved best Level-3 gated RKAD v3 -> {args.out} (best val PPL={math.exp(best_val_nll):.3f} vs base {b_ppl:.3f}) in {time.time()-t0:.1f}s")
+    else:
+        write_rkad_v2(args.out, meta["target_layer"], args.src_layer, mu_e, bridge)
+        print(f"Saved best Level-3 gated RKAD v2 -> {args.out} (best val PPL={math.exp(best_val_nll):.3f} vs base {b_ppl:.3f}) in {time.time()-t0:.1f}s")
 
 
 if __name__ == "__main__":
