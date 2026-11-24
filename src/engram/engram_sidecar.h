@@ -172,13 +172,22 @@ public:
     void close_calibration_dump();
 
     // Optional: enable "RKCE" v1 tail-CE dump at a target host layer (e.g. L44 right before hc_head+output_norm+lm_head).
-    void enable_tail_ce_dump(const std::string & out_path, int target_host_layer);
+    // If src_engram_layer >= 0, dumps only that single Engram layer (2x faster & smaller for single-layer training).
+    void enable_tail_ce_dump(const std::string & out_path, int target_host_layer, int src_engram_layer = -1);
     void set_tail_ce_targets(const std::vector<int32_t> & targets,
                              const std::vector<int32_t> & host_tokens,
                              int start_pos);
     void close_tail_ce_dump();
 
     void set_shuffle_salt(uint64_t salt) { table_.set_shuffle_salt(salt); }
+    void set_mask_special_tokens(bool enable) { mask_special_tokens_ = enable; }
+    bool mask_special_tokens() const { return mask_special_tokens_; }
+    bool should_mask_token(int32_t host_tok) const {
+        return mask_special_tokens_ && host_tok_ != nullptr && host_tok_->is_special_token(host_tok);
+    }
+    float resolve_token_scale(int32_t host_tok, float eff_scale) const {
+        return should_mask_token(host_tok) ? 0.0f : eff_scale;
+    }
     void set_global_scale(float s) { default_params_.scale = s; }
     float global_scale() const { return default_params_.scale; }
     void set_default_params(const EngramRuntimeParams & p) { default_params_ = p; }
@@ -244,6 +253,7 @@ private:
     int                     max_batch_      = 512;
     EngramRuntimeParams     default_params_{};
     EngramAdapterManifest   manifest_{};
+    bool                    mask_special_tokens_ = true;
     bool                    gpu_profile_    = false;
     EngramProfileStats      prof_{};
 
@@ -272,6 +282,7 @@ private:
     // Optional tail-CE dump file ("RKCE" v1)
     FILE *               ce_fp_            = nullptr;
     int                  ce_target_layer_  = -1;
+    int                  ce_src_layer_     = -1; // -1 = all Engram layers, >=0 = single Engram layer
     uint64_t             ce_tokens_        = 0;
     std::vector<int32_t> ce_cur_targets_;
     std::vector<std::vector<uint16_t>> ce_cur_e_f16_; // [n_eng_layers][T * d_engram]

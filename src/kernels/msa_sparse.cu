@@ -30,7 +30,6 @@ __global__ void idx_k_write_f16_kernel(
 
 // ============================================================================
 // Split-Block MSA Indexer: 1 block per (block_b, idx_head, token)
-// Saturates ALL 80-82 SMs (e.g. 256 * 4 = 1024 blocks vs 4 blocks previously -> ~80x faster!)
 // ============================================================================
 __global__ void msa_indexer_score_blocks_d128_kernel(
     const float *   __restrict__ iq,         // [T, n_idx_heads, 128]
@@ -154,10 +153,176 @@ __global__ void msa_indexer_select_topk_kernel(
 }
 
 // ============================================================================
-// Split-K Zero-Copy Block-Sparse + Dense FlashAttention over Q8_0 / F16 KV Cache
-// For decode (T <= 4): splits KV across S=16 blocks per head -> 32*16 = 512 blocks!
-// Saturates ALL SMs on RTX 3090 (82 SMs) and V100 (80 SMs) with ZERO KV copies!
+// GQA-8 Shared-KV Split-K FlashAttention (T <= 4, head_dim == 128, GQA == 8)
+// 1 CTA per (kvh, split, t) with 8 warps = all 8 Q heads sharing KV head `kvh`!
+// Cooperatively loads 8 KV positions ONCE into shared memory (8 KB total),
+// cutting KV cache DRAM bandwidth by 8x for both dense & MSA block-sparse decode!
 // ============================================================================
+template <bool KV_Q8_0>
+__device__ __forceinline__ void load_one_kv_to_smem(
+    int p, int n_kv_heads, int kvh, int lane, int blk_idx, int blk_off,
+    const void * k_cache, const void * v_cache,
+    float4 * dst_k, float4 * dst_v) {
+
+    if constexpr (KV_Q8_0) {
+        const auto * kc = static_cast<const BlockQ8_0 *>(k_cache);
+        const auto * vc = static_cast<const BlockQ8_0 *>(v_cache);
+        const size_t blk = (static_cast<size_t>(p) * n_kv_heads + kvh) * 4 + blk_idx;
+        const BlockQ8_0 & kb = kc[blk];
+        const BlockQ8_0 & vb = vc[blk];
+        __half kd_h, vd_h;
+        *reinterpret_cast<uint16_t *>(&kd_h) = __ldg(&kb.d);
+        *reinterpret_cast<uint16_t *>(&vd_h) = __ldg(&vb.d);
+        const float kd = __half2float(kd_h), vd = __half2float(vd_h);
+        const uint16_t kq01 = __ldg(reinterpret_cast<const uint16_t *>(kb.qs + blk_off));
+        const uint16_t kq23 = __ldg(reinterpret_cast<const uint16_t *>(kb.qs + blk_off + 2));
+        const uint16_t vq01 = __ldg(reinterpret_cast<const uint16_t *>(vb.qs + blk_off));
+        const uint16_t vq23 = __ldg(reinterpret_cast<const uint16_t *>(vb.qs + blk_off + 2));
+        dst_k[lane] = make_float4(
+            kd * static_cast<float>(static_cast<int8_t>(kq01 & 0xFF)),
+            kd * static_cast<float>(static_cast<int8_t>(kq01 >> 8)),
+            kd * static_cast<float>(static_cast<int8_t>(kq23 & 0xFF)),
+            kd * static_cast<float>(static_cast<int8_t>(kq23 >> 8)));
+        dst_v[lane] = make_float4(
+            vd * static_cast<float>(static_cast<int8_t>(vq01 & 0xFF)),
+            vd * static_cast<float>(static_cast<int8_t>(vq01 >> 8)),
+            vd * static_cast<float>(static_cast<int8_t>(vq23 & 0xFF)),
+            vd * static_cast<float>(static_cast<int8_t>(vq23 >> 8)));
+    } else {
+        const auto * kc = static_cast<const uint2 *>(k_cache);
+        const auto * vc = static_cast<const uint2 *>(v_cache);
+        const size_t off4 = (static_cast<size_t>(p) * n_kv_heads + kvh) * 32 + lane;
+        const uint2 kp = __ldg(&kc[off4]), vp = __ldg(&vc[off4]);
+        const float2 kf0 = __half22float2(*reinterpret_cast<const __half2 *>(&kp.x));
+        const float2 kf1 = __half22float2(*reinterpret_cast<const __half2 *>(&kp.y));
+        const float2 vf0 = __half22float2(*reinterpret_cast<const __half2 *>(&vp.x));
+        const float2 vf1 = __half22float2(*reinterpret_cast<const __half2 *>(&vp.y));
+        dst_k[lane] = make_float4(kf0.x, kf0.y, kf1.x, kf1.y);
+        dst_v[lane] = make_float4(vf0.x, vf0.y, vf1.x, vf1.y);
+    }
+}
+
+template <bool KV_Q8_0, int SPLITS>
+__global__ __launch_bounds__(256) void gqa8_flash_attn_msa_splitk_d128_kernel(
+    const float *   __restrict__ q,
+    const void *    __restrict__ k_cache,
+    const void *    __restrict__ v_cache,
+    const int32_t * __restrict__ pos,
+    const int32_t * __restrict__ msa_blocks,
+    const int32_t * __restrict__ msa_k_count,
+    float *         __restrict__ part_m,   // [T, n_heads, SPLITS]
+    float *         __restrict__ part_l,   // [T, n_heads, SPLITS]
+    float *         __restrict__ part_o,   // [T, n_heads, SPLITS, 128]
+    int n_heads, int n_kv_heads, int blk_size, int k_max, float scale) {
+
+    const int kvh  = blockIdx.x;
+    const int s    = blockIdx.y;
+    const int t    = blockIdx.z;
+    const int lane = threadIdx.x; // 0..31 (4 dims per lane)
+    const int warp = threadIdx.y; // 0..7  (one warp per Q head in GQA-8 group)
+    const int h    = kvh * 8 + warp;
+
+    const int kv_len = pos[t] + 1;
+    const int k_sel  = msa_k_count ? msa_k_count[t] : 0;
+
+    const float4 q4 = reinterpret_cast<const float4 *>(q + (static_cast<size_t>(t) * n_heads + h) * 128)[lane];
+    const float q0 = q4.x * scale, q1 = q4.y * scale, q2 = q4.z * scale, q3 = q4.w * scale;
+
+    float m_i = -FLT_MAX;
+    float l_i = 0.0f;
+    float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
+
+    __shared__ float4 s_k[8][32]; // 4 KB
+    __shared__ float4 s_v[8][32]; // 4 KB
+
+    const int blk_idx = lane >> 3;
+    const int blk_off = (lane & 7) << 2;
+
+    auto process_range = [&](int r0, int r1) {
+        for (int p0 = r0; p0 < r1; p0 += 8) {
+            const int cnt = (p0 + 8 <= r1) ? 8 : (r1 - p0);
+            if (warp < cnt) {
+                load_one_kv_to_smem<KV_Q8_0>(
+                    p0 + warp, n_kv_heads, kvh, lane, blk_idx, blk_off,
+                    k_cache, v_cache, s_k[warp], s_v[warp]);
+            }
+            __syncthreads();
+
+            if (cnt == 8) {
+                float sc[8];
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const float4 kv = s_k[j][lane];
+                    const float dot = warp_sum(q0 * kv.x + q1 * kv.y + q2 * kv.z + q3 * kv.w);
+                    sc[j] = __shfl_sync(0xffffffffu, dot, 0);
+                }
+                float m_tile = fmaxf(fmaxf(fmaxf(sc[0], sc[1]), fmaxf(sc[2], sc[3])),
+                                     fmaxf(fmaxf(sc[4], sc[5]), fmaxf(sc[6], sc[7])));
+                const float m_new = fmaxf(m_i, m_tile);
+                const float alpha = __expf(m_i - m_new);
+                l_i *= alpha;
+                o0  *= alpha;
+                o1  *= alpha;
+                o2  *= alpha;
+                o3  *= alpha;
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const float beta = __expf(sc[j] - m_new);
+                    const float4 vv = s_v[j][lane];
+                    l_i += beta;
+                    o0  += beta * vv.x;
+                    o1  += beta * vv.y;
+                    o2  += beta * vv.z;
+                    o3  += beta * vv.w;
+                }
+                m_i = m_new;
+            } else {
+                for (int j = 0; j < cnt; ++j) {
+                    const float4 kv = s_k[j][lane];
+                    const float4 vv = s_v[j][lane];
+                    const float dot = warp_sum(q0 * kv.x + q1 * kv.y + q2 * kv.z + q3 * kv.w);
+                    const float score = __shfl_sync(0xffffffffu, dot, 0);
+                    const float m_new = fmaxf(m_i, score);
+                    const float alpha = __expf(m_i - m_new);
+                    const float beta  = __expf(score - m_new);
+                    l_i = l_i * alpha + beta;
+                    o0  = o0  * alpha + beta * vv.x;
+                    o1  = o1  * alpha + beta * vv.y;
+                    o2  = o2  * alpha + beta * vv.z;
+                    o3  = o3  * alpha + beta * vv.w;
+                    m_i = m_new;
+                }
+            }
+            __syncthreads();
+        }
+    };
+
+    if (k_sel == 0) {
+        const int chunk = (kv_len + SPLITS - 1) / SPLITS;
+        const int p0    = s * chunk;
+        const int p1    = (p0 + chunk < kv_len) ? (p0 + chunk) : kv_len;
+        if (p0 < p1) process_range(p0, p1);
+    } else {
+        const int32_t * blks = msa_blocks + (static_cast<size_t>(t) * n_kv_heads + kvh) * k_max;
+        const int bchunk = (k_sel + SPLITS - 1) / SPLITS;
+        const int b0     = s * bchunk;
+        const int b1     = (b0 + bchunk < k_sel) ? (b0 + bchunk) : k_sel;
+        for (int bi = b0; bi < b1; ++bi) {
+            const int base_p = blks[bi] * blk_size;
+            const int end_p  = (base_p + blk_size < kv_len) ? (base_p + blk_size) : kv_len;
+            if (base_p < end_p) process_range(base_p, end_p);
+        }
+    }
+
+    const size_t slot = (static_cast<size_t>(t) * n_heads + h) * SPLITS + s;
+    if (lane == 0) {
+        part_m[slot] = m_i;
+        part_l[slot] = l_i;
+    }
+    reinterpret_cast<float4 *>(part_o + slot * 128)[lane] = make_float4(o0, o1, o2, o3);
+}
+
+// Generic Split-K fallback (for non-GQA-8 head ratios)
 template <bool KV_Q8_0>
 __device__ __forceinline__ void attend_one_pos(
     int p, int n_kv_heads, int kvh, int lane, int blk_idx, int blk_off,
@@ -176,7 +341,6 @@ __device__ __forceinline__ void attend_one_pos(
         *reinterpret_cast<uint16_t *>(&kd_h) = __ldg(&kb.d);
         *reinterpret_cast<uint16_t *>(&vd_h) = __ldg(&vb.d);
         const float kd = __half2float(kd_h), vd = __half2float(vd_h);
-        // Load 4 int8s with two 16-bit __ldg loads (2-byte aligned inside BlockQ8_0!)
         const uint16_t kq01 = __ldg(reinterpret_cast<const uint16_t *>(kb.qs + blk_off));
         const uint16_t kq23 = __ldg(reinterpret_cast<const uint16_t *>(kb.qs + blk_off + 2));
         const uint16_t vq01 = __ldg(reinterpret_cast<const uint16_t *>(vb.qs + blk_off));
@@ -222,9 +386,9 @@ __global__ void gqa_flash_attn_msa_splitk_d128_kernel(
     const int32_t * __restrict__ pos,
     const int32_t * __restrict__ msa_blocks,
     const int32_t * __restrict__ msa_k_count,
-    float *         __restrict__ part_m,   // [T, n_heads, SPLITS]
-    float *         __restrict__ part_l,   // [T, n_heads, SPLITS]
-    float *         __restrict__ part_o,   // [T, n_heads, SPLITS, 128]
+    float *         __restrict__ part_m,
+    float *         __restrict__ part_l,
+    float *         __restrict__ part_o,
     int n_heads, int n_kv_heads, int blk_size, int k_max, float scale) {
 
     const int h = blockIdx.x;
@@ -318,7 +482,7 @@ __global__ void gqa_flash_attn_splitk_reduce_d128_kernel(
         make_float4(o0 * inv_l, o1 * inv_l, o2 * inv_l, o3 * inv_l);
 }
 
-// Single-pass warp kernel for large prefill batches (T > 4), where T * n_heads already saturates all SMs.
+// Single-pass warp kernel for sparse prefill batches (T > 4 with active MSA top-K blocks)
 template <bool KV_Q8_0>
 __global__ void gqa_flash_attn_msa_d128_warp_kernel(
     const float *   __restrict__ q,
@@ -417,15 +581,37 @@ void launch_gqa_attn_msa(
         float * part_l = part_m + n_slots;
         float * part_o = part_l + n_slots;
 
-        dim3 grid(n_heads, S, T);
-        if (kv_is_q8_0) {
-            gqa_flash_attn_msa_splitk_d128_kernel<true, S><<<grid, 32, 0, stream>>>(
-                d_q, d_k_cache, d_v_cache, d_pos, d_msa_blocks, d_msa_k_count,
-                part_m, part_l, part_o, n_heads, n_kv_heads, blk_size, k_max, scale);
+        if (head_dim == 128 && n_kv_heads > 0 && n_heads == n_kv_heads * 8) {
+            // GQA-8 Shared-KV Split-K: S=28 (4*28=112 CTAs = exact 2 waves on 56-SM P100) + 8x less KV DRAM traffic!
+            constexpr int S8 = 28;
+            const size_t n_slots8 = static_cast<size_t>(T) * n_heads * S8;
+            float * pm8 = static_cast<float *>(d_scratch);
+            float * pl8 = pm8 + n_slots8;
+            float * po8 = pl8 + n_slots8;
+            dim3 grid(n_kv_heads, S8, T);
+            if (kv_is_q8_0) {
+                gqa8_flash_attn_msa_splitk_d128_kernel<true, S8><<<grid, dim3(32, 8), 0, stream>>>(
+                    d_q, d_k_cache, d_v_cache, d_pos, d_msa_blocks, d_msa_k_count,
+                    pm8, pl8, po8, n_heads, n_kv_heads, blk_size, k_max, scale);
+            } else {
+                gqa8_flash_attn_msa_splitk_d128_kernel<false, S8><<<grid, dim3(32, 8), 0, stream>>>(
+                    d_q, d_k_cache, d_v_cache, d_pos, d_msa_blocks, d_msa_k_count,
+                    pm8, pl8, po8, n_heads, n_kv_heads, blk_size, k_max, scale);
+            }
+            gqa_flash_attn_splitk_reduce_d128_kernel<S8><<<dim3(n_heads, T), 32, 0, stream>>>(
+                pm8, pl8, po8, d_out, n_heads);
+            return;
         } else {
-            gqa_flash_attn_msa_splitk_d128_kernel<false, S><<<grid, 32, 0, stream>>>(
-                d_q, d_k_cache, d_v_cache, d_pos, d_msa_blocks, d_msa_k_count,
-                part_m, part_l, part_o, n_heads, n_kv_heads, blk_size, k_max, scale);
+            dim3 grid(n_heads, S, T);
+            if (kv_is_q8_0) {
+                gqa_flash_attn_msa_splitk_d128_kernel<true, S><<<grid, 32, 0, stream>>>(
+                    d_q, d_k_cache, d_v_cache, d_pos, d_msa_blocks, d_msa_k_count,
+                    part_m, part_l, part_o, n_heads, n_kv_heads, blk_size, k_max, scale);
+            } else {
+                gqa_flash_attn_msa_splitk_d128_kernel<false, S><<<grid, 32, 0, stream>>>(
+                    d_q, d_k_cache, d_v_cache, d_pos, d_msa_blocks, d_msa_k_count,
+                    part_m, part_l, part_o, n_heads, n_kv_heads, blk_size, k_max, scale);
+            }
         }
         gqa_flash_attn_splitk_reduce_d128_kernel<S><<<dim3(n_heads, T), 32, 0, stream>>>(
             part_m, part_l, part_o, d_out, n_heads);

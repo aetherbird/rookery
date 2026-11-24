@@ -48,6 +48,24 @@ void launch_qk_norm_rope_neox(
     float           rope_freq_base,
     cudaStream_t    stream);
 
+void launch_maxwell_qk_norm_rope_kv_write(
+    float *         d_q,
+    const float *   d_k,
+    const float *   d_v,
+    const float *   d_q_norm_w,
+    const float *   d_k_norm_w,
+    void *          d_k_cache,
+    void *          d_v_cache,
+    bool            kv_is_q8_0,
+    const int32_t * d_pos,
+    int             n_tokens,
+    int             n_heads,
+    int             n_kv_heads,
+    int             head_dim,
+    float           rms_eps,
+    float           rope_freq_base,
+    cudaStream_t    stream);
+
 void launch_silu_mul(
     const float * d_gate,
     const float * d_up,
@@ -98,6 +116,20 @@ void launch_hc_post(
     int           n_embd,
     int           n_tokens,
     cudaStream_t  stream);
+
+void launch_hc_post_flat_rmsnorm_mix(
+    const float *        d_sub,
+    const float *        d_residual,
+    const float *        d_post,
+    const float *        d_comb,
+    float *              d_out,
+    const DeviceTensor & hc_fn,
+    float *              d_mixes,
+    int                  n_embd,
+    int                  n_out,
+    int                  n_tokens,
+    float                rms_eps,
+    cudaStream_t         stream);
 
 void launch_hc_head_rmsnorm(
     const float * d_inpL,
@@ -241,7 +273,10 @@ void launch_gqa_attn(
     int             n_kv_heads,
     int             head_dim,
     float           scale,
-    cudaStream_t    stream);
+    cudaStream_t    stream,
+    cublasHandle_t  cublas = nullptr,
+    size_t          scratch_bytes = 0,
+    int             kv_len_max = 0);
 
 // --- Maxwell Block-Sparse Attention (MSA) ---
 void launch_idx_k_write_f16(
@@ -690,5 +725,47 @@ void launch_gqa_attn_d256_qsa(
     float * d_out, void * d_scratch, size_t scratch_bytes,
     int T, int n_head, int n_kv, int max_sel, float scale,
     cublasHandle_t cublas, int kv_len_max, int top_k, int kpool, cudaStream_t stream);
+
+// --- Fast Q3_K SoA & sm_60 Native FP16 (half2) / sm_61+ dp4a K-Quant & MoE Kernels ---
+void launch_embedding_q3_k_soa(
+    const DeviceTensor & tok_embd, const int32_t * d_tokens, float * d_out,
+    int n_embd, int hc_mult, int n_tokens, cudaStream_t stream);
+
+void launch_dequant_q3_k_soa(
+    const DeviceTensor & W, int64_t b0, int64_t nblk, void * d_dst, bool dst_f16, cudaStream_t stream);
+
+void launch_linear_q3_k_soa_prequant(
+    const DeviceTensor & W, const void * d_xq8, float * d_y, int T, cudaStream_t stream);
+
+bool try_launch_linear_kquant_prefill_sm60_f16(
+    cublasHandle_t cublas, const DeviceTensor & W,
+    const float * d_x, float * d_y, int T,
+    void * d_scratch, size_t scratch_bytes, cudaStream_t stream);
+
+bool try_launch_linear_kquant_sm60_h2(
+    const DeviceTensor & W, const float * d_x, float * d_y, int T,
+    void * d_scratch, size_t scratch_bytes, cudaStream_t stream);
+
+bool try_launch_linear_multi_sm60_h2(
+    const DeviceTensor * const * Ws, float * const * Ys, int n_mat,
+    const float * d_x, int T, void * d_scratch, size_t scratch_bytes, cudaStream_t stream);
+
+void launch_moe_gate_up_q3_k_soa_only(
+    const DeviceTensor & gate_exps, const DeviceTensor & up_exps,
+    const void * d_xq8, const int32_t * d_top_ids, float * d_act,
+    int T, int k_used, float clamp_exp, cudaStream_t stream);
+
+void launch_moe_down_q3_k_soa_only(
+    const DeviceTensor & down_exps, const void * d_aq8,
+    const int32_t * d_top_ids, const float * d_top_w, float * d_out,
+    int T, int k_used, cudaStream_t stream);
+
+bool try_launch_moe_q3k_q4k_fast(
+    cublasHandle_t cublas,
+    const DeviceTensor & gate_exps, const DeviceTensor & up_exps, const DeviceTensor & down_exps,
+    const DeviceTensor & gate_shexp, const DeviceTensor & up_shexp, const DeviceTensor & down_shexp,
+    const float * d_x, const int32_t * d_top_ids, const float * d_top_w,
+    float * d_out, void * d_scratch, size_t scratch_bytes,
+    int T, int k_used, float clamp_exp, float clamp_shexp, cudaStream_t stream);
 
 } // namespace rookery

@@ -76,7 +76,7 @@ struct MaxwellMtpWeights {
     DeviceTensor        eh_proj, enorm, hnorm;
     DeviceTensor        shared_head_norm;
     DeviceTensor        hc_head_fn, hc_head_base, hc_head_scale;
-    DeviceTensor        tok_embd; // copy on last_dev for zero-hop MTP
+    DeviceTensor        tok_embd; // shared with tok_embd_ when on same GPU, else copy on last_dev
 };
 
 struct MtpStats {
@@ -157,7 +157,6 @@ private:
 
         float *   d_inpL      = nullptr;
         float *   d_inpL_alt  = nullptr;
-        float *   d_flat_norm = nullptr;
         float *   d_mixes     = nullptr;
         float *   d_post      = nullptr;
         float *   d_comb      = nullptr;
@@ -174,8 +173,8 @@ private:
         float *   d_top_w     = nullptr;
         int32_t * d_tokens    = nullptr;
         int32_t * d_pos       = nullptr;
-        float *   d_logits    = nullptr; // [2, n_vocab] on last GPU
-        int32_t * d_argmax    = nullptr; // [2] on last GPU
+        float *   d_logits    = nullptr; // [2, n_vocab] on head GPU
+        int32_t * d_argmax    = nullptr; // [2] on head GPU
         void *    d_scratch   = nullptr;
         size_t    scratch_bytes = 0;
 
@@ -194,7 +193,9 @@ private:
         int32_t * d_mtp_pos    = nullptr; // [max_batch]
     };
 
-    void run_gpu_segment(size_t gi, int T, bool run_argmax, bool logits_all_t = false);
+    void run_gpu_segment(size_t gi, int T, bool run_argmax, bool logits_all_t = false, int kv_len_max = 0);
+    void run_head_on_head_gpu(int head_T, bool run_argmax);
+    void run_mtp_body_on_last_gpu(const float * d_h_states, int T_mtp, int kv_len_max = 0);
     int32_t run_mtp_on_last_gpu(const int32_t * h_tokens, const float * d_h_states, const int32_t * h_positions, int T_mtp);
     void capture_decode_graphs(int T);
     void invalidate_graphs() noexcept;
@@ -213,6 +214,16 @@ private:
     void *                           k_cache_mtp_ = nullptr;
     void *                           v_cache_mtp_ = nullptr;
     std::vector<DevRuntime>          runtimes_;
+    // Asymmetric dual-GPU mode: cold token_embd on last GPU, hot lm_head on GPU 0, max layers on GPU 0!
+    bool                             asym_mode_       = false;
+    size_t                           embd_gi_         = 0;
+    size_t                           head_gi_         = 0;
+    cudaGraphExec_t                  graph_embd_t1_   = nullptr;
+    cudaGraphExec_t                  graph_embd_t2_   = nullptr;
+    cudaGraphExec_t                  graph_head_t1_   = nullptr;
+    cudaGraphExec_t                  graph_head_t2_   = nullptr;
+    cudaGraphExec_t                  graph_mtp_t1_    = nullptr;
+    cudaGraphExec_t                  graph_mtp_t2_    = nullptr;
     int                              max_batch_       = 512;
     bool                             use_cuda_graphs_ = true;
     bool                             graphs_t1_ready_ = false;

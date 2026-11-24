@@ -722,7 +722,7 @@ void launch_linear(
     }
 
     if (W.dtype == DType::F32 && (T == 1 || T == 2) && (K & 3) == 0 && K <= 4096) {
-        constexpr int wpb_f = 8;
+        const int wpb_f = (N <= 512) ? 4 : 8;
         const size_t smem = static_cast<size_t>(T) * K * sizeof(float);
         if (T == 2) {
             gemv_f32_smem_kernel<true><<<(N + wpb_f - 1) / wpb_f, dim3(32, wpb_f), smem, stream>>>(

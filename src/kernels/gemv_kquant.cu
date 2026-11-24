@@ -3862,6 +3862,14 @@ void dispatch_linear_kquant_prefill_f16(
                 static_cast<const int8_t *>(W.scales_ptr) + b0 * 16,
                 static_cast<const uint16_t *>(W.d_ptr) + b0,
                 d_w16, nblk);
+        } else if constexpr (DT == DType::Q3_K) {
+            if (W.is_soa) {
+                launch_dequant_q3_k_soa(W, static_cast<int64_t>(m0) * nb_row, nblk, d_w16, true, stream);
+            } else {
+                constexpr size_t B = block_bytes_of<DT>();
+                dequant_kquant_kernel<DT, __half><<<(nblk + wpb - 1) / wpb, dim3(32, wpb), 0, stream>>>(
+                    static_cast<const uint8_t *>(W.ptr) + static_cast<size_t>(m0) * nb_row * B, d_w16, nblk);
+            }
         } else {
             constexpr size_t B = block_bytes_of<DT>();
             dequant_kquant_kernel<DT, __half><<<(nblk + wpb - 1) / wpb, dim3(32, wpb), 0, stream>>>(
@@ -3905,6 +3913,14 @@ void dispatch_linear_kquant_prefill_f32(
                 static_cast<const int8_t *>(W.scales_ptr) + b0 * 16,
                 static_cast<const uint16_t *>(W.d_ptr) + b0,
                 d_w32, nblk);
+        } else if constexpr (DT == DType::Q3_K) {
+            if (W.is_soa) {
+                launch_dequant_q3_k_soa(W, static_cast<int64_t>(m0) * nb_row, nblk, d_w32, false, stream);
+            } else {
+                constexpr size_t B = block_bytes_of<DT>();
+                dequant_kquant_kernel<DT, float><<<(nblk + wpb - 1) / wpb, dim3(32, wpb), 0, stream>>>(
+                    static_cast<const uint8_t *>(W.ptr) + static_cast<size_t>(m0) * nb_row * B, d_w32, nblk);
+            }
         } else {
             constexpr size_t B = block_bytes_of<DT>();
             dequant_kquant_kernel<DT, float><<<(nblk + wpb - 1) / wpb, dim3(32, wpb), 0, stream>>>(
@@ -3980,6 +3996,11 @@ void launch_linear_prequant(
     const int K_blocks = K >> 5;
     constexpr int wpb  = 8;
     const auto * xq = static_cast<const BlockQ8_1_Act *>(d_xq8);
+
+    if (W.dtype == DType::Q3_K && W.is_soa) {
+        launch_linear_q3_k_soa_prequant(W, d_xq8, d_y, T, stream);
+        return;
+    }
 
     if (W.dtype == DType::Q6_K && W.is_soa) {
         const auto * ql = static_cast<const int4 *>(W.ptr);
@@ -4111,6 +4132,9 @@ void launch_linear_kquant(
     const size_t align_x = (x_f16_bytes + 255) & ~size_t(255);
 
     if (cublas != nullptr && T >= 16) {
+        if (try_launch_linear_kquant_prefill_sm60_f16(cublas, W, d_x, d_y, T, d_scratch, scratch_bytes, stream)) {
+            return;
+        }
         const bool use_tc = device_has_tensor_cores(W.device);
         if (use_tc && align_x + static_cast<size_t>(K) * sizeof(__half) <= scratch_bytes) {
             switch (W.dtype) {
@@ -4143,6 +4167,10 @@ void launch_linear_kquant(
         }
     }
 
+    if (try_launch_linear_kquant_sm60_h2(W, d_x, d_y, T, d_scratch, scratch_bytes, stream)) {
+        return;
+    }
+
     launch_quantize_q8_1(d_x, d_scratch, K, T, stream);
     launch_linear_prequant(W, d_scratch, d_y, T, stream);
 }
@@ -4170,7 +4198,11 @@ void launch_embedding_kquant(
         return;
     }
     if (tok_embd.dtype == DType::Q3_K) {
-        embedding_kquant_generic_kernel<DType::Q3_K><<<grid, 32, 0, stream>>>(tbl, d_tokens, d_out, n_embd, hc_mult);
+        if (tok_embd.is_soa) {
+            launch_embedding_q3_k_soa(tok_embd, d_tokens, d_out, n_embd, hc_mult, n_tokens, stream);
+        } else {
+            embedding_kquant_generic_kernel<DType::Q3_K><<<grid, 32, 0, stream>>>(tbl, d_tokens, d_out, n_embd, hc_mult);
+        }
         return;
     }
     if (tok_embd.dtype == DType::IQ4_XS) {
@@ -4187,6 +4219,14 @@ void launch_moe_ffn_kquant_with_shared(
     const float * d_x, const int32_t * d_top_ids, const float * d_top_w,
     float * d_out, void * d_scratch, size_t scratch_bytes,
     int T, int k_used, float clamp_exp, float clamp_shexp, cudaStream_t stream) {
+
+    if (try_launch_moe_q3k_q4k_fast(
+            cublas, gate_exps, up_exps, down_exps,
+            gate_shexp, up_shexp, down_shexp,
+            d_x, d_top_ids, d_top_w, d_out, d_scratch, scratch_bytes,
+            T, k_used, clamp_exp, clamp_shexp, stream)) {
+        return;
+    }
 
     const int K     = static_cast<int>(gate_exps.ne[0]);
     const int ff    = static_cast<int>(gate_exps.ne[1]);
@@ -4336,7 +4376,7 @@ void launch_moe_ffn_kquant_with_shared(
         else if (gate_exps.dtype == DType::IQ2_XXS && up_exps.dtype == DType::IQ2_XXS) run_gu_grp(std::integral_constant<DType, DType::IQ2_XXS>{});
         else if (gate_exps.dtype == DType::IQ4_XS && up_exps.dtype == DType::IQ4_XS)   run_gu_grp(std::integral_constant<DType, DType::IQ4_XS>{});
         else if (gate_exps.dtype == DType::Q2_K && up_exps.dtype == DType::Q2_K)       run_gu_grp(std::integral_constant<DType, DType::Q2_K>{});
-        else if (gate_exps.dtype == DType::Q3_K && up_exps.dtype == DType::Q3_K)       run_gu_grp(std::integral_constant<DType, DType::Q3_K>{});
+        else if (gate_exps.dtype == DType::Q3_K && !gate_exps.is_soa && up_exps.dtype == DType::Q3_K && !up_exps.is_soa) run_gu_grp(std::integral_constant<DType, DType::Q3_K>{});
         else if (gate_exps.dtype == DType::Q4_K && up_exps.dtype == DType::Q4_K)       run_gu_grp(std::integral_constant<DType, DType::Q4_K>{});
         else if (gate_exps.dtype == DType::Q5_K && up_exps.dtype == DType::Q5_K)       run_gu_grp(std::integral_constant<DType, DType::Q5_K>{});
         else if (gate_exps.dtype == DType::IQ3_S && up_exps.dtype == DType::IQ3_S)     run_gu_grp(std::integral_constant<DType, DType::IQ3_S>{});
@@ -4464,6 +4504,8 @@ void launch_moe_ffn_kquant_with_shared(
         moe_gate_up_kquant_q8_1_kernel<DType::IQ4_XS, DType::IQ4_XS><<<gu_grid, dim3(32, wpb), gu_smem, stream>>>(gp, up, xq8, d_top_ids, act, ff, K, k_used, clamp_exp);
     } else if (gate_exps.dtype == DType::Q2_K && up_exps.dtype == DType::Q2_K) {
         moe_gate_up_kquant_q8_1_kernel<DType::Q2_K, DType::Q2_K><<<gu_grid, dim3(32, wpb), gu_smem, stream>>>(gp, up, xq8, d_top_ids, act, ff, K, k_used, clamp_exp);
+    } else if (gate_exps.dtype == DType::Q3_K && gate_exps.is_soa && up_exps.dtype == DType::Q3_K && up_exps.is_soa) {
+        launch_moe_gate_up_q3_k_soa_only(gate_exps, up_exps, xq8, d_top_ids, act, T, k_used, clamp_exp, stream);
     } else if (gate_exps.dtype == DType::Q3_K && up_exps.dtype == DType::Q3_K) {
         moe_gate_up_kquant_q8_1_kernel<DType::Q3_K, DType::Q3_K><<<gu_grid, dim3(32, wpb), gu_smem, stream>>>(gp, up, xq8, d_top_ids, act, ff, K, k_used, clamp_exp);
     } else if (gate_exps.dtype == DType::Q4_K && up_exps.dtype == DType::Q4_K) {
@@ -4523,6 +4565,7 @@ void launch_moe_ffn_kquant_with_shared(
     else if (down_exps.dtype == DType::IQ3_S)   run_dn(std::integral_constant<DType, DType::IQ3_S>{});
     else if (down_exps.dtype == DType::IQ3_XXS) run_dn(std::integral_constant<DType, DType::IQ3_XXS>{});
     else if (down_exps.dtype == DType::IQ4_XS)  run_dn(std::integral_constant<DType, DType::IQ4_XS>{});
+    else if (down_exps.dtype == DType::Q3_K && down_exps.is_soa) launch_moe_down_q3_k_soa_only(down_exps, aq8, d_top_ids, d_top_w, d_out, T, k_used, stream);
     else if (down_exps.dtype == DType::Q3_K)    run_dn(std::integral_constant<DType, DType::Q3_K>{});
     else if (down_exps.dtype == DType::Q4_K)    run_dn(std::integral_constant<DType, DType::Q4_K>{});
     else if (down_exps.dtype == DType::Q5_K)    run_dn(std::integral_constant<DType, DType::Q5_K>{});
@@ -4882,6 +4925,7 @@ void launch_inkling2_moe_ffn_kquant(
             nullptr, nullptr, nullptr, nullptr, aq8, nullptr, d_top_ids, d_top_w, d_out, K, ff, 0, k_used);
     }
     else if (down_exps.dtype == DType::Q2_K)    run_dn(std::integral_constant<DType, DType::Q2_K>{});
+    else if (down_exps.dtype == DType::Q3_K && down_exps.is_soa) launch_moe_down_q3_k_soa_only(down_exps, aq8, d_top_ids, d_top_w, d_out, T, k_used, stream);
     else if (down_exps.dtype == DType::Q3_K)    run_dn(std::integral_constant<DType, DType::Q3_K>{});
     else if (down_exps.dtype == DType::Q4_K)    run_dn(std::integral_constant<DType, DType::Q4_K>{});
     else if (down_exps.dtype == DType::Q5_K)    run_dn(std::integral_constant<DType, DType::Q5_K>{});

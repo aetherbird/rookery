@@ -55,6 +55,15 @@ struct PackedBlockQ6_K {
 };
 static_assert(sizeof(PackedBlockQ6_K) == 210, "PackedBlockQ6_K size");
 
+// Packed on-disk 110-byte BlockQ3_K (QK_K = 256)
+struct PackedBlockQ3_K {
+    uint8_t  hmask[32];
+    uint8_t  qs[64];
+    uint8_t  scales[12];
+    uint16_t d;
+};
+static_assert(sizeof(PackedBlockQ3_K) == 110, "PackedBlockQ3_K size");
+
 // Packed on-disk 18-byte BlockIQ4_NL (QK = 32)
 struct PackedBlockIQ4_NL {
     uint16_t d;
@@ -103,6 +112,33 @@ __global__ void unpack_q6_k_to_soa_kernel(
         dst_qh[b * 64 + i * 32 + lane] = s.qh[i * 32 + lane];
     }
     if (lane < 16) dst_sc[b * 16 + lane] = s.scales[lane];
+    if (lane == 0) dst_d[b] = s.d;
+}
+
+// Fast GPU unpack: packed 110-byte BlockQ3_K[n_blocks] -> 256B-aligned SoA (qs, hmask, scales[u32], d).
+// Enables 100% coalesced 128-bit LDG.128 loads in Q3_K SoA kernels with ZERO extra VRAM!
+__global__ void unpack_q3_k_to_soa_kernel(
+    const PackedBlockQ3_K * __restrict__ src,
+    uint8_t *               __restrict__ dst_qs,
+    uint8_t *               __restrict__ dst_hm,
+    uint32_t *              __restrict__ dst_sc,
+    uint16_t *              __restrict__ dst_d,
+    int64_t n_blocks) {
+
+    const int64_t b = static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
+    if (b >= n_blocks) return;
+    const int lane = threadIdx.x;
+    const PackedBlockQ3_K & s = src[b];
+    dst_qs[b * 64 + lane]      = s.qs[lane];
+    dst_qs[b * 64 + 32 + lane] = s.qs[32 + lane];
+    dst_hm[b * 32 + lane]      = s.hmask[lane];
+    if (lane < 3) {
+        const uint32_t w = static_cast<uint32_t>(s.scales[lane * 4 + 0])
+                         | (static_cast<uint32_t>(s.scales[lane * 4 + 1]) << 8)
+                         | (static_cast<uint32_t>(s.scales[lane * 4 + 2]) << 16)
+                         | (static_cast<uint32_t>(s.scales[lane * 4 + 3]) << 24);
+        dst_sc[b * 3 + lane] = w;
+    }
     if (lane == 0) dst_d[b] = s.d;
 }
 
@@ -318,6 +354,51 @@ DeviceTensor WeightPool::upload_raw(const GgufTensorInfo & info_ref,
         dt.scales_ptr = d_sc;
         dt.d_ptr      = d_d;
         dt.dtype      = DType::Q6_K;
+        dt.device     = dev;
+        for (int i = 0; i < 4; ++i) dt.ne[i] = info->ne[i];
+        dt.nbytes     = tot_bytes;
+        dt.is_soa     = true;
+        return dt;
+    }
+
+    if (info->dtype == DType::Q3_K) {
+        const int64_t n_blocks  = static_cast<int64_t>(info->nbytes / sizeof(PackedBlockQ3_K));
+        const size_t  qs_bytes  = align256(static_cast<size_t>(n_blocks) * 64);
+        const size_t  hm_bytes  = align256(static_cast<size_t>(n_blocks) * 32);
+        const size_t  sc_bytes  = align256(static_cast<size_t>(n_blocks) * 12);
+        const size_t  d_bytes   = align256(static_cast<size_t>(n_blocks) * sizeof(uint16_t));
+        const size_t  tot_bytes = qs_bytes + hm_bytes + sc_bytes + d_bytes;
+
+        void * st_ptr = ensure_staging(info->nbytes);
+        void * dptr = nullptr;
+        cuda_ok(cudaMalloc(&dptr, tot_bytes), ("cudaMalloc SoA Q3_K for " + name).c_str());
+        cuda_ok(cudaMemcpy(st_ptr, src, info->nbytes, cudaMemcpyHostToDevice),
+                ("cudaMemcpy staging Q3_K for " + name).c_str());
+
+        auto * base = static_cast<uint8_t *>(dptr);
+        auto * d_qs = base;
+        auto * d_hm = base + qs_bytes;
+        auto * d_sc = reinterpret_cast<uint32_t *>(base + qs_bytes + hm_bytes);
+        auto * d_d  = reinterpret_cast<uint16_t *>(base + qs_bytes + hm_bytes + sc_bytes);
+
+        constexpr int wpb = 8;
+        const int64_t grid = (n_blocks + wpb - 1) / wpb;
+        unpack_q3_k_to_soa_kernel<<<static_cast<unsigned int>(grid), dim3(32, wpb)>>>(
+            static_cast<const PackedBlockQ3_K *>(st_ptr), d_qs, d_hm, d_sc, d_d, n_blocks);
+        cuda_ok(cudaGetLastError(), ("unpack_q3_k_to_soa launch for " + name).c_str());
+
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            allocs_.push_back({dev, dptr, tot_bytes});
+            dev_bytes_[dev] += tot_bytes;
+        }
+
+        DeviceTensor dt;
+        dt.ptr        = d_qs;
+        dt.aux_ptr    = d_hm;
+        dt.scales_ptr = d_sc;
+        dt.d_ptr      = d_d;
+        dt.dtype      = DType::Q3_K;
         dt.device     = dev;
         for (int i = 0; i < 4; ++i) dt.ne[i] = info->ne[i];
         dt.nbytes     = tot_bytes;

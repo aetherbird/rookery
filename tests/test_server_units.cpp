@@ -124,10 +124,11 @@ int main(int argc, char ** argv) {
         auto gguf = rookery::GgufFile::open(argv[1]);
         rookery::BpeTokenizer tok;
         tok.load(gguf);
+        assert(tok.is_special_token(tok.bos_id()) || tok.token_type(tok.bos_id()) != 1);
         for (int i = 2; i < argc; ++i) {
             auto ids = tok.encode(argv[i], true, true);
             std::printf("TOK[%d]:", i - 2);
-            for (int32_t id : ids) std::printf(" %d", id);
+            for (int32_t id : ids) std::printf(" %d%s", id, tok.is_special_token(id) ? "*" : "");
             std::printf("\n");
         }
     }

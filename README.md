@@ -42,7 +42,8 @@ Measured against `llama.cpp` (`-fa 1 -ctk q8_0 -ctv q8_0`) on heterogeneous mult
 | **Ling-3.0-tiny** (`Q4_K_M`) | RTX 3090 (`sm_86`) | Prefill `pp128` / `pp512` | `3,809.9` / `9,174.8 tok/s` | **`6,555.2` / `9,471.4 tok/s`** | **+72% / +3%** |
 | **Ling-3.0-tiny** (`Q4_K_M`) | RTX 3090 (`sm_86`) | Decode `tg128` (`d=0` / `4K` / `16K`) | `241.4` / `239.2` / `220.8 tok/s` | **`383.9` / `355.2` / `294.0 tok/s`** | **+59% / +49% / +33%** |
 | **Qwen3.6-35B-A3B** (`UD-Q3_K_XL`) | P100 + GTX 1060 (`sm_60/61`) | Decode `tg128` | `38.0 tok/s` | **`53.4 tok/s`** | **+41%** |
-| **Maxwell-V1-Flash** (`Q3_K_M`) | P100 + GTX 1060 (`sm_60/61`) | Decode `tg64` | Unsupported | **`26.3 tok/s`** | — |
+| **Maxwell-V1-Flash** (`Q3_K_M`, MTP) | P100 + GTX 1060 (`sm_60/61`) | Prefill `pp512` / `pp4096` / `pp16384` | Unsupported | **`510.3` / `474.3` / `327.1 tok/s`** | **7.33×–8.12× vs baseline** |
+| **Maxwell-V1-Flash** (`Q3_K_M`, MTP) | P100 + GTX 1060 (`sm_60/61`) | Decode `tg128` (`d=0` / `4K` / `32K`, no MTP / + MTP) | Unsupported | `94.1` / `77.7` / `47.4` · **`110.7` / `93.3` / `55.5 tok/s`** | **3.38×–4.19× vs baseline** |
 | **Inkling-2-Mini** (`IQ4_NL`, `36K` ctx) | P100 + GTX 1060 (`sm_60/61`) | Prefill `pp512` / `pp8192` | Unsupported | **`543.7` / `504.7 tok/s`** | **7.87× vs baseline** |
 | **Inkling-2-Mini** (`IQ4_NL`, `36K` ctx) | P100 + GTX 1060 (`sm_60/61`) | Decode `tg128` (`d=0` / `16K` / `32K`) | Unsupported | **`64.0` / `54.6` / `49.0 tok/s`** | **2.31×–2.57× vs baseline** |
 
@@ -99,7 +100,7 @@ Common flags:
 
 ### Cross-Model Engram Sidecar (End-to-End)
 
-`rookery` supports zero-VRAM host-RAM `mmap` Engram/PLE grafting across decoupled providers (`deepseek41`, `qwen4exp`, `hy_v4_flash`, `unigram_ple`) and all 5 host model architectures (`maxwell-moe`, `qwen35moe`, `glm5_next`, `qwen4exp`, `inkling2_loop`) using strict self-describing `RKAD v3` manifests (`provider_fingerprint`, host architecture/layer/stream contract checks), an incremental boundary-anchored BPE commit cache (`100.00%` causal parity, `~7.9 µs/tok`), and sub-1% warm-RAM decode overhead (`+0.90%` decode / `+0.49%` prefill on `DeepSeek-V4.1-Flash` 103 GiB → `Maxwell-V1-Flash`).
+`rookery` supports zero-VRAM host-RAM `mmap` Engram/PLE grafting across decoupled providers (`deepseek41`, `qwen4exp`, `hy_v4_flash`, `unigram_ple`) and all 6 host model architectures (`maxwell-moe`, `qwen35moe`, `glm5_next`, `qwen4exp`, `inkling2_loop`, `bailingmoe3`) using strict self-describing `RKAD v3` manifests (`provider_fingerprint`, host architecture/layer/stream contract checks), per-token special-token masking (`token_type` 3/4 → exact `0.0` delta inside CUDA Graphs), an incremental boundary-anchored BPE commit cache (`100.00%` causal parity, `~7.9 µs/tok`), and sub-1% warm-RAM decode overhead (`+0.90%` decode / `+0.49%` prefill on `DeepSeek-V4.1-Flash` 103 GiB → `Maxwell-V1-Flash`).
 
 ```bash
 # 1. Inspect a provider table, host GGUF, or .rkad adapter

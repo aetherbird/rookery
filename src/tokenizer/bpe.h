@@ -26,6 +26,13 @@ public:
     bool    add_bos_default() const { return add_bos_default_; }
     void    add_stop_token(const std::string & tok);
     bool    is_stop_token(int32_t id) const;
+    bool    is_special_token(int32_t id) const {
+        return (id >= 0 && static_cast<size_t>(id) < token_types_.size()) &&
+               (token_types_[id] == 3 || token_types_[id] == 4);
+    }
+    int32_t token_type(int32_t id) const {
+        return (id >= 0 && static_cast<size_t>(id) < token_types_.size()) ? token_types_[id] : 1;
+    }
     size_t  vocab_size() const { return id_to_token_.size(); }
 
 private:

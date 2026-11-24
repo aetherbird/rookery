@@ -24,6 +24,85 @@ __device__ __forceinline__ float warp_max(float v) {
     return v;
 }
 
+// Ultra-fast single-warp register-resident Top-K sigmoid router for n_expert <= 256 (ZERO __syncthreads, ZERO smem!)
+__global__ void moe_route_sigmoid_warp_256_kernel(
+    const float * __restrict__ logits,
+    const float * __restrict__ bias,
+    int32_t *     __restrict__ top_ids,
+    float *       __restrict__ top_w,
+    int n_expert, int k, bool renorm, float scale) {
+
+    const int t    = blockIdx.x;
+    const int lane = threadIdx.x; // 0..31 -> owns 8 experts: lane + i*32 (i=0..7)
+    const float * row = logits + static_cast<size_t>(t) * n_expert;
+
+    float p_reg[8];
+    float s_reg[8];
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int idx = lane + i * 32;
+        if (idx < n_expert) {
+            const float p = 1.0f / (1.0f + __expf(-row[idx]));
+            p_reg[i] = p;
+            s_reg[i] = bias ? (p + __ldg(&bias[idx])) : p;
+        } else {
+            p_reg[i] = 0.0f;
+            s_reg[i] = -FLT_MAX;
+        }
+    }
+
+    int32_t out_i[16];
+    float   out_w[16];
+    float   w_sum = 0.0f;
+
+    for (int j = 0; j < k; ++j) {
+        float   bv = s_reg[0];
+        int32_t bi = lane;
+        float   bp = p_reg[0];
+        #pragma unroll
+        for (int i = 1; i < 8; ++i) {
+            const float sv = s_reg[i];
+            if (sv > bv) {
+                bv = sv;
+                bi = lane + i * 32;
+                bp = p_reg[i];
+            }
+        }
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            const float   ov = __shfl_down_sync(0xffffffffu, bv, offset);
+            const int32_t oi = __shfl_down_sync(0xffffffffu, bi, offset);
+            const float   op = __shfl_down_sync(0xffffffffu, bp, offset);
+            if (ov > bv || (ov == bv && oi < bi)) {
+                bv = ov; bi = oi; bp = op;
+            }
+        }
+        const int32_t picked = __shfl_sync(0xffffffffu, bi, 0);
+        if (lane == 0) {
+            out_i[j] = bi;
+            out_w[j] = bp;
+            w_sum   += bp;
+        }
+        if ((picked & 31) == lane) {
+            const int slot_i = picked >> 5;
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                if (i == slot_i) s_reg[i] = -FLT_MAX;
+            }
+        }
+    }
+
+    if (lane == 0) {
+        const float mul = (renorm && w_sum > 0.0f) ? (scale / w_sum) : scale;
+        int32_t * dst_i = top_ids + static_cast<size_t>(t) * k;
+        float *   dst_w = top_w   + static_cast<size_t>(t) * k;
+        for (int j = 0; j < k; ++j) {
+            dst_i[j] = out_i[j];
+            dst_w[j] = out_w[j] * mul;
+        }
+    }
+}
+
 __global__ void moe_route_sigmoid_kernel(
     const float * __restrict__ logits,
     const float * __restrict__ bias,
@@ -386,6 +465,11 @@ void launch_moe_route_sigmoid(
     }
     if (n_expert_groups > 32) {
         throw std::runtime_error("moe_route_sigmoid: n_expert_groups > 32 not yet supported");
+    }
+    if (n_expert <= 256 && k <= 16 && n_expert_groups <= 1) {
+        moe_route_sigmoid_warp_256_kernel<<<n_tokens, 32, 0, stream>>>(
+            d_logits, d_bias, d_top_ids, d_top_w, n_expert, k, renorm, scale);
+        return;
     }
     moe_route_sigmoid_kernel<<<n_tokens, 256, 0, stream>>>(
         d_logits, d_bias, d_top_ids, d_top_w, n_expert, k, renorm, scale, n_expert_groups, n_group_used);

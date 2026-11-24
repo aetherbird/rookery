@@ -39,6 +39,7 @@ add_library(rookery_core STATIC
     src/kernels/hc_fused.cu
     src/kernels/gemv_quant.cu
     src/kernels/gemv_kquant.cu
+    src/kernels/maxwell_kquant.cu
     src/kernels/moe_fused.cu
     src/kernels/attn_flash.cu
     src/kernels/msa_sparse.cu

@@ -505,19 +505,21 @@ void EngramSidecar::close_calibration_dump() {
                 static_cast<unsigned long long>(dump_records_));
 }
 
-void EngramSidecar::enable_tail_ce_dump(const std::string & out_path, int target_host_layer) {
+void EngramSidecar::enable_tail_ce_dump(const std::string & out_path, int target_host_layer, int src_engram_layer) {
     close_tail_ce_dump();
     ce_target_layer_ = target_host_layer;
+    ce_src_layer_    = src_engram_layer;
     ce_tokens_       = 0;
     ce_seq_state_.clear();
 
     ce_fp_ = std::fopen(out_path.c_str(), "wb");
     if (!ce_fp_) throw std::runtime_error("Failed to open tail-CE dump path: " + out_path);
 
+    const int n_dump_layers = (ce_src_layer_ >= 0) ? 1 : std::max(1, table_.cfg().n_layers);
     const char magic[4] = {'R', 'K', 'C', 'E'};
     uint32_t hdr[6] = {
         1u,
-        static_cast<uint32_t>(std::max(1, table_.cfg().n_layers)),
+        static_cast<uint32_t>(n_dump_layers),
         static_cast<uint32_t>(table_.cfg().engram_dim()),
         static_cast<uint32_t>(d_host_),
         static_cast<uint32_t>(hc_),
@@ -527,8 +529,8 @@ void EngramSidecar::enable_tail_ce_dump(const std::string & out_path, int target
     std::fwrite(magic, 1, 4, ce_fp_);
     std::fwrite(hdr, sizeof(uint32_t), 6, ce_fp_);
     std::fwrite(&zero_tok, sizeof(uint64_t), 1, ce_fp_);
-    std::printf("EngramSidecar tail-CE dump enabled (layer=%d, n_eng_layers=%u, d_engram=%u, hc=%u, d_host=%u) -> %s\n",
-                target_host_layer, hdr[1], hdr[2], hdr[4], hdr[3], out_path.c_str());
+    std::printf("EngramSidecar tail-CE dump enabled (layer=%d, src_layer=%d, n_eng_layers=%u, d_engram=%u, hc=%u, d_host=%u) -> %s\n",
+                target_host_layer, ce_src_layer_, hdr[1], hdr[2], hdr[4], hdr[3], out_path.c_str());
 }
 
 void EngramSidecar::close_tail_ce_dump() {
@@ -638,33 +640,42 @@ void EngramSidecar::set_tail_ce_targets(const std::vector<int32_t> & targets,
     if (!ce_fp_) return;
     const int T      = static_cast<int>(host_tokens.size());
     const int n_eng  = std::max(1, table_.cfg().n_layers);
+    const int e_beg  = (ce_src_layer_ >= 0 && ce_src_layer_ < n_eng) ? ce_src_layer_ : 0;
+    const int e_end  = (ce_src_layer_ >= 0 && ce_src_layer_ < n_eng) ? (ce_src_layer_ + 1) : n_eng;
+    const int n_dump = e_end - e_beg;
     const int d_eng  = table_.cfg().engram_dim();
     const int n_cols = table_.cfg().n_cols;
 
     ce_cur_targets_ = targets;
+    if (mask_special_tokens_ && host_tok_ != nullptr) {
+        for (int i = 0; i < T && i < static_cast<int>(ce_cur_targets_.size()); ++i) {
+            if (host_tok_->is_special_token(host_tokens[i])) ce_cur_targets_[i] = -1;
+        }
+    }
     if (start_pos == 0) ce_seq_state_.clear();
 
     // Strictly causal per-token source addressing using the production incremental commit cache!
-    std::vector<std::vector<int32_t>> layer_rows(n_eng, std::vector<int32_t>(static_cast<size_t>(T) * n_cols));
-    std::vector<std::vector<float>>   layer_val(n_eng,  std::vector<float>(static_cast<size_t>(T) * n_cols));
+    std::vector<std::vector<int32_t>> layer_rows(n_dump, std::vector<int32_t>(static_cast<size_t>(T) * n_cols));
+    std::vector<std::vector<float>>   layer_val(n_dump,  std::vector<float>(static_cast<size_t>(T) * n_cols));
     std::vector<int32_t> s_win, s_pos, s_ids;
     std::vector<float>   s_val;
 
     for (int i = 0; i < T; ++i) {
         advance_seq_state(ce_seq_state_, {host_tokens[i]}, start_pos + i, s_win, s_pos);
-        for (int e = 0; e < n_eng; ++e) {
+        for (int idx = 0; idx < n_dump; ++idx) {
+            const int e = e_beg + idx;
             table_.hash_tokens(e, s_win, s_pos[0], 1, s_ids, s_val);
-            std::memcpy(layer_rows[e].data() + static_cast<size_t>(i) * n_cols, s_ids.data(), n_cols * sizeof(int32_t));
-            std::memcpy(layer_val[e].data()  + static_cast<size_t>(i) * n_cols, s_val.data(), n_cols * sizeof(float));
+            std::memcpy(layer_rows[idx].data() + static_cast<size_t>(i) * n_cols, s_ids.data(), n_cols * sizeof(int32_t));
+            std::memcpy(layer_val[idx].data()  + static_cast<size_t>(i) * n_cols, s_val.data(), n_cols * sizeof(float));
         }
     }
 
-    ce_cur_e_f16_.assign(n_eng, std::vector<uint16_t>(static_cast<size_t>(T) * d_eng));
+    ce_cur_e_f16_.assign(n_dump, std::vector<uint16_t>(static_cast<size_t>(T) * d_eng));
     std::vector<float> tmp_e(static_cast<size_t>(T) * d_eng);
-    for (int e = 0; e < n_eng; ++e) {
-        table_.prefetch_rows(layer_rows[e].data(), static_cast<int>(layer_rows[e].size()));
-        table_.gather_dequant_f32(layer_rows[e].data(), layer_val[e].data(), T, tmp_e.data());
-        for (size_t k = 0; k < tmp_e.size(); ++k) ce_cur_e_f16_[e][k] = f32_to_f16_bits(tmp_e[k]);
+    for (int idx = 0; idx < n_dump; ++idx) {
+        table_.prefetch_rows(layer_rows[idx].data(), static_cast<int>(layer_rows[idx].size()));
+        table_.gather_dequant_f32(layer_rows[idx].data(), layer_val[idx].data(), T, tmp_e.data());
+        for (size_t k = 0; k < tmp_e.size(); ++k) ce_cur_e_f16_[idx][k] = f32_to_f16_bits(tmp_e[k]);
     }
 }
 
@@ -812,12 +823,15 @@ void EngramSidecar::prepare_step(const std::vector<int32_t> & host_tokens,
 
         const float eff_scale = params.scale * hk.scale;
         const float eff_clip  = (params.delta_clip_ratio > 0.0f) ? params.delta_clip_ratio : hk.default_delta_clip;
+        bool any_active = false;
         for (int t = 0; t < T; ++t) {
-            hk.h_params_pin[t] = EngramRuntimeParams{eff_scale, params.gate_bias, eff_clip, 0.0f};
+            const float tok_scale = resolve_token_scale(host_tokens[t], eff_scale);
+            hk.h_params_pin[t] = EngramRuntimeParams{tok_scale, params.gate_bias, eff_clip, 0.0f};
+            if (tok_scale != 0.0f) any_active = true;
         }
 
-        // Skip table gather if eff_scale == 0 and no dump is active (still upload zeroed params so GPU early-exits!)
-        if (eff_scale != 0.0f || dump_fp_ != nullptr) {
+        // Skip table gather if all tokens have tok_scale == 0 and no dump is active (still upload zeroed params so GPU early-exits!)
+        if (any_active || dump_fp_ != nullptr) {
             table_.gather_dequant_f32(scratch_hook_rows_[hi].data(), scratch_hook_valid_[hi].data(), T, hk.h_engram_pin);
             if (!hk.h_mu_e.empty()) {
                 const float * mu = hk.h_mu_e.data();
@@ -835,12 +849,16 @@ void EngramSidecar::prepare_step(const std::vector<int32_t> & host_tokens,
     for (size_t hi = 0; hi < hooks_.size(); ++hi) {
         auto & hk = hooks_[hi];
         if (hk.scale == 0.0f && dump_fp_ == nullptr) continue;
+        bool any_active = false;
+        for (int t = 0; t < T; ++t) {
+            if (hk.h_params_pin[t].scale != 0.0f) { any_active = true; break; }
+        }
         cuda_ok(cudaSetDevice(hk.device), "engram upload setDevice");
         cuda_ok(cudaMemcpyAsync(hk.d_params, hk.h_params_pin,
                                 static_cast<size_t>(T) * sizeof(EngramRuntimeParams),
                                 cudaMemcpyHostToDevice, nullptr),
                 "engram params H2D");
-        if (params.scale * hk.scale != 0.0f || dump_fp_ != nullptr) {
+        if (any_active || dump_fp_ != nullptr) {
             cuda_ok(cudaMemcpyAsync(hk.d_engram_in, hk.h_engram_pin,
                                     static_cast<size_t>(T) * d_eng * sizeof(float),
                                     cudaMemcpyHostToDevice, nullptr),
@@ -907,7 +925,7 @@ void EngramSidecar::prepare_batch_step(const std::vector<int> & seq_ids,
         if (hk.scale == 0.0f) continue;
         bool any_active = false;
         for (int t = 0; t < T; ++t) {
-            const float eff_scale = per_token_params[t].scale * hk.scale;
+            const float eff_scale = resolve_token_scale(host_tokens[t], per_token_params[t].scale * hk.scale);
             const float eff_clip  = (per_token_params[t].delta_clip_ratio > 0.0f)
                 ? per_token_params[t].delta_clip_ratio : hk.default_delta_clip;
             hk.h_params_pin[t] = EngramRuntimeParams{eff_scale, per_token_params[t].gate_bias, eff_clip, 0.0f};

@@ -155,6 +155,55 @@ def load_gguf_tail_head(gguf_path: str, device: torch.device):
                 d = raw[:, :2].copy().view(np.float16).astype(np.float32)
                 qs = raw[:, 2:].view(np.int8).astype(np.float32)
                 arr = (d * qs).reshape(ne)
+            elif tt == 12:  # Q4_K (2B d + 2B dmin + 12B scales + 128B qs = 144B per 256 elems)
+                nblk = ne // 256
+                raw = np.frombuffer(f.read(nblk * 144), dtype=np.uint8).reshape(nblk, 144)
+                d = raw[:, 0:2].copy().view(np.float16).astype(np.float32)       # [nblk, 1]
+                dmin = raw[:, 2:4].copy().view(np.float16).astype(np.float32)    # [nblk, 1]
+                sc_b = raw[:, 4:16]                                              # [nblk, 12]
+                qs = raw[:, 16:144]                                              # [nblk, 128]
+                sc = np.empty((nblk, 8), dtype=np.float32)
+                mn = np.empty((nblk, 8), dtype=np.float32)
+                sc[:, 0:4] = sc_b[:, 0:4] & 63
+                mn[:, 0:4] = sc_b[:, 4:8] & 63
+                sc[:, 4:8] = (sc_b[:, 8:12] & 0x0F) | ((sc_b[:, 0:4] >> 6) << 4)
+                mn[:, 4:8] = (sc_b[:, 8:12] >> 4) | ((sc_b[:, 4:8] >> 6) << 4)
+                out = np.empty((nblk, 256), dtype=np.float32)
+                for j in range(4):
+                    q = qs[:, 32 * j : 32 * (j + 1)]
+                    d1 = (d * sc[:, 2 * j : 2 * j + 1])
+                    m1 = (dmin * mn[:, 2 * j : 2 * j + 1])
+                    d2 = (d * sc[:, 2 * j + 1 : 2 * j + 2])
+                    m2 = (dmin * mn[:, 2 * j + 1 : 2 * j + 2])
+                    out[:, 64 * j : 64 * j + 32] = d1 * (q & 0x0F).astype(np.float32) - m1
+                    out[:, 64 * j + 32 : 64 * j + 64] = d2 * (q >> 4).astype(np.float32) - m2
+                arr = out.reshape(ne)
+            elif tt == 14:  # Q6_K (128B ql + 64B qh + 16B scales(int8) + 2B d = 210B per 256 elems)
+                nblk = ne // 256
+                raw = np.frombuffer(f.read(nblk * 210), dtype=np.uint8).reshape(nblk, 210)
+                ql = raw[:, 0:128]                                               # [nblk, 128]
+                qh = raw[:, 128:192]                                             # [nblk, 64]
+                sc = raw[:, 192:208].copy().view(np.int8).astype(np.float32)     # [nblk, 16]
+                d = raw[:, 208:210].copy().view(np.float16).astype(np.float32)   # [nblk, 1]
+                out = np.empty((nblk, 256), dtype=np.float32)
+                for n in range(2):
+                    ql_n = ql[:, 64 * n : 64 * (n + 1)]
+                    qh_n = qh[:, 32 * n : 32 * (n + 1)]
+                    sc_n = sc[:, 8 * n : 8 * (n + 1)]
+                    q1 = ((ql_n[:, 0:32] & 0x0F) | (((qh_n >> 0) & 3) << 4)).astype(np.int32) - 32
+                    q2 = ((ql_n[:, 32:64] & 0x0F) | (((qh_n >> 2) & 3) << 4)).astype(np.int32) - 32
+                    q3 = ((ql_n[:, 0:32] >> 4) | (((qh_n >> 4) & 3) << 4)).astype(np.int32) - 32
+                    q4 = ((ql_n[:, 32:64] >> 4) | (((qh_n >> 6) & 3) << 4)).astype(np.int32) - 32
+                    # is = 0 for l in 0..15, 1 for l in 16..31
+                    s0 = np.repeat(sc_n[:, 0:2], 16, axis=1)
+                    s2 = np.repeat(sc_n[:, 2:4], 16, axis=1)
+                    s4 = np.repeat(sc_n[:, 4:6], 16, axis=1)
+                    s6 = np.repeat(sc_n[:, 6:8], 16, axis=1)
+                    out[:, 128 * n + 0 : 128 * n + 32] = d * s0 * q1
+                    out[:, 128 * n + 32 : 128 * n + 64] = d * s2 * q2
+                    out[:, 128 * n + 64 : 128 * n + 96] = d * s4 * q3
+                    out[:, 128 * n + 96 : 128 * n + 128] = d * s6 * q4
+                arr = out.reshape(ne)
             else:
                 raise ValueError(f"Unsupported GGUF tensor type {tt} for {name}")
             # GGUF dims are reversed relative to PyTorch row-major [rows, cols]
