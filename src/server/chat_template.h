@@ -2,12 +2,29 @@
 
 #include "nlohmann/json.hpp"
 
+#include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <string>
 #include <vector>
 
 namespace rookery {
 
 using json = nlohmann::json;
+
+// Generates a globally unique OpenAI tool_call_id across turns, requests, and restarts.
+inline std::string next_tool_call_id() {
+    static const uint64_t boot_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    static std::atomic<uint64_t> seq{0};
+    const uint64_t n = seq.fetch_add(1, std::memory_order_relaxed) + 1;
+    char buf[48];
+    std::snprintf(buf, sizeof(buf), "call_rk_%llx_%llu",
+                  static_cast<unsigned long long>(boot_us & 0xFFFFFFFFULL),
+                  static_cast<unsigned long long>(n));
+    return std::string(buf);
+}
 
 struct ParsedAssistantResponse {
     std::string reasoning_content;
@@ -153,7 +170,6 @@ inline ParsedAssistantResponse parse_maxwell_output(const std::string & raw, boo
     }
 
     size_t cursor = tc_pos;
-    int call_idx = 0;
     while ((cursor = rest.find("<function=", cursor)) != std::string::npos) {
         size_t name_end = rest.find('>', cursor + 10);
         if (name_end == std::string::npos) break;
@@ -198,7 +214,7 @@ inline ParsedAssistantResponse parse_maxwell_output(const std::string & raw, boo
         }
 
         res.tool_calls.push_back({
-            {"id", "call_rookery_" + std::to_string(++call_idx)},
+            {"id", next_tool_call_id()},
             {"type", "function"},
             {"function", {
                 {"name", fn_name},
@@ -324,7 +340,6 @@ inline ParsedAssistantResponse parse_glm5_output(const std::string & raw, bool s
     }
 
     size_t cursor = tc_pos;
-    int call_idx = 0;
     while ((cursor = rest.find("<tool_call>", cursor)) != std::string::npos) {
         size_t body_start = cursor + 11;
         size_t tc_end = rest.find("</tool_call>", body_start);
@@ -361,7 +376,7 @@ inline ParsedAssistantResponse parse_glm5_output(const std::string & raw, bool s
         }
 
         res.tool_calls.push_back({
-            {"id", "call_rookery_" + std::to_string(++call_idx)},
+            {"id", next_tool_call_id()},
             {"type", "function"},
             {"function", {
                 {"name", fn_name},
@@ -513,7 +528,6 @@ inline std::string render_inkling2_chat_prompt(const json & messages,
 inline ParsedAssistantResponse parse_inkling2_output(const std::string & raw) {
     ParsedAssistantResponse res;
     size_t pos = 0;
-    int call_idx = 0;
     const std::string kThink = "<|content_thinking|>";
     const std::string kText  = "<|content_text|>";
     const std::string kTool  = "<|content_invoke_tool_json|>";
@@ -548,7 +562,7 @@ inline ParsedAssistantResponse parse_inkling2_output(const std::string & raw) {
                 json args = j.contains("args") ? j["args"] : (j.contains("arguments") ? j["arguments"] : json::object());
                 std::string args_str = args.is_string() ? args.get<std::string>() : args.dump();
                 res.tool_calls.push_back({
-                    {"id", "call_rookery_" + std::to_string(++call_idx)},
+                    {"id", next_tool_call_id()},
                     {"type", "function"},
                     {"function", {{"name", fname}, {"arguments", args_str}}}
                 });

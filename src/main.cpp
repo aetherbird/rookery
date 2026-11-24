@@ -1023,7 +1023,7 @@ int main(int argc, char ** argv) {
                                                     has_tools = true;
                                                     json tc = {
                                                         {"index", ink_tool_idx++},
-                                                        {"id", "call_rookery_" + std::to_string(ink_tool_idx)},
+                                                        {"id", rookery::next_tool_call_id()},
                                                         {"type", "function"},
                                                         {"function", {{"name", fname}, {"arguments", args_s}}}
                                                     };
