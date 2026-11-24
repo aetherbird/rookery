@@ -52,6 +52,7 @@ add_library(rookery_core STATIC
     src/models/inkling2_loop.cu
     src/models/qwen35_moe.cu
     src/models/qwen4exp.cu
+    src/models/bailingmoe3.cu
 )
 
 target_include_directories(rookery_core PUBLIC
@@ -89,6 +90,9 @@ target_link_libraries(rookery_qwen35_test PRIVATE rookery_core)
 
 add_executable(rookery_qwen4exp_test tests/test_qwen4exp_forward.cpp)
 target_link_libraries(rookery_qwen4exp_test PRIVATE rookery_core)
+
+add_executable(rookery_bailingmoe3_test tests/test_bailingmoe3_forward.cpp)
+target_link_libraries(rookery_bailingmoe3_test PRIVATE rookery_core)
 
 add_executable(rookery_unit_test tests/test_server_units.cpp)
 target_link_libraries(rookery_unit_test PRIVATE rookery_core)

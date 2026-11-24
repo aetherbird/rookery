@@ -56,6 +56,13 @@ public:
                             int dev,
                             bool convert_bf16_to_f16 = false);
 
+    // Dequantizes any supported GGUF quant (F32/F16/BF16/Q8_0/Q5_0/Q4_K/Q5_K/Q6_K) to F16 on device.
+    // Ideal for small 3D MLA head-projection tensors (attn_k_b, attn_v_b) so cuBLAS FP16 Tensor Cores work on any quant!
+    DeviceTensor upload_as_f16(const ShardedGguf & gguf,
+                               const std::string & name,
+                               int dev,
+                               bool required = true);
+
     void free_all() noexcept;
     void release_staging() noexcept;
 

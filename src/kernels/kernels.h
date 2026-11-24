@@ -316,7 +316,8 @@ void launch_l2_norm_d128(float * d_x, int T, int n_heads, float eps, cudaStream_
 
 void launch_kda_gate_and_beta(
     float * d_f, const float * d_dt_bias, const float * d_ssm_a,
-    float * d_beta, float lower_bound, int T, int n_heads, int head_dim, cudaStream_t stream);
+    float * d_beta, float lower_bound, int T, int n_heads, int head_dim, cudaStream_t stream,
+    bool negate_a = true);
 
 void launch_gated_delta_net_d128(
     const float * d_q, const float * d_k, const float * d_v,
@@ -344,6 +345,46 @@ void launch_mla_attn_d512(
     const int32_t * d_pos, float * d_out, void * d_scratch,
     int T, int n_heads, float scale, cudaStream_t stream,
     cublasHandle_t cublas = nullptr, size_t scratch_bytes = 0, int kv_len_max = 0);
+
+// --- RoPE-576 Absorbed MLA (BailingMoE3 / Ling-3.0 / Ling-3.2-Air / DeepSeek MLA) ---
+void launch_mla_rope_split_q(
+    const float * d_q_all,    // [T, n_heads, qk_nope + rope_dim]
+    const int32_t * d_pos,    // [T]
+    float * d_q_nope,         // [T, n_heads, qk_nope]
+    float * d_q_pe,           // [T, n_heads, rope_dim]
+    int T, int n_heads, int qk_nope, int rope_dim, float rope_freq_base, cudaStream_t stream);
+
+void launch_mla_kv_norm_rope_write_576(
+    const float * d_kv_all,   // [T, 576] = [kv_latent(512), k_pe(64)]
+    const float * d_norm_w,   // [512]
+    const int32_t * d_pos,    // [T]
+    void * d_kv_cache,        // [max_ctx, 576] (18 BlockQ8_0 or 576 F16 per pos)
+    bool kv_is_q8_0,
+    int T, float rms_eps, float rope_freq_base, cudaStream_t stream);
+
+void launch_mla_concat_q576(
+    const float * d_q_abs,    // [T, n_heads, 512]
+    const float * d_q_pe,     // [T, n_heads, 64]
+    float * d_q576,           // [T, n_heads, 576]
+    int T, int n_heads, cudaStream_t stream);
+
+void launch_batched_head_proj_f16(
+    const DeviceTensor & W,   // F16 [K, M, n_heads] (ne[0]=K, ne[1]=M, ne[2]=n_heads)
+    const float * d_x,        // [T, n_heads, K]
+    float * d_y,              // [T, n_heads, M]
+    int T, cudaStream_t stream,
+    cublasHandle_t cublas = nullptr, void * d_scratch = nullptr, size_t scratch_bytes = 0);
+
+void launch_mla_attn_d576_v512(
+    const float * d_q576, const void * d_kv_cache, bool kv_is_q8_0,
+    const int32_t * d_pos, float * d_out, void * d_scratch,
+    int T, int n_heads, float scale, cudaStream_t stream,
+    cublasHandle_t cublas = nullptr, size_t scratch_bytes = 0, int kv_len_max = 0);
+
+void launch_mla_head_sigmoid_gate(
+    float * d_o,              // [T, n_heads, head_dim] in-place
+    const float * d_gate,     // [T, n_heads]
+    int T, int n_heads, int head_dim, cudaStream_t stream);
 
 // --- Inkling 2 Mini (inkling2_loop: Looped MoE + Depth AttnRes + ShortConv + RelBias Sink Attn + SiTU) ---
 void launch_inkling2_depth_mix(

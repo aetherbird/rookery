@@ -295,4 +295,202 @@ DeviceTensor WeightPool::upload_raw(const GgufTensorInfo & info_ref,
     return dt;
 }
 
+namespace {
+
+inline float f16_bits_to_f32(uint16_t h) {
+    __half hh;
+    std::memcpy(&hh, &h, 2);
+    return __half2float(hh);
+}
+
+inline uint16_t f32_to_f16_bits(float f) {
+    __half hh = __float2half_rn(f);
+    uint16_t out;
+    std::memcpy(&out, &hh, 2);
+    return out;
+}
+
+inline void get_scale_min_k4_host(int j, const uint8_t * q, uint8_t & d, uint8_t & m) {
+    if (j < 4) {
+        d = q[j] & 63;
+        m = q[j + 4] & 63;
+    } else {
+        d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        m = (q[j + 4] >> 4)  | ((q[j]     >> 6) << 4);
+    }
+}
+
+void dequant_to_f16_host(DType dtype, const void * src, size_t n_elems, uint16_t * dst) {
+    const auto * p = static_cast<const uint8_t *>(src);
+    if (dtype == DType::F16) {
+        std::memcpy(dst, p, n_elems * 2);
+        return;
+    }
+    if (dtype == DType::F32) {
+        const auto * s = reinterpret_cast<const float *>(p);
+        for (size_t i = 0; i < n_elems; ++i) dst[i] = f32_to_f16_bits(s[i]);
+        return;
+    }
+    if (dtype == DType::BF16) {
+        const auto * s = reinterpret_cast<const uint16_t *>(p);
+        for (size_t i = 0; i < n_elems; ++i) dst[i] = bf16_to_f16_bits(s[i]);
+        return;
+    }
+    if (dtype == DType::Q8_0) {
+        const size_t nb = n_elems / 32;
+        const auto * blk = reinterpret_cast<const BlockQ8_0 *>(p);
+        for (size_t b = 0; b < nb; ++b) {
+            const float d = f16_bits_to_f32(blk[b].d);
+            for (int i = 0; i < 32; ++i) dst[b * 32 + i] = f32_to_f16_bits(d * blk[b].qs[i]);
+        }
+        return;
+    }
+    if (dtype == DType::Q5_0) {
+        const size_t nb = n_elems / 32;
+        for (size_t b = 0; b < nb; ++b) {
+            const uint8_t * bp = p + b * 22;
+            uint16_t dh; std::memcpy(&dh, bp, 2);
+            uint32_t qh; std::memcpy(&qh, bp + 2, 4);
+            const uint8_t * qs = bp + 6;
+            const float d = f16_bits_to_f32(dh);
+            for (int j = 0; j < 16; ++j) {
+                const uint8_t xh_0 = ((qh >> j) << 4) & 0x10;
+                const uint8_t xh_1 = ((qh >> (j + 12))) & 0x10;
+                const int x0 = static_cast<int>((qs[j] & 0x0F) | xh_0) - 16;
+                const int x1 = static_cast<int>((qs[j] >> 4)   | xh_1) - 16;
+                dst[b * 32 + j]      = f32_to_f16_bits(x0 * d);
+                dst[b * 32 + j + 16] = f32_to_f16_bits(x1 * d);
+            }
+        }
+        return;
+    }
+    if (dtype == DType::Q4_K) {
+        const size_t nb = n_elems / 256;
+        for (size_t b = 0; b < nb; ++b) {
+            const uint8_t * bp = p + b * 144;
+            uint16_t dh, dminh;
+            std::memcpy(&dh, bp, 2);
+            std::memcpy(&dminh, bp + 2, 2);
+            const float d = f16_bits_to_f32(dh);
+            const float min_v = f16_bits_to_f32(dminh);
+            const uint8_t * sc = bp + 4;
+            const uint8_t * q  = bp + 16;
+            uint16_t * y = dst + b * 256;
+            int is = 0;
+            for (int j = 0; j < 256; j += 64) {
+                uint8_t s1, m1, s2, m2;
+                get_scale_min_k4_host(is + 0, sc, s1, m1);
+                get_scale_min_k4_host(is + 1, sc, s2, m2);
+                const float d1 = d * s1, mm1 = min_v * m1;
+                const float d2 = d * s2, mm2 = min_v * m2;
+                for (int l = 0; l < 32; ++l) y[j + l]      = f32_to_f16_bits(d1 * (q[l] & 0xF) - mm1);
+                for (int l = 0; l < 32; ++l) y[j + 32 + l] = f32_to_f16_bits(d2 * (q[l] >> 4)  - mm2);
+                q += 32;
+                is += 2;
+            }
+        }
+        return;
+    }
+    if (dtype == DType::Q5_K) {
+        const size_t nb = n_elems / 256;
+        for (size_t b = 0; b < nb; ++b) {
+            const uint8_t * bp = p + b * 176;
+            uint16_t dh, dminh;
+            std::memcpy(&dh, bp, 2);
+            std::memcpy(&dminh, bp + 2, 2);
+            const float d = f16_bits_to_f32(dh);
+            const float min_v = f16_bits_to_f32(dminh);
+            const uint8_t * sc = bp + 4;
+            const uint8_t * qh = bp + 16;
+            const uint8_t * ql = bp + 48;
+            uint16_t * y = dst + b * 256;
+            int is = 0;
+            uint8_t u1 = 1, u2 = 2;
+            for (int j = 0; j < 256; j += 64) {
+                uint8_t s1, m1, s2, m2;
+                get_scale_min_k4_host(is + 0, sc, s1, m1);
+                get_scale_min_k4_host(is + 1, sc, s2, m2);
+                const float d1 = d * s1, mm1 = min_v * m1;
+                const float d2 = d * s2, mm2 = min_v * m2;
+                for (int l = 0; l < 32; ++l) {
+                    y[j + l]      = f32_to_f16_bits(d1 * ((ql[l] & 0xF) + ((qh[l] & u1) ? 16 : 0)) - mm1);
+                    y[j + 32 + l] = f32_to_f16_bits(d2 * ((ql[l] >> 4)  + ((qh[l] & u2) ? 16 : 0)) - mm2);
+                }
+                ql += 32;
+                is += 2;
+                u1 <<= 2;
+                u2 <<= 2;
+            }
+        }
+        return;
+    }
+    if (dtype == DType::Q6_K) {
+        const size_t nb = n_elems / 256;
+        const auto * blk = reinterpret_cast<const PackedBlockQ6_K *>(p);
+        for (size_t b = 0; b < nb; ++b) {
+            const float d = f16_bits_to_f32(blk[b].d);
+            const uint8_t * ql = blk[b].ql;
+            const uint8_t * qh = blk[b].qh;
+            const int8_t  * sc = blk[b].scales;
+            uint16_t * y = dst + b * 256;
+            for (int n = 0; n < 256; n += 128) {
+                for (int l = 0; l < 32; ++l) {
+                    const int is = l / 16;
+                    const int8_t q1 = static_cast<int8_t>((ql[l +  0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                    const int8_t q2 = static_cast<int8_t>((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                    const int8_t q3 = static_cast<int8_t>((ql[l +  0] >>  4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                    const int8_t q4 = static_cast<int8_t>((ql[l + 32] >>  4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+                    y[l +  0] = f32_to_f16_bits(d * sc[is + 0] * q1);
+                    y[l + 32] = f32_to_f16_bits(d * sc[is + 2] * q2);
+                    y[l + 64] = f32_to_f16_bits(d * sc[is + 4] * q3);
+                    y[l + 96] = f32_to_f16_bits(d * sc[is + 6] * q4);
+                }
+                y  += 128;
+                ql += 64;
+                qh += 32;
+                sc += 8;
+            }
+        }
+        return;
+    }
+    throw std::runtime_error(std::string("WeightPool::upload_as_f16 unsupported dtype: ") + dtype_traits(dtype).name);
+}
+
+} // namespace
+
+DeviceTensor WeightPool::upload_as_f16(const ShardedGguf & gguf,
+                                       const std::string & name,
+                                       int dev,
+                                       bool required) {
+    auto loc = gguf.find_tensor(name);
+    if (!loc.info) {
+        if (required) throw std::runtime_error("Required tensor missing from GGUF: " + name);
+        return {};
+    }
+    const auto & info = *loc.info;
+    const size_t n_elems = static_cast<size_t>(info.ne[0]) * info.ne[1] * info.ne[2] * info.ne[3];
+    std::vector<uint16_t> h_f16(n_elems);
+    dequant_to_f16_host(info.dtype, loc.data(), n_elems, h_f16.data());
+
+    const size_t dst_bytes = n_elems * sizeof(uint16_t);
+    cuda_ok(cudaSetDevice(dev), "upload_as_f16 setDevice");
+    void * dptr = nullptr;
+    cuda_ok(cudaMalloc(&dptr, dst_bytes), ("cudaMalloc F16 for " + name).c_str());
+    cuda_ok(cudaMemcpy(dptr, h_f16.data(), dst_bytes, cudaMemcpyHostToDevice), ("cudaMemcpy F16 for " + name).c_str());
+
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        allocs_.push_back({dev, dptr, dst_bytes});
+        dev_bytes_[dev] += dst_bytes;
+    }
+
+    DeviceTensor dt;
+    dt.ptr    = dptr;
+    dt.dtype  = DType::F16;
+    dt.device = dev;
+    for (int i = 0; i < 4; ++i) dt.ne[i] = info.ne[i];
+    dt.nbytes = dst_bytes;
+    return dt;
+}
+
 } // namespace rookery

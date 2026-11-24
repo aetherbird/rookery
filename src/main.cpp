@@ -2,6 +2,7 @@
 #include "engram/engram_sidecar.h"
 #include "gguf/reader.h"
 #include "gguf/sharded.h"
+#include "models/bailingmoe3.h"
 #include "models/glm5_next.h"
 #include "models/inkling2_loop.h"
 #include "models/maxwell_moe.h"
@@ -110,18 +111,21 @@ struct ServerEngine {
     std::unique_ptr<rookery::Inkling2LoopModel> inkling2;
     std::unique_ptr<rookery::Qwen35MoeModel>    qwen35;
     std::unique_ptr<rookery::Qwen4ExpModel>     qwen4;
+    std::unique_ptr<rookery::BailingMoe3Model>  bailing3;
 
     bool is_glm5()     const { return glm5 != nullptr; }
     bool is_inkling2() const { return inkling2 != nullptr; }
     bool is_qwen35()   const { return qwen35 != nullptr; }
     bool is_qwen4()    const { return qwen4 != nullptr; }
-    bool has_state_checkpoints() const { return is_glm5() || is_inkling2() || is_qwen35() || is_qwen4(); }
+    bool is_bailing3() const { return bailing3 != nullptr; }
+    bool has_state_checkpoints() const { return is_glm5() || is_inkling2() || is_qwen35() || is_qwen4() || is_bailing3(); }
 
     int max_ctx() const {
         if (glm5)     return glm5->config().max_ctx;
         if (inkling2) return inkling2->config().max_ctx;
         if (qwen35)   return qwen35->config().max_ctx;
         if (qwen4)    return qwen4->config().max_ctx;
+        if (bailing3) return bailing3->config().max_ctx;
         return maxwell->config().max_ctx;
     }
     int n_embd() const {
@@ -129,18 +133,19 @@ struct ServerEngine {
         if (inkling2) return inkling2->config().n_embd;
         if (qwen35)   return qwen35->config().n_embd;
         if (qwen4)    return qwen4->config().n_embd;
+        if (bailing3) return bailing3->config().n_embd;
         return maxwell->config().n_embd;
     }
     int hc_mult() const {
         if (glm5)     return glm5->config().hc_mult;
         if (qwen4)    return qwen4->config().hc_mult;
-        if (inkling2 || qwen35) return 1;
+        if (inkling2 || qwen35 || bailing3) return 1;
         return maxwell->config().hc_mult;
     }
-    size_t prefill_chunk() const { return (glm5 || inkling2) ? 256 : 512; }
+    size_t prefill_chunk() const { return (glm5 || inkling2 || bailing3) ? 256 : 512; }
     bool has_mtp() const {
         if (glm5)     return glm5->has_mtp();
-        if (inkling2 || qwen4) return false;
+        if (inkling2 || qwen4 || bailing3) return false;
         if (qwen35)   return qwen35->has_mtp();
         return maxwell->has_mtp();
     }
@@ -150,6 +155,7 @@ struct ServerEngine {
         if (inkling2) return inkling2->layer_devices();
         if (qwen35)   return qwen35->layer_devices();
         if (qwen4)    return qwen4->layer_devices();
+        if (bailing3) return bailing3->layer_devices();
         return maxwell->layer_devices();
     }
     void set_layer_hook(rookery::LayerHook * h) {
@@ -157,6 +163,7 @@ struct ServerEngine {
         else if (inkling2) inkling2->set_layer_hook(h);
         else if (qwen35)   qwen35->set_layer_hook(h);
         else if (qwen4)    qwen4->set_layer_hook(h);
+        else if (bailing3) bailing3->set_layer_hook(h);
         else               maxwell->set_layer_hook(h);
     }
     void warmup_decode_graphs() {
@@ -164,6 +171,7 @@ struct ServerEngine {
         else if (inkling2) inkling2->warmup_decode_graphs();
         else if (qwen35)   qwen35->warmup_decode_graphs();
         else if (qwen4)    qwen4->warmup_decode_graphs();
+        else if (bailing3) bailing3->warmup_decode_graphs();
         else               maxwell->warmup_decode_graphs();
     }
     void reset_state() {
@@ -171,12 +179,14 @@ struct ServerEngine {
         else if (inkling2) inkling2->reset_state();
         else if (qwen35)   qwen35->reset_state();
         else if (qwen4)    qwen4->reset_state();
+        else if (bailing3) bailing3->reset_state();
     }
     void forward(const std::vector<int32_t> & t, const std::vector<int32_t> & p, std::vector<float> & l) {
         if (glm5)          glm5->forward(t, p, l);
         else if (inkling2) inkling2->forward(t, p, l);
         else if (qwen35)   qwen35->forward(t, p, l);
         else if (qwen4)    qwen4->forward(t, p, l);
+        else if (bailing3) bailing3->forward(t, p, l);
         else               maxwell->forward(t, p, l);
     }
     int32_t forward_decode_greedy(int32_t t, int32_t p) {
@@ -184,6 +194,7 @@ struct ServerEngine {
         if (inkling2) return inkling2->forward_decode_greedy(t, p);
         if (qwen35)   return qwen35->forward_decode_greedy(t, p);
         if (qwen4)    return qwen4->forward_decode_greedy(t, p);
+        if (bailing3) return bailing3->forward_decode_greedy(t, p);
         return maxwell->forward_decode_greedy(t, p);
     }
     void forward_decode_logits(int32_t t, int32_t p, std::vector<float> & l) {
@@ -191,6 +202,7 @@ struct ServerEngine {
         else if (inkling2) inkling2->forward_decode_logits(t, p, l);
         else if (qwen35)   qwen35->forward_decode_logits(t, p, l);
         else if (qwen4)    qwen4->forward_decode_logits(t, p, l);
+        else if (bailing3) bailing3->forward_decode_logits(t, p, l);
         else               maxwell->forward_decode_logits(t, p, l);
     }
     int32_t mtp_prefill_chunk(const std::vector<int32_t> & nt, const std::vector<int32_t> & p) {
@@ -203,6 +215,7 @@ struct ServerEngine {
     std::vector<rookery::Inkling2LoopModel::ConvCheckpoint> conv_checkpoints;
     std::vector<rookery::Qwen35MoeModel::GdnCheckpoint>     gdn_checkpoints;
     std::vector<rookery::Qwen4ExpModel::StateCheckpoint>    qwen4_checkpoints;
+    std::vector<rookery::BailingMoe3Model::KdaCheckpoint>   bailing3_checkpoints;
     size_t  mtp_kv_valid_len  = 0;
     int32_t mtp_last_next_tok = -1;
     bool    has_cached_engram_params = false;
@@ -225,6 +238,10 @@ struct ServerEngine {
             std::remove_if(qwen4_checkpoints.begin(), qwen4_checkpoints.end(),
                            [pos](const auto & cp) { return cp.pos > pos; }),
             qwen4_checkpoints.end());
+        bailing3_checkpoints.erase(
+            std::remove_if(bailing3_checkpoints.begin(), bailing3_checkpoints.end(),
+                           [pos](const auto & cp) { return cp.pos > pos; }),
+            bailing3_checkpoints.end());
     }
 
     void save_state_checkpoint(int pos) {
@@ -297,6 +314,23 @@ struct ServerEngine {
             auto it = std::lower_bound(qwen4_checkpoints.begin(), qwen4_checkpoints.end(), pos,
                                        [](const auto & a, int p) { return a.pos < p; });
             qwen4_checkpoints.insert(it, std::move(cp));
+        } else if (bailing3) {
+            for (auto & cp : bailing3_checkpoints) {
+                if (cp.pos == pos) { bailing3->save_kda_checkpoint(cp, pos); return; }
+            }
+            if (bailing3_checkpoints.size() >= 32) {
+                size_t drop_idx = 0; int min_gap = INT32_MAX;
+                for (size_t i = 1; i + 1 < bailing3_checkpoints.size(); ++i) {
+                    int gap = bailing3_checkpoints[i + 1].pos - bailing3_checkpoints[i - 1].pos;
+                    if (gap < min_gap) { min_gap = gap; drop_idx = i; }
+                }
+                bailing3_checkpoints.erase(bailing3_checkpoints.begin() + static_cast<ptrdiff_t>(drop_idx));
+            }
+            rookery::BailingMoe3Model::KdaCheckpoint cp;
+            bailing3->save_kda_checkpoint(cp, pos);
+            auto it = std::lower_bound(bailing3_checkpoints.begin(), bailing3_checkpoints.end(), pos,
+                                       [](const auto & a, int p) { return a.pos < p; });
+            bailing3_checkpoints.insert(it, std::move(cp));
         }
     }
 
@@ -443,6 +477,19 @@ static GenResult run_generation(
         }
         if (best_cp != nullptr) {
             engine.qwen4->restore_checkpoint(*best_cp);
+            reuse_pos = static_cast<size_t>(best_cp->pos);
+        } else {
+            engine.reset_state();
+            reuse_pos = 0;
+        }
+        engine.prune_state_checkpoints_after(static_cast<int>(reuse_pos));
+    } else if (engine.is_bailing3()) {
+        const rookery::BailingMoe3Model::KdaCheckpoint * best_cp = nullptr;
+        for (const auto & cp : engine.bailing3_checkpoints) {
+            if (cp.pos > 0 && static_cast<size_t>(cp.pos) <= max_reuse) best_cp = &cp;
+        }
+        if (best_cp != nullptr) {
+            engine.bailing3->restore_kda_checkpoint(*best_cp);
             reuse_pos = static_cast<size_t>(best_cp->pos);
         } else {
             engine.reset_state();
@@ -854,15 +901,17 @@ int main(int argc, char ** argv) {
                 ? rookery::render_glm5_chat_prompt(j.at("messages"), tools, enable_thinking, reasoning_effort)
                 : (engine.is_inkling2()
                     ? rookery::render_inkling2_chat_prompt(j.at("messages"), tools, enable_thinking, reasoning_effort)
-                    : ((engine.is_qwen35() || engine.is_qwen4())
-                        ? rookery::render_qwen3_chat_prompt(j.at("messages"), tools, enable_thinking)
-                        : rookery::render_maxwell_chat_prompt(j.at("messages"), tools, enable_thinking)));
+                    : (engine.is_bailing3()
+                        ? rookery::render_bailing3_chat_prompt(j.at("messages"), tools, enable_thinking)
+                        : ((engine.is_qwen35() || engine.is_qwen4())
+                            ? rookery::render_qwen3_chat_prompt(j.at("messages"), tools, enable_thinking)
+                            : rookery::render_maxwell_chat_prompt(j.at("messages"), tools, enable_thinking))));
             const auto prompt_ids = tokenizer.encode(prompt_str, tokenizer.add_bos_default(), true);
             const auto now_s = std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count();
 
             auto parse_out = [&](const std::string & raw, bool in_think) {
-                if (engine.is_glm5())     return rookery::parse_glm5_output(raw, in_think);
+                if (engine.is_glm5() || engine.is_bailing3()) return rookery::parse_glm5_output(raw, in_think);
                 if (engine.is_inkling2()) return rookery::parse_inkling2_output(in_think ? raw : ("<|content_text|>" + raw));
                 return rookery::parse_maxwell_output(raw, in_think);
             };
@@ -1048,15 +1097,22 @@ int main(int argc, char ** argv) {
                                 }
                                 if (in_think) {
                                     size_t end_t = pending.find("</think>");
-                                    const size_t hold = std::max<size_t>(8, max_stop_len);
-                                    if (end_t != std::string::npos) {
+                                    size_t tc_t  = pending.find("<tool_call>");
+                                    const size_t hold = std::max<size_t>(11, max_stop_len);
+                                    if (end_t != std::string::npos && (tc_t == std::string::npos || end_t < tc_t)) {
                                         std::string r = pending.substr(0, end_t);
                                         if (!r.empty() && !send_chunk({{"reasoning_content", r}}, nullptr)) return false;
                                         pending.erase(0, end_t + 8);
-                                        if (!engine.is_glm5()) {
+                                        if (!engine.is_glm5() && !engine.is_bailing3()) {
                                             while (!pending.empty() && pending.front() == '\n') pending.erase(pending.begin());
                                         }
                                         in_think = false;
+                                    } else if (tc_t != std::string::npos) {
+                                        // Recover gracefully if model skips </think> and emits <tool_call> directly!
+                                        if (tc_t > 0 && !send_chunk({{"reasoning_content", pending.substr(0, tc_t)}}, nullptr)) return false;
+                                        pending.erase(0, tc_t);
+                                        in_think = false;
+                                        in_tool  = true;
                                     } else if (is_final) {
                                         if (!pending.empty() && !send_chunk({{"reasoning_content", pending}}, nullptr)) return false;
                                         pending.clear();
@@ -1107,7 +1163,7 @@ int main(int argc, char ** argv) {
 
                             flush_stream(true);
                             if (in_tool && !pending.empty()) {
-                                auto parsed = engine.is_glm5()
+                                auto parsed = (engine.is_glm5() || engine.is_bailing3())
                                     ? rookery::parse_glm5_output(pending, false)
                                     : rookery::parse_maxwell_output(pending, false);
                                 if (!parsed.tool_calls.empty()) {
@@ -1194,6 +1250,11 @@ int main(int argc, char ** argv) {
         tokenizer.add_stop_token("<|endoftext|>");
         engine.qwen4 = std::make_unique<rookery::Qwen4ExpModel>();
         engine.qwen4->load(model_path, gpu_ids, tensor_split, max_ctx, kv_q8);
+    } else if (engine.arch == "bailingmoe3") {
+        tokenizer.add_stop_token("<|role_end|>");
+        tokenizer.add_stop_token("<|endoftext|>");
+        engine.bailing3 = std::make_unique<rookery::BailingMoe3Model>();
+        engine.bailing3->load(model_path, gpu_ids, tensor_split, max_ctx, kv_q8);
     } else if (engine.arch == "maxwell-moe") {
         engine.maxwell = std::make_unique<rookery::MaxwellMoeModel>();
         engine.maxwell->load(model_path, gpu_ids, tensor_split, max_ctx, kv_q8, use_mtp);

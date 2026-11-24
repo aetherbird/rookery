@@ -993,4 +993,492 @@ void launch_mla_attn_d512(
     }
 }
 
+// ============================================================================
+// RoPE-576 Absorbed MLA Kernels (BailingMoE3 / Ling-3.0 / Ling-3.2-Air)
+// K = [kv_norm(512), k_pe_rot(64)] (576 dims), V = kv_norm(512) (first 512 dims)
+// ============================================================================
+namespace {
+
+__global__ void mla_rope_split_q_kernel(
+    const float * __restrict__ q_all,   // [T, n_heads, qk_nope + rope_dim]
+    const int32_t * __restrict__ pos,   // [T]
+    float * __restrict__ q_nope,        // [T, n_heads, qk_nope]
+    float * __restrict__ q_pe,          // [T, n_heads, rope_dim]
+    int n_heads, int qk_nope, int rope_dim, float rope_freq_base) {
+
+    const int h = blockIdx.x;
+    const int t = blockIdx.y;
+    const int d = threadIdx.x;
+    const int qk_tot = qk_nope + rope_dim;
+    const float * src = q_all + (static_cast<size_t>(t) * n_heads + h) * qk_tot;
+    float * dst_nope  = q_nope + (static_cast<size_t>(t) * n_heads + h) * qk_nope;
+    float * dst_pe    = q_pe   + (static_cast<size_t>(t) * n_heads + h) * rope_dim;
+
+    for (int i = d; i < qk_nope; i += blockDim.x) {
+        dst_nope[i] = src[i];
+    }
+    const int half_r = rope_dim >> 1;
+    if (d < half_r) {
+        const float p = static_cast<float>(pos[t]);
+        const float freq = powf(rope_freq_base, -static_cast<float>(2 * d) / static_cast<float>(rope_dim));
+        const float theta = p * freq;
+        const float c = cosf(theta);
+        const float s = sinf(theta);
+        const float x0 = src[qk_nope + 2 * d + 0];
+        const float x1 = src[qk_nope + 2 * d + 1];
+        dst_pe[2 * d + 0] = x0 * c - x1 * s;
+        dst_pe[2 * d + 1] = x0 * s + x1 * c;
+    }
+}
+
+template <bool KV_Q8_0>
+__global__ void mla_kv_norm_rope_write_576_kernel(
+    const float * __restrict__ kv_all,  // [T, 576]
+    const float * __restrict__ norm_w,  // [512]
+    const int32_t * __restrict__ pos,   // [T]
+    void * __restrict__ kv_cache,       // [max_ctx, 576] (18 BlockQ8_0 or 576 __half)
+    float rms_eps, float rope_freq_base) {
+
+    __shared__ float s_buf[576];
+    __shared__ float s_warp[8];
+
+    const int t = blockIdx.x;
+    const int tid = threadIdx.x; // 0..255 (8 warps)
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const float * src = kv_all + static_cast<size_t>(t) * 576;
+
+    // 1. RMSNorm first 512 dims
+    const float v0 = src[tid];
+    const float v1 = src[tid + 256];
+    float ss = warp_sum(v0 * v0 + v1 * v1);
+    if (lane == 0) s_warp[warp] = ss;
+    __syncthreads();
+    if (warp == 0) {
+        float tot = (lane < 8) ? s_warp[lane] : 0.0f;
+        tot = warp_sum(tot);
+        if (lane == 0) s_warp[0] = rsqrtf(tot * (1.0f / 512.0f) + rms_eps);
+    }
+    __syncthreads();
+    const float inv = s_warp[0];
+    s_buf[tid]       = v0 * inv * norm_w[tid];
+    s_buf[tid + 256] = v1 * inv * norm_w[tid + 256];
+
+    // 2. Normal-pair RoPE on last 64 dims
+    if (tid < 32) {
+        const float p = static_cast<float>(pos[t]);
+        const float freq = powf(rope_freq_base, -static_cast<float>(2 * tid) / 64.0f);
+        const float theta = p * freq;
+        const float c = cosf(theta);
+        const float s = sinf(theta);
+        const float x0 = src[512 + 2 * tid + 0];
+        const float x1 = src[512 + 2 * tid + 1];
+        s_buf[512 + 2 * tid + 0] = x0 * c - x1 * s;
+        s_buf[512 + 2 * tid + 1] = x0 * s + x1 * c;
+    }
+    __syncthreads();
+
+    const int p = pos[t];
+    if constexpr (KV_Q8_0) {
+        // 18 Q8_0 blocks (576 / 32 = 18), 8 warps loop over blocks
+        BlockQ8_0 * dst = static_cast<BlockQ8_0 *>(kv_cache) + static_cast<size_t>(p) * 18;
+        for (int b = warp; b < 18; b += 8) {
+            const float v = s_buf[b * 32 + lane];
+            const float amax = __shfl_sync(0xffffffffu, warp_max(fabsf(v)), 0);
+            const float d = amax / 127.0f;
+            const float inv_d = (d > 0.0f) ? (127.0f / amax) : 0.0f;
+            if (lane == 0) {
+                __half dh = __float2half_rn(d);
+                dst[b].d = *reinterpret_cast<uint16_t *>(&dh);
+            }
+            dst[b].qs[lane] = static_cast<int8_t>(__float2int_rn(v * inv_d));
+        }
+    } else {
+        __half * dst = static_cast<__half *>(kv_cache) + static_cast<size_t>(p) * 576;
+        for (int i = tid; i < 576; i += 256) {
+            dst[i] = __float2half_rn(s_buf[i]);
+        }
+    }
+}
+
+__global__ void mla_concat_q576_kernel(
+    const float * __restrict__ q_abs,   // [T, n_heads, 512]
+    const float * __restrict__ q_pe,    // [T, n_heads, 64]
+    float * __restrict__ q576,          // [T, n_heads, 576]
+    int n_heads) {
+
+    const int h = blockIdx.x;
+    const int t = blockIdx.y;
+    const int i = threadIdx.x; // 0..255
+    const float * a = q_abs + (static_cast<size_t>(t) * n_heads + h) * 512;
+    const float * p = q_pe  + (static_cast<size_t>(t) * n_heads + h) * 64;
+    float * dst     = q576  + (static_cast<size_t>(t) * n_heads + h) * 576;
+    dst[i]       = a[i];
+    dst[i + 256] = a[i + 256];
+    if (i < 64) dst[512 + i] = p[i];
+}
+
+// Warp-parallel FP16 batched per-head GEMV (CUDA-Graph safe for T<=4, zero cuBLAS!)
+// W: [n_heads, M, K] FP16, x: [T, n_heads, K] FP32, y: [T, n_heads, M] FP32
+__global__ void batched_head_proj_f16_gemv_kernel(
+    const __half * __restrict__ W,
+    const float *  __restrict__ x,
+    float *        __restrict__ y,
+    int M, int K, int n_heads) {
+
+    __shared__ float s_x[1024]; // K <= 1024 (128 or 512)
+    const int h    = blockIdx.y;
+    const int t    = blockIdx.z;
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    const int tid  = warp * 32 + lane;
+    const int ntid = blockDim.x * blockDim.y;
+
+    const float * xp = x + (static_cast<size_t>(t) * n_heads + h) * K;
+    for (int i = tid; i < K; i += ntid) s_x[i] = xp[i];
+    __syncthreads();
+
+    const int row = blockIdx.x * blockDim.y + warp;
+    if (row >= M) return;
+
+    const __half * wr = W + (static_cast<size_t>(h) * M + row) * K;
+    float acc = 0.0f;
+    const int k2 = K >> 1;
+    const __half2 * wr2 = reinterpret_cast<const __half2 *>(wr);
+    for (int i = lane; i < k2; i += 32) {
+        float2 wv = __half22float2(__ldg(&wr2[i]));
+        acc += wv.x * s_x[2 * i] + wv.y * s_x[2 * i + 1];
+    }
+    acc = warp_sum(acc);
+    if (lane == 0) y[(static_cast<size_t>(t) * n_heads + h) * M + row] = acc;
+}
+
+template <bool KV_Q8_0, typename OutT>
+__global__ void mla_dequant_kv576_tile_kernel(
+    const void * __restrict__ kv_cache,
+    OutT *       __restrict__ out_tile, // [kc, 576]
+    int k0, int kc) {
+
+    const int row = blockIdx.x; // 0..kc-1
+    if (row >= kc) return;
+    const int p = k0 + row;
+    const int tid = threadIdx.x; // 0..255
+    OutT * dst = out_tile + static_cast<size_t>(row) * 576;
+
+    if constexpr (KV_Q8_0) {
+        const int lane = tid & 31;
+        const int warp = tid >> 5;
+        const BlockQ8_0 * kb = static_cast<const BlockQ8_0 *>(kv_cache) + static_cast<size_t>(p) * 18;
+        for (int b = warp; b < 18; b += 8) {
+            __half dh;
+            *reinterpret_cast<uint16_t *>(&dh) = __ldg(&kb[b].d);
+            const float val = __half2float(dh) * static_cast<float>(kb[b].qs[lane]);
+            if constexpr (std::is_same_v<OutT, __half>) dst[b * 32 + lane] = __float2half_rn(val);
+            else dst[b * 32 + lane] = val;
+        }
+    } else {
+        const __half * src = static_cast<const __half *>(kv_cache) + static_cast<size_t>(p) * 576;
+        for (int i = tid; i < 576; i += 256) {
+            if constexpr (std::is_same_v<OutT, __half>) dst[i] = src[i];
+            else dst[i] = __half2float(src[i]);
+        }
+    }
+}
+
+// Multi-head shared Split-K Decode for 576-dim K (512 latent + 64 RoPE) / 512-dim V!
+// 8 heads per CTA load each KV position ONCE into shared memory (2.3 KB), then all 8 warps score + accumulate!
+template <bool KV_Q8_0, int SPLITS, int H_PER_BLK>
+__global__ void mla_mqa_d576_decode_shared_kernel(
+    const float *   __restrict__ q576,     // [T, n_heads, 576]
+    const void *    __restrict__ kv_cache, // [max_ctx, 576]
+    const int32_t * __restrict__ pos,      // [T]
+    float *         __restrict__ part_m,   // [T, n_heads, SPLITS]
+    float *         __restrict__ part_l,   // [T, n_heads, SPLITS]
+    float *         __restrict__ part_o,   // [T, n_heads, SPLITS, 512]
+    int n_heads, float scale) {
+
+    __shared__ float s_kv[576];
+
+    const int h0   = blockIdx.x * H_PER_BLK;
+    const int s    = blockIdx.y;
+    const int t    = blockIdx.z;
+    const int lane = threadIdx.x; // 0..31
+    const int warp = threadIdx.y; // 0..H_PER_BLK-1 (8 warps = 256 threads)
+    const int tid  = warp * 32 + lane;
+    const int h    = h0 + warp;
+    const bool valid_h = (h < n_heads);
+
+    const int kv_len = pos[t] + 1;
+    const int chunk  = (kv_len + SPLITS - 1) / SPLITS;
+    const int p0     = s * chunk;
+    const int p1     = (p0 + chunk < kv_len) ? (p0 + chunk) : kv_len;
+
+    // Load 16 latent Q dims + 2 RoPE Q dims per lane!
+    float qv[16] = {0};
+    float qp0 = 0.0f, qp1 = 0.0f;
+    if (valid_h) {
+        const float * qp = q576 + (static_cast<size_t>(t) * n_heads + h) * 576;
+        const auto * q4p = reinterpret_cast<const float4 *>(qp) + lane * 4;
+        #pragma unroll
+        for (int g = 0; g < 4; ++g) {
+            float4 tmp = q4p[g];
+            qv[g * 4 + 0] = tmp.x * scale;
+            qv[g * 4 + 1] = tmp.y * scale;
+            qv[g * 4 + 2] = tmp.z * scale;
+            qv[g * 4 + 3] = tmp.w * scale;
+        }
+        qp0 = qp[512 + lane * 2 + 0] * scale;
+        qp1 = qp[512 + lane * 2 + 1] * scale;
+    }
+
+    float m_i = -FLT_MAX;
+    float l_i = 0.0f;
+    float ov[16] = {0};
+
+    for (int p = p0; p < p1; ++p) {
+        if constexpr (KV_Q8_0) {
+            const BlockQ8_0 * kb = static_cast<const BlockQ8_0 *>(kv_cache) + static_cast<size_t>(p) * 18;
+            for (int b = warp; b < 18; b += H_PER_BLK) {
+                __half dh;
+                *reinterpret_cast<uint16_t *>(&dh) = __ldg(&kb[b].d);
+                s_kv[b * 32 + lane] = __half2float(dh) * static_cast<float>(kb[b].qs[lane]);
+            }
+        } else {
+            const __half * kc = static_cast<const __half *>(kv_cache) + static_cast<size_t>(p) * 576;
+            for (int i = tid; i < 576; i += H_PER_BLK * 32) {
+                s_kv[i] = __half2float(__ldg(&kc[i]));
+            }
+        }
+        __syncthreads();
+
+        if (valid_h) {
+            float kv[16];
+            const auto * sk4 = reinterpret_cast<const float4 *>(s_kv) + lane * 4;
+            #pragma unroll
+            for (int g = 0; g < 4; ++g) {
+                float4 tmp = sk4[g];
+                kv[g * 4 + 0] = tmp.x; kv[g * 4 + 1] = tmp.y;
+                kv[g * 4 + 2] = tmp.z; kv[g * 4 + 3] = tmp.w;
+            }
+            float dot = qp0 * s_kv[512 + lane * 2 + 0] + qp1 * s_kv[512 + lane * 2 + 1];
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) dot += qv[i] * kv[i];
+            dot = warp_sum(dot);
+            const float score = __shfl_sync(0xffffffffu, dot, 0);
+
+            const float m_new = fmaxf(m_i, score);
+            const float alpha = expf(m_i - m_new);
+            const float beta  = expf(score - m_new);
+            l_i = l_i * alpha + beta;
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) ov[i] = ov[i] * alpha + beta * kv[i];
+            m_i = m_new;
+        }
+        __syncthreads();
+    }
+
+    if (valid_h) {
+        const size_t slot = (static_cast<size_t>(t) * n_heads + h) * SPLITS + s;
+        if (lane == 0) {
+            part_m[slot] = m_i;
+            part_l[slot] = l_i;
+        }
+        auto * o4 = reinterpret_cast<float4 *>(part_o + slot * 512) + lane * 4;
+        #pragma unroll
+        for (int g = 0; g < 4; ++g) {
+            o4[g] = make_float4(ov[g * 4 + 0], ov[g * 4 + 1], ov[g * 4 + 2], ov[g * 4 + 3]);
+        }
+    }
+}
+
+__global__ void mla_head_sigmoid_gate_kernel(
+    float *       __restrict__ o,    // [T, n_heads, head_dim]
+    const float * __restrict__ gate, // [T, n_heads]
+    int n_heads, int head_dim) {
+
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
+    const int h = blockIdx.y;
+    const int t = blockIdx.z;
+    if (d >= head_dim) return;
+    const float g = 1.0f / (1.0f + expf(-gate[static_cast<size_t>(t) * n_heads + h]));
+    o[(static_cast<size_t>(t) * n_heads + h) * head_dim + d] *= g;
+}
+
+} // namespace
+
+void launch_mla_rope_split_q(
+    const float * d_q_all, const int32_t * d_pos, float * d_q_nope, float * d_q_pe,
+    int T, int n_heads, int qk_nope, int rope_dim, float rope_freq_base, cudaStream_t stream) {
+    mla_rope_split_q_kernel<<<dim3(n_heads, T), 128, 0, stream>>>(
+        d_q_all, d_pos, d_q_nope, d_q_pe, n_heads, qk_nope, rope_dim, rope_freq_base);
+}
+
+void launch_mla_kv_norm_rope_write_576(
+    const float * d_kv_all, const float * d_norm_w, const int32_t * d_pos,
+    void * d_kv_cache, bool kv_is_q8_0,
+    int T, float rms_eps, float rope_freq_base, cudaStream_t stream) {
+    if (kv_is_q8_0) {
+        mla_kv_norm_rope_write_576_kernel<true><<<T, 256, 0, stream>>>(
+            d_kv_all, d_norm_w, d_pos, d_kv_cache, rms_eps, rope_freq_base);
+    } else {
+        mla_kv_norm_rope_write_576_kernel<false><<<T, 256, 0, stream>>>(
+            d_kv_all, d_norm_w, d_pos, d_kv_cache, rms_eps, rope_freq_base);
+    }
+}
+
+void launch_mla_concat_q576(
+    const float * d_q_abs, const float * d_q_pe, float * d_q576,
+    int T, int n_heads, cudaStream_t stream) {
+    mla_concat_q576_kernel<<<dim3(n_heads, T), 256, 0, stream>>>(d_q_abs, d_q_pe, d_q576, n_heads);
+}
+
+void launch_batched_head_proj_f16(
+    const DeviceTensor & W, const float * d_x, float * d_y, int T, cudaStream_t stream,
+    cublasHandle_t cublas, void * d_scratch, size_t scratch_bytes) {
+
+    const int K       = static_cast<int>(W.ne[0]);
+    const int M       = static_cast<int>(W.ne[1]);
+    const int n_heads = static_cast<int>(W.ne[2]);
+
+    if (T >= 8 && cublas != nullptr && d_scratch != nullptr) {
+        auto align256 = [](size_t n) { return (n + 255) & ~size_t(255); };
+        if (device_has_tensor_cores(-1)) {
+            const size_t x_bytes = align256(static_cast<size_t>(n_heads) * T * K * sizeof(__half));
+            const size_t y_bytes = align256(static_cast<size_t>(n_heads) * T * M * sizeof(float));
+            if (x_bytes + y_bytes <= scratch_bytes) {
+                auto * base  = static_cast<uint8_t *>(d_scratch);
+                auto * d_x16 = reinterpret_cast<__half *>(base);
+                auto * d_yh  = reinterpret_cast<float  *>(base + x_bytes);
+
+                const int tot_x = T * n_heads * K;
+                transpose_thd_to_htd_kernel<__half><<<(tot_x + 255) / 256, 256, 0, stream>>>(d_x, d_x16, T, n_heads, K);
+
+                const float alpha = 1.0f, beta = 0.0f;
+                cublasSetStream(cublas, stream);
+                cublasGemmStridedBatchedEx(
+                    cublas,
+                    CUBLAS_OP_T, CUBLAS_OP_N,
+                    M, T, K,
+                    &alpha,
+                    W.ptr, CUDA_R_16F, K, static_cast<long long>(M) * K,
+                    d_x16, CUDA_R_16F, K, static_cast<long long>(T) * K,
+                    &beta,
+                    d_yh,  CUDA_R_32F, M, static_cast<long long>(T) * M,
+                    n_heads,
+                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+                const int tot_y = T * n_heads * M;
+                transpose_htd_to_thd_f32_kernel<<<(tot_y + 255) / 256, 256, 0, stream>>>(d_yh, d_y, T, n_heads, M);
+                return;
+            }
+        }
+    }
+
+    constexpr int wpb = 8;
+    dim3 grid((M + wpb - 1) / wpb, n_heads, T);
+    batched_head_proj_f16_gemv_kernel<<<grid, dim3(32, wpb), 0, stream>>>(
+        static_cast<const __half *>(W.ptr), d_x, d_y, M, K, n_heads);
+}
+
+void launch_mla_attn_d576_v512(
+    const float * d_q576, const void * d_kv_cache, bool kv_is_q8_0,
+    const int32_t * d_pos, float * d_out, void * d_scratch,
+    int T, int n_heads, float scale, cudaStream_t stream,
+    cublasHandle_t cublas, size_t scratch_bytes, int kv_len_max) {
+
+    // Fast Tiled FlashMLA Prefill (T >= 8): FP16 Tensor Core (Q576 @ K576^T -> P @ V512!)
+    if (T >= 8 && cublas != nullptr && kv_len_max > 0 && device_has_tensor_cores(-1)) {
+        const int M = T * n_heads;
+        auto align256 = [](size_t n) { return (n + 255) & ~size_t(255); };
+        constexpr int K_TILE = 512;
+        const size_t q16_b = align256(static_cast<size_t>(M) * 576 * sizeof(__half));
+        const size_t k16_b = align256(static_cast<size_t>(K_TILE) * 576 * sizeof(__half));
+        const size_t s32_b = align256(static_cast<size_t>(M) * K_TILE * sizeof(float));
+        const size_t p16_b = align256(static_cast<size_t>(M) * K_TILE * sizeof(__half));
+        const size_t ml_b  = align256(static_cast<size_t>(M) * sizeof(float));
+        const size_t need  = q16_b + k16_b + s32_b + p16_b + 2 * ml_b;
+
+        if (need <= scratch_bytes) {
+            auto * base = static_cast<uint8_t *>(d_scratch);
+            size_t off = 0;
+            auto * d_q16 = reinterpret_cast<__half *>(base + off); off += q16_b;
+            auto * d_k16 = reinterpret_cast<__half *>(base + off); off += k16_b;
+            auto * d_s32 = reinterpret_cast<float  *>(base + off); off += s32_b;
+            auto * d_p16 = reinterpret_cast<__half *>(base + off); off += p16_b;
+            auto * d_m   = reinterpret_cast<float  *>(base + off); off += ml_b;
+            auto * d_l   = reinterpret_cast<float  *>(base + off);
+
+            const int64_t nq = static_cast<int64_t>(M) * 576;
+            mla_scale_cast_kernel<__half><<<(nq + 255) / 256, 256, 0, stream>>>(d_q576, d_q16, nq, scale);
+            mla_init_flash_state_kernel<<<(M + 255) / 256, 256, 0, stream>>>(d_m, d_l, M);
+
+            const float one = 1.0f, zero = 0.0f;
+            cublasSetStream(cublas, stream);
+
+            for (int k0 = 0; k0 < kv_len_max; k0 += K_TILE) {
+                const int kc = (k0 + K_TILE < kv_len_max) ? K_TILE : (kv_len_max - k0);
+                if (kv_is_q8_0) {
+                    mla_dequant_kv576_tile_kernel<true, __half><<<kc, 256, 0, stream>>>(d_kv_cache, d_k16, k0, kc);
+                } else {
+                    mla_dequant_kv576_tile_kernel<false, __half><<<kc, 256, 0, stream>>>(d_kv_cache, d_k16, k0, kc);
+                }
+
+                // S[kc, M] = K16[576, kc]^T @ Q16[576, M]
+                cublasGemmEx(
+                    cublas,
+                    CUBLAS_OP_T, CUBLAS_OP_N,
+                    kc, M, 576,
+                    &one,
+                    d_k16, CUDA_R_16F, 576,
+                    d_q16, CUDA_R_16F, 576,
+                    &zero,
+                    d_s32, CUDA_R_32F, kc,
+                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+                mla_flash_online_softmax_rescale_kernel<__half><<<M, 128, 0, stream>>>(
+                    d_s32, d_p16, d_pos, d_m, d_l, d_out, n_heads, k0, kc);
+
+                // O[512, M] += V16[512, kc] @ P16[kc, M]  (V16 is first 512 rows of K16 with ld=576!)
+                cublasGemmEx(
+                    cublas,
+                    CUBLAS_OP_N, CUBLAS_OP_N,
+                    512, M, kc,
+                    &one,
+                    d_k16, CUDA_R_16F, 576,
+                    d_p16, CUDA_R_16F, kc,
+                    &one,
+                    d_out, CUDA_R_32F, 512,
+                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            }
+
+            mla_flash_finalize_out_kernel<<<M, 128, 0, stream>>>(d_out, d_l, M);
+            return;
+        }
+    }
+
+    // Multi-Head-Shared Split-K Decode (and small-T fallback)
+    constexpr int S = 32;
+    constexpr int H_PER_BLK = 8;
+    const size_t n_slots = static_cast<size_t>(T) * n_heads * S;
+    float * pm = static_cast<float *>(d_scratch);
+    float * pl = pm + n_slots;
+    float * po = pl + n_slots;
+    dim3 grid((n_heads + H_PER_BLK - 1) / H_PER_BLK, S, T);
+    dim3 block(32, H_PER_BLK);
+    if (kv_is_q8_0) {
+        mla_mqa_d576_decode_shared_kernel<true, S, H_PER_BLK><<<grid, block, 0, stream>>>(
+            d_q576, d_kv_cache, d_pos, pm, pl, po, n_heads, scale);
+    } else {
+        mla_mqa_d576_decode_shared_kernel<false, S, H_PER_BLK><<<grid, block, 0, stream>>>(
+            d_q576, d_kv_cache, d_pos, pm, pl, po, n_heads, scale);
+    }
+    mla_mqa_d512_reduce_kernel<S><<<dim3(n_heads, T), 32, 0, stream>>>(pm, pl, po, d_out, n_heads);
+}
+
+void launch_mla_head_sigmoid_gate(
+    float * d_o, const float * d_gate, int T, int n_heads, int head_dim, cudaStream_t stream) {
+    mla_head_sigmoid_gate_kernel<<<dim3((head_dim + 127) / 128, n_heads, T), 128, 0, stream>>>(
+        d_o, d_gate, n_heads, head_dim);
+}
+
 } // namespace rookery

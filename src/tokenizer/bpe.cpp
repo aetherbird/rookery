@@ -99,9 +99,9 @@ void BpeTokenizer::load(const GgufFile & gguf) {
     eot_id_          = static_cast<int32_t>(gguf.get_u64("tokenizer.ggml.eot_token_id", 200001));
     add_bos_default_ = gguf.get_bool("tokenizer.ggml.add_bos_token", true);
     const std::string pre = gguf.get_str("tokenizer.ggml.pre", "");
-    max_digits_ = (pre == "qwen35" || pre == "qwen2") ? 1 : 3;
+    max_digits_ = (pre == "qwen35" || pre == "qwen2" || pre == "bailingmoe" || pre == "bailingmoe2") ? 1 : 3;
     use_llama3_pre_ = (pre == "qwen35" || pre == "qwen2" || pre == "glm4" || pre == "glm5" ||
-                       pre == "llama3" || pre == "llama-bpe");
+                       pre == "llama3" || pre == "llama-bpe" || pre == "bailingmoe" || pre == "bailingmoe2");
 
     const auto & tok_val = gguf.kv("tokenizer.ggml.tokens");
     const auto * tok_vec = std::get_if<std::vector<std::string>>(&tok_val.data);

@@ -75,6 +75,7 @@ __global__ void l2_norm_d128_kernel(float * __restrict__ x, int n_heads, float e
 // Fused KDA gate + beta:
 // g[t, h, d] = lower_bound * sigmoid(-(f[t, h, d] + dt_bias[h, d]) * ssm_a[h])
 // (Note: ssm_a in GLM-5.3 holds -exp(A_log), so -(x * ssm_a) = +exp(A_log) * x!)
+template <bool NEGATE_A>
 __global__ void kda_gate_kernel(
     float *       __restrict__ f,       // [T, n_heads * head_dim] in-place -> g
     const float * __restrict__ dt_bias, // [n_heads * head_dim]
@@ -90,7 +91,11 @@ __global__ void kda_gate_kernel(
     const int h = idx / head_dim;
     const size_t off = static_cast<size_t>(t) * D + idx;
     const float val = (f[off] + dt_bias[idx]) * ssm_a[h];
-    f[off] = lower_bound / (1.0f + expf(val)); // lower_bound * sigmoid(-val)
+    if constexpr (NEGATE_A) {
+        f[off] = lower_bound / (1.0f + expf(val));  // lower_bound * sigmoid(-val) (GLM-5.3)
+    } else {
+        f[off] = lower_bound / (1.0f + expf(-val)); // lower_bound * sigmoid(+val) (BailingMoE3)
+    }
 }
 
 __global__ void sigmoid_inplace_kernel(float * __restrict__ x, int64_t n) {
@@ -225,9 +230,14 @@ void launch_l2_norm_d128(float * d_x, int T, int n_heads, float eps, cudaStream_
 
 void launch_kda_gate_and_beta(
     float * d_f, const float * d_dt_bias, const float * d_ssm_a,
-    float * d_beta, float lower_bound, int T, int n_heads, int head_dim, cudaStream_t stream) {
+    float * d_beta, float lower_bound, int T, int n_heads, int head_dim, cudaStream_t stream,
+    bool negate_a) {
     const int D = n_heads * head_dim;
-    kda_gate_kernel<<<dim3((D + 255) / 256, T), 256, 0, stream>>>(d_f, d_dt_bias, d_ssm_a, lower_bound, n_heads, head_dim);
+    if (negate_a) {
+        kda_gate_kernel<true><<<dim3((D + 255) / 256, T), 256, 0, stream>>>(d_f, d_dt_bias, d_ssm_a, lower_bound, n_heads, head_dim);
+    } else {
+        kda_gate_kernel<false><<<dim3((D + 255) / 256, T), 256, 0, stream>>>(d_f, d_dt_bias, d_ssm_a, lower_bound, n_heads, head_dim);
+    }
     const int64_t nb = static_cast<int64_t>(T) * n_heads;
     sigmoid_inplace_kernel<<<(nb + 255) / 256, 256, 0, stream>>>(d_beta, nb);
 }
