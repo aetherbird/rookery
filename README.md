@@ -13,6 +13,7 @@ A pure C++20 + CUDA LLM inference and serving engine built for modern MoE and hy
 | `inkling2_loop` / `inkling2` | Inkling 2 Mini | Recurrent loop-transformer with SWA FlashAttention (`T >= 8` Tensor Core prefill), `Q8_0` MoE |
 | `qwen35moe` | Qwen3.5 / Qwen3.6-35B-A3B-MTP | Hybrid Gated Delta Net (GDN) + GQA (`d=256`), grouped `__dp4a` MoE, NextN MTP speculative decoding, host-RAM GDN checkpoints |
 | `qwen4exp` | Qwen3.8-Flash-Next | mHC-4 + host-RAM mmap Per-Layer Embedding (PLE) + QSA sparse indexer (`top_k=2048`) + GDN + `Q6_K`/`Q8_0` MoE |
+| `bailingmoe3` | Ling-3.0-tiny / Ling-3.0-Flash / Ling-3.2-Air (incl. REAP-408) | Hybrid KDA linear attention + Gated RoPE-576 MLA (`P_TILE=8` zero-bank-conflict Split-K + Tensor Core FlashMLA), grouped top-k `Q6_K`/`Q8_0` SoA MoE with SwiGLU clamping, NextN MTP speculative decoding, host-RAM KDA checkpoints |
 
 Additional engine features:
 - **Heterogeneous multi-GPU pipeline execution:** Automatically discovers GPU topology (`sm_70` + `sm_86`), supports `--tensor-split` / `--gpus`, and converts `BF16` weights to `FP16` on Volta (`sm_70`) while keeping native `BF16` on Ampere (`sm_86`).
@@ -34,6 +35,10 @@ Measured against `llama.cpp` (`-fa 1 -ctk q8_0 -ctv q8_0`) on heterogeneous mult
 | **Qwen3.6-35B-A3B-MTP** (`Q8_0`) | 3090 + V100 | Decode (no MTP / + MTP) | `113.2 tok/s` | `134.0` / **`195.6 tok/s`** | **+18% / +73%** |
 | **Qwen3.6-35B-A3B-MTP** (`Q8_0`) | 3090 + V100 | Prefill `pp2048` | — | **`1,887.4 tok/s`** | `0.000000` ckpt parity |
 | **Qwen3.8-Flash-Next** (`UD-Q6_K_XL`) | 3090 + 2×3060 + 3×V100 | Decode (`ctx=5` / `ctx=4096`) | `41.6 tok/s` | **`50.5` / `50.1 tok/s`** | **+21%** |
+| **Ling-3.2-Air** (`Q6_K`, `256K` ctx, MTP) | 3090 + 3×V100 | Decode `tg128` (no MTP / + MTP) | `55.4 tok/s` | `86.3` / **`116.4 tok/s`** | **+56% / +110%** |
+| **Ling-3.2-Air** (`Q6_K`, `256K` ctx, MTP) | 3090 + 3×V100 | Long-ctx decode (`20K` / `41K` / `82K`) | `50.1 tok/s` (`32K`) | **`75.0` / `58.0` / `44.7 tok/s`** | **100% needle up to 82K** |
+| **Ling-3.2-Air REAP-408** (`Q8_0`, `256K` ctx) | 3090 + 3×V100 | Decode `tg128` (no MTP) | — | **`76.4 tok/s`** | **pure `Q8_0` SoA** |
+| **Ling-3.0-tiny** (`Q4_K_M`) | RTX 3090 (`sm_86`) | Decode `tg128` | `225.3 tok/s` | **`288.6 tok/s`** | **+28%** |
 | **Qwen3.6-35B-A3B** (`UD-Q3_K_XL`) | P100 + GTX 1060 (`sm_60/61`) | Decode `tg128` | `38.0 tok/s` | **`53.4 tok/s`** | **+41%** |
 | **Maxwell-V1-Flash** (`Q3_K_M`) | P100 + GTX 1060 (`sm_60/61`) | Decode `tg64` | Unsupported | **`26.3 tok/s`** | — |
 | **Inkling-2-Mini** (`IQ4_NL`) | P100 + GTX 1060 (`sm_60/61`) | Decode `tg64` (asym 2-GPU) | Unsupported | **`27.7 tok/s`** | — |
@@ -59,7 +64,7 @@ This builds:
 - `build/rookery-server` — OpenAI-compatible inference server
 - `build/rookery-fit-adapter` — GPU Ridge adapter fitter for cross-model Engram grafting
 - `build/rookery_unit_test` — Chat template, tokenizer, and tool-parser unit tests
-- `build/rookery_{maxwell,glm5,inkling2,qwen35,qwen4exp,engram}_test` — Model parity & benchmark binaries
+- `build/rookery_{maxwell,glm5,inkling2,qwen35,qwen4exp,bailingmoe3,engram}_test` — Model parity & benchmark binaries
 
 ## Usage
 

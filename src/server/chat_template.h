@@ -717,7 +717,10 @@ inline std::string render_bailing3_chat_prompt(const json & messages,
 
     std::string out = "<role>SYSTEM</role>";
     if (has_tools) {
-        if (first_sys) out += sys_txt + "\n";
+        if (first_sys) {
+            out += sys_txt;
+            if (!sys_txt.empty() && sys_txt.back() != '\n') out += "\n";
+        }
         out += "# Tools\n\nYou may call one or more functions to assist with the user query.\n\n"
                "You are provided with function signatures within <tools></tools> XML tags:\n<tools>";
         for (const auto & t : tools) out += "\n" + t.dump();
@@ -731,8 +734,12 @@ inline std::string render_bailing3_chat_prompt(const json & messages,
         else               out += "detailed thinking " + thinking_opt + "<|role_end|>";
     } else {
         if (first_sys) {
-            if (sys_has_think) out += sys_txt + "<|role_end|>";
-            else               out += sys_txt + "\ndetailed thinking " + thinking_opt + "<|role_end|>";
+            out += sys_txt;
+            if (!sys_has_think) {
+                if (!sys_txt.empty() && sys_txt.back() != '\n') out += "\n";
+                out += "detailed thinking " + thinking_opt;
+            }
+            out += "<|role_end|>";
         } else {
             out += "detailed thinking " + thinking_opt + "<|role_end|>";
         }

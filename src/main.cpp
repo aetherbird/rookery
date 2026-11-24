@@ -142,11 +142,12 @@ struct ServerEngine {
         if (inkling2 || qwen35 || bailing3) return 1;
         return maxwell->config().hc_mult;
     }
-    size_t prefill_chunk() const { return (glm5 || inkling2 || bailing3) ? 256 : 512; }
+    size_t prefill_chunk() const { return (glm5 || inkling2) ? 256 : 512; }
     bool has_mtp() const {
         if (glm5)     return glm5->has_mtp();
-        if (inkling2 || qwen4 || bailing3) return false;
+        if (inkling2 || qwen4) return false;
         if (qwen35)   return qwen35->has_mtp();
+        if (bailing3) return bailing3->has_mtp();
         return maxwell->has_mtp();
     }
 
@@ -206,8 +207,9 @@ struct ServerEngine {
         else               maxwell->forward_decode_logits(t, p, l);
     }
     int32_t mtp_prefill_chunk(const std::vector<int32_t> & nt, const std::vector<int32_t> & p) {
-        if (glm5)   return glm5->mtp_prefill_chunk(nt, p);
-        if (qwen35) return qwen35->mtp_prefill_chunk(nt, p);
+        if (glm5)     return glm5->mtp_prefill_chunk(nt, p);
+        if (qwen35)   return qwen35->mtp_prefill_chunk(nt, p);
+        if (bailing3) return bailing3->mtp_prefill_chunk(nt, p);
         return maxwell->mtp_prefill_chunk(nt, p);
     }
     std::vector<int32_t> cached_tokens;
@@ -335,31 +337,35 @@ struct ServerEngine {
     }
 
     bool supports_sample_mtp() const {
-        return (glm5 && glm5->has_mtp()) || (qwen35 && qwen35->has_mtp());
+        return (glm5 && glm5->has_mtp()) || (qwen35 && qwen35->has_mtp()) || (bailing3 && bailing3->has_mtp());
     }
 
     void mtp_prefill_chunk_logits(const std::vector<int32_t> & nt, const std::vector<int32_t> & p, std::vector<float> & l) {
-        if (glm5) glm5->mtp_prefill_chunk_logits(nt, p, l);
-        else      qwen35->mtp_prefill_chunk_logits(nt, p, l);
+        if (glm5)        glm5->mtp_prefill_chunk_logits(nt, p, l);
+        else if (qwen35) qwen35->mtp_prefill_chunk_logits(nt, p, l);
+        else             bailing3->mtp_prefill_chunk_logits(nt, p, l);
     }
 
     void decode_mtp_greedy_step(int32_t & ct, int32_t & dt, int32_t & cp,
                                 std::vector<int32_t> & out, rookery::MtpStats & st) {
-        if (glm5)        glm5->decode_mtp_greedy_step(ct, dt, cp, out, st);
-        else if (qwen35) qwen35->decode_mtp_greedy_step(ct, dt, cp, out, st);
-        else             maxwell->decode_mtp_greedy_step(ct, dt, cp, out, st);
+        if (glm5)          glm5->decode_mtp_greedy_step(ct, dt, cp, out, st);
+        else if (qwen35)   qwen35->decode_mtp_greedy_step(ct, dt, cp, out, st);
+        else if (bailing3) bailing3->decode_mtp_greedy_step(ct, dt, cp, out, st);
+        else               maxwell->decode_mtp_greedy_step(ct, dt, cp, out, st);
     }
 
     void decode_mtp_sample_step(int32_t & ct, int32_t & dt, rookery::Sampler::SparseDist & dq,
                                 int32_t & cp, rookery::Sampler & sampler,
                                 std::vector<int32_t> & out, rookery::MtpStats & st) {
-        if (glm5) glm5->decode_mtp_sample_step(ct, dt, dq, cp, sampler, out, st);
-        else      qwen35->decode_mtp_sample_step(ct, dt, dq, cp, sampler, out, st);
+        if (glm5)        glm5->decode_mtp_sample_step(ct, dt, dq, cp, sampler, out, st);
+        else if (qwen35) qwen35->decode_mtp_sample_step(ct, dt, dq, cp, sampler, out, st);
+        else             bailing3->decode_mtp_sample_step(ct, dt, dq, cp, sampler, out, st);
     }
 
     void rollback_mtp_1tok() {
-        if (glm5)        glm5->rollback_kda_states();
-        else if (qwen35) qwen35->rollback_gdn_states();
+        if (glm5)          glm5->rollback_kda_states();
+        else if (qwen35)   qwen35->rollback_gdn_states();
+        else if (bailing3) bailing3->rollback_kda_states();
     }
 };
 
@@ -1254,7 +1260,7 @@ int main(int argc, char ** argv) {
         tokenizer.add_stop_token("<|role_end|>");
         tokenizer.add_stop_token("<|endoftext|>");
         engine.bailing3 = std::make_unique<rookery::BailingMoe3Model>();
-        engine.bailing3->load(model_path, gpu_ids, tensor_split, max_ctx, kv_q8);
+        engine.bailing3->load(model_path, gpu_ids, tensor_split, max_ctx, kv_q8, use_mtp);
     } else if (engine.arch == "maxwell-moe") {
         engine.maxwell = std::make_unique<rookery::MaxwellMoeModel>();
         engine.maxwell->load(model_path, gpu_ids, tensor_split, max_ctx, kv_q8, use_mtp);

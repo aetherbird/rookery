@@ -29,7 +29,8 @@ __global__ void moe_route_sigmoid_kernel(
     const float * __restrict__ bias,
     int32_t *     __restrict__ top_ids,
     float *       __restrict__ top_w,
-    int n_expert, int k, bool renorm, float scale) {
+    int n_expert, int k, bool renorm, float scale,
+    int n_expert_groups, int n_group_used) {
 
     const int t    = blockIdx.x;
     const int tid  = threadIdx.x;
@@ -47,6 +48,49 @@ __global__ void moe_route_sigmoid_kernel(
     if (tid + 256 < n_expert) {
         my_p1 = 1.0f / (1.0f + expf(-row[tid + 256]));
         my_s1 = bias ? (my_p1 + bias[tid + 256]) : my_p1;
+    }
+
+    __shared__ float   s_sel[512];
+    __shared__ float   s_gscore[32];
+    __shared__ uint8_t s_gmask[32];
+
+    // Optional DeepSeek-V3 / BailingMoE3 grouped top-k routing (top-2 sum per group -> keep top n_group_used groups)
+    if (n_expert_groups > 1 && n_group_used > 0 && n_group_used < n_expert_groups) {
+        const int n_per_grp = n_expert / n_expert_groups;
+        s_sel[tid]       = my_s0;
+        s_sel[tid + 256] = my_s1;
+        __syncthreads();
+
+        if (tid < n_expert_groups) {
+            const int g0 = tid * n_per_grp;
+            float t1 = -FLT_MAX, t2 = -FLT_MAX;
+            for (int i = 0; i < n_per_grp; ++i) {
+                float v = s_sel[g0 + i];
+                if (v > t1) { t2 = t1; t1 = v; }
+                else if (v > t2) { t2 = v; }
+            }
+            s_gscore[tid] = t1 + t2;
+            s_gmask[tid]  = 0;
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            for (int j = 0; j < n_group_used; ++j) {
+                float best_v = -FLT_MAX;
+                int   best_g = 0;
+                for (int g = 0; g < n_expert_groups; ++g) {
+                    if (!s_gmask[g] && s_gscore[g] > best_v) {
+                        best_v = s_gscore[g];
+                        best_g = g;
+                    }
+                }
+                s_gmask[best_g] = 1;
+            }
+        }
+        __syncthreads();
+
+        if (tid < n_expert && !s_gmask[tid / n_per_grp]) my_s0 = -FLT_MAX;
+        if (tid + 256 < n_expert && !s_gmask[(tid + 256) / n_per_grp]) my_s1 = -FLT_MAX;
     }
 
     __shared__ float   s_wval[8];
@@ -334,13 +378,17 @@ void launch_moe_route_sigmoid(
     const float * d_logits, const float * d_bias,
     int32_t * d_top_ids, float * d_top_w,
     int n_tokens, int n_expert, int k, bool renorm, float scale,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    int n_expert_groups, int n_group_used) {
 
     if (n_expert > 512) {
         throw std::runtime_error("moe_route_sigmoid: n_expert > 512 not yet supported");
     }
+    if (n_expert_groups > 32) {
+        throw std::runtime_error("moe_route_sigmoid: n_expert_groups > 32 not yet supported");
+    }
     moe_route_sigmoid_kernel<<<n_tokens, 256, 0, stream>>>(
-        d_logits, d_bias, d_top_ids, d_top_w, n_expert, k, renorm, scale);
+        d_logits, d_bias, d_top_ids, d_top_w, n_expert, k, renorm, scale, n_expert_groups, n_group_used);
 }
 
 void launch_moe_ffn_q8_0_with_shared(

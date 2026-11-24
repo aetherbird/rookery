@@ -1185,10 +1185,9 @@ __global__ void mla_dequant_kv576_tile_kernel(
     }
 }
 
-// Multi-head shared Split-K Decode for 576-dim K (512 latent + 64 RoPE) / 512-dim V!
-// 8 heads per CTA load each KV position ONCE into shared memory (2.3 KB), then all 8 warps score + accumulate!
+// Zero-bank-conflict stride-32 Multi-Head-Shared Split-K RoPE-576 MLA Decode (P_TILE=8, H_PER_BLK=16)
 template <bool KV_Q8_0, int SPLITS, int H_PER_BLK>
-__global__ void mla_mqa_d576_decode_shared_kernel(
+__global__ __launch_bounds__(512) void mla_mqa_d576_decode_shared_kernel(
     const float *   __restrict__ q576,     // [T, n_heads, 576]
     const void *    __restrict__ kv_cache, // [max_ctx, 576]
     const int32_t * __restrict__ pos,      // [T]
@@ -1197,13 +1196,14 @@ __global__ void mla_mqa_d576_decode_shared_kernel(
     float *         __restrict__ part_o,   // [T, n_heads, SPLITS, 512]
     int n_heads, float scale) {
 
-    __shared__ float s_kv[576];
+    constexpr int P_TILE = 8; // 8 * 576 * 4 B = 18.4 KB smem; 8 * 18 = 144 Q8_0 blocks / 16 warps = 9 exact!
+    __shared__ float s_kv[P_TILE][576];
 
     const int h0   = blockIdx.x * H_PER_BLK;
     const int s    = blockIdx.y;
     const int t    = blockIdx.z;
     const int lane = threadIdx.x; // 0..31
-    const int warp = threadIdx.y; // 0..H_PER_BLK-1 (8 warps = 256 threads)
+    const int warp = threadIdx.y; // 0..H_PER_BLK-1 (16 warps = 512 threads)
     const int tid  = warp * 32 + lane;
     const int h    = h0 + warp;
     const bool valid_h = (h < n_heads);
@@ -1213,66 +1213,67 @@ __global__ void mla_mqa_d576_decode_shared_kernel(
     const int p0     = s * chunk;
     const int p1     = (p0 + chunk < kv_len) ? (p0 + chunk) : kv_len;
 
-    // Load 16 latent Q dims + 2 RoPE Q dims per lane!
+    // Stride-32 coalesced Q load: lane owns dims {i*32 + lane} -> ZERO shared-mem bank conflicts!
     float qv[16] = {0};
     float qp0 = 0.0f, qp1 = 0.0f;
     if (valid_h) {
         const float * qp = q576 + (static_cast<size_t>(t) * n_heads + h) * 576;
-        const auto * q4p = reinterpret_cast<const float4 *>(qp) + lane * 4;
         #pragma unroll
-        for (int g = 0; g < 4; ++g) {
-            float4 tmp = q4p[g];
-            qv[g * 4 + 0] = tmp.x * scale;
-            qv[g * 4 + 1] = tmp.y * scale;
-            qv[g * 4 + 2] = tmp.z * scale;
-            qv[g * 4 + 3] = tmp.w * scale;
-        }
-        qp0 = qp[512 + lane * 2 + 0] * scale;
-        qp1 = qp[512 + lane * 2 + 1] * scale;
+        for (int i = 0; i < 16; ++i) qv[i] = __ldg(&qp[i * 32 + lane]) * scale;
+        qp0 = __ldg(&qp[512 + lane]) * scale;
+        qp1 = __ldg(&qp[544 + lane]) * scale;
     }
 
     float m_i = -FLT_MAX;
     float l_i = 0.0f;
     float ov[16] = {0};
 
-    for (int p = p0; p < p1; ++p) {
+    for (int p = p0; p < p1; p += P_TILE) {
+        const int n_p = (p + P_TILE < p1) ? P_TILE : (p1 - p);
         if constexpr (KV_Q8_0) {
-            const BlockQ8_0 * kb = static_cast<const BlockQ8_0 *>(kv_cache) + static_cast<size_t>(p) * 18;
-            for (int b = warp; b < 18; b += H_PER_BLK) {
+            const int tot_blk = n_p * 18;
+            const BlockQ8_0 * kb_base = static_cast<const BlockQ8_0 *>(kv_cache) + static_cast<size_t>(p) * 18;
+            for (int idx = warp; idx < tot_blk; idx += H_PER_BLK) {
+                const int pi = (idx * 3641) >> 16; // exact idx / 18 for 0 <= idx < 180
+                const int b  = idx - pi * 18;
+                const BlockQ8_0 & kb = kb_base[idx];
                 __half dh;
-                *reinterpret_cast<uint16_t *>(&dh) = __ldg(&kb[b].d);
-                s_kv[b * 32 + lane] = __half2float(dh) * static_cast<float>(kb[b].qs[lane]);
+                *reinterpret_cast<uint16_t *>(&dh) = __ldg(&kb.d);
+                s_kv[pi][b * 32 + lane] = __half2float(dh) * static_cast<float>(__ldg(&kb.qs[lane]));
             }
         } else {
-            const __half * kc = static_cast<const __half *>(kv_cache) + static_cast<size_t>(p) * 576;
-            for (int i = tid; i < 576; i += H_PER_BLK * 32) {
-                s_kv[i] = __half2float(__ldg(&kc[i]));
+            const int tot_u2 = n_p * 144;
+            const uint2 * kc_base = static_cast<const uint2 *>(kv_cache) + static_cast<size_t>(p) * 144;
+            for (int idx = tid; idx < tot_u2; idx += H_PER_BLK * 32) {
+                const int pi = idx / 144;
+                const int c4 = idx - pi * 144;
+                uint2 pk = __ldg(&kc_base[idx]);
+                float2 f0 = __half22float2(*reinterpret_cast<const __half2 *>(&pk.x));
+                float2 f1 = __half22float2(*reinterpret_cast<const __half2 *>(&pk.y));
+                reinterpret_cast<float4 *>(s_kv[pi])[c4] = make_float4(f0.x, f0.y, f1.x, f1.y);
             }
         }
         __syncthreads();
 
         if (valid_h) {
-            float kv[16];
-            const auto * sk4 = reinterpret_cast<const float4 *>(s_kv) + lane * 4;
             #pragma unroll
-            for (int g = 0; g < 4; ++g) {
-                float4 tmp = sk4[g];
-                kv[g * 4 + 0] = tmp.x; kv[g * 4 + 1] = tmp.y;
-                kv[g * 4 + 2] = tmp.z; kv[g * 4 + 3] = tmp.w;
-            }
-            float dot = qp0 * s_kv[512 + lane * 2 + 0] + qp1 * s_kv[512 + lane * 2 + 1];
-            #pragma unroll
-            for (int i = 0; i < 16; ++i) dot += qv[i] * kv[i];
-            dot = warp_sum(dot);
-            const float score = __shfl_sync(0xffffffffu, dot, 0);
+            for (int pi = 0; pi < P_TILE; ++pi) {
+                if (pi >= n_p) break;
+                const float * sk = s_kv[pi];
+                float dot = qp0 * sk[512 + lane] + qp1 * sk[544 + lane];
+                #pragma unroll
+                for (int i = 0; i < 16; ++i) dot += qv[i] * sk[i * 32 + lane];
+                dot = warp_sum(dot);
+                const float score = __shfl_sync(0xffffffffu, dot, 0);
 
-            const float m_new = fmaxf(m_i, score);
-            const float alpha = expf(m_i - m_new);
-            const float beta  = expf(score - m_new);
-            l_i = l_i * alpha + beta;
-            #pragma unroll
-            for (int i = 0; i < 16; ++i) ov[i] = ov[i] * alpha + beta * kv[i];
-            m_i = m_new;
+                const float m_new = fmaxf(m_i, score);
+                const float alpha = expf(m_i - m_new);
+                const float beta  = expf(score - m_new);
+                l_i = l_i * alpha + beta;
+                #pragma unroll
+                for (int i = 0; i < 16; ++i) ov[i] = ov[i] * alpha + beta * sk[i * 32 + lane];
+                m_i = m_new;
+            }
         }
         __syncthreads();
     }
@@ -1283,12 +1284,155 @@ __global__ void mla_mqa_d576_decode_shared_kernel(
             part_m[slot] = m_i;
             part_l[slot] = l_i;
         }
-        auto * o4 = reinterpret_cast<float4 *>(part_o + slot * 512) + lane * 4;
+        float * op = part_o + slot * 512;
         #pragma unroll
-        for (int g = 0; g < 4; ++g) {
-            o4[g] = make_float4(ov[g * 4 + 0], ov[g * 4 + 1], ov[g * 4 + 2], ov[g * 4 + 3]);
-        }
+        for (int i = 0; i < 16; ++i) op[i * 32 + lane] = ov[i];
     }
+}
+
+// Zero-bank-conflict stride-32 Joint T=2 MTP Split-K RoPE-576 MLA Decode (P_TILE=8, 8 heads x 2 tokens = 16 warps!)
+template <bool KV_Q8_0, int SPLITS>
+__global__ __launch_bounds__(512) void mla_mqa_d576_decode_shared_t2_kernel(
+    const float *   __restrict__ q576,     // [2, n_heads, 576]
+    const void *    __restrict__ kv_cache, // [max_ctx, 576] (Q8_0 or F16)
+    const int32_t * __restrict__ pos,      // [2]
+    float *         __restrict__ part_m,   // [2, n_heads, SPLITS]
+    float *         __restrict__ part_l,   // [2, n_heads, SPLITS]
+    float *         __restrict__ part_o,   // [2, n_heads, SPLITS, 512]
+    int n_heads, float scale) {
+
+    constexpr int H_PER_BLK = 8;
+    constexpr int P_TILE    = 8;
+    __shared__ float s_kv[P_TILE][576];
+
+    const int h0   = blockIdx.x * H_PER_BLK;
+    const int s    = blockIdx.y;
+    const int lane = threadIdx.x;          // 0..31
+    const int warp = threadIdx.y;          // 0..15 (t = warp/8, hi = warp%8)
+    const int tid  = warp * 32 + lane;     // 0..511
+    const int t    = warp >> 3;            // 0 or 1
+    const int h    = h0 + (warp & 7);
+    const bool valid_h = (h < n_heads);
+
+    const int kv_len_0 = pos[0] + 1;
+    const int kv_len_1 = pos[1] + 1;
+    const int kv_max   = (kv_len_1 > kv_len_0) ? kv_len_1 : kv_len_0;
+    const int my_kv    = (t == 0) ? kv_len_0 : kv_len_1;
+
+    const int chunk = (kv_max + SPLITS - 1) / SPLITS;
+    const int p0    = s * chunk;
+    const int p1    = (p0 + chunk < kv_max) ? (p0 + chunk) : kv_max;
+
+    float qv[16] = {0};
+    float qp0 = 0.0f, qp1 = 0.0f;
+    if (valid_h) {
+        const float * qp = q576 + (static_cast<size_t>(t) * n_heads + h) * 576;
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) qv[i] = __ldg(&qp[i * 32 + lane]) * scale;
+        qp0 = __ldg(&qp[512 + lane]) * scale;
+        qp1 = __ldg(&qp[544 + lane]) * scale;
+    }
+
+    float m_i = -FLT_MAX;
+    float l_i = 0.0f;
+    float ov[16] = {0};
+
+    for (int p = p0; p < p1; p += P_TILE) {
+        const int n_p = (p + P_TILE < p1) ? P_TILE : (p1 - p);
+        if constexpr (KV_Q8_0) {
+            const int tot_blk = n_p * 18;
+            const BlockQ8_0 * kb_base = static_cast<const BlockQ8_0 *>(kv_cache) + static_cast<size_t>(p) * 18;
+            for (int idx = warp; idx < tot_blk; idx += 16) {
+                const int pi = (idx * 3641) >> 16; // exact idx / 18 for 0 <= idx < 180
+                const int b  = idx - pi * 18;
+                const BlockQ8_0 & kb = kb_base[idx];
+                __half dh;
+                *reinterpret_cast<uint16_t *>(&dh) = __ldg(&kb.d);
+                s_kv[pi][b * 32 + lane] = __half2float(dh) * static_cast<float>(__ldg(&kb.qs[lane]));
+            }
+        } else {
+            const int tot_u2 = n_p * 144;
+            const uint2 * kc_base = static_cast<const uint2 *>(kv_cache) + static_cast<size_t>(p) * 144;
+            for (int idx = tid; idx < tot_u2; idx += 512) {
+                const int pi = idx / 144;
+                const int c4 = idx - pi * 144;
+                uint2 pk = __ldg(&kc_base[idx]);
+                float2 f0 = __half22float2(*reinterpret_cast<const __half2 *>(&pk.x));
+                float2 f1 = __half22float2(*reinterpret_cast<const __half2 *>(&pk.y));
+                reinterpret_cast<float4 *>(s_kv[pi])[c4] = make_float4(f0.x, f0.y, f1.x, f1.y);
+            }
+        }
+        __syncthreads();
+
+        if (valid_h) {
+            #pragma unroll
+            for (int pi = 0; pi < P_TILE; ++pi) {
+                if (pi >= n_p || (p + pi) >= my_kv) break;
+                const float * sk = s_kv[pi];
+                float dot = qp0 * sk[512 + lane] + qp1 * sk[544 + lane];
+                #pragma unroll
+                for (int i = 0; i < 16; ++i) dot += qv[i] * sk[i * 32 + lane];
+                dot = warp_sum(dot);
+                const float score = __shfl_sync(0xffffffffu, dot, 0);
+
+                const float m_new = fmaxf(m_i, score);
+                const float alpha = expf(m_i - m_new);
+                const float beta  = expf(score - m_new);
+                l_i = l_i * alpha + beta;
+                #pragma unroll
+                for (int i = 0; i < 16; ++i) ov[i] = ov[i] * alpha + beta * sk[i * 32 + lane];
+                m_i = m_new;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (valid_h) {
+        const size_t slot = (static_cast<size_t>(t) * n_heads + h) * SPLITS + s;
+        if (lane == 0) {
+            part_m[slot] = m_i;
+            part_l[slot] = l_i;
+        }
+        float * op = part_o + slot * 512;
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) op[i * 32 + lane] = ov[i];
+    }
+}
+
+template <int SPLITS>
+__global__ void mla_mqa_d512_reduce_strided_kernel(
+    const float * __restrict__ part_m,
+    const float * __restrict__ part_l,
+    const float * __restrict__ part_o,
+    float *       __restrict__ out,
+    int n_heads) {
+
+    const int h    = blockIdx.x;
+    const int t    = blockIdx.y;
+    const int lane = threadIdx.x;
+    const size_t base = (static_cast<size_t>(t) * n_heads + h) * SPLITS;
+
+    float m_max = -FLT_MAX;
+    for (int s = 0; s < SPLITS; ++s) {
+        if (part_l[base + s] > 0.0f) m_max = fmaxf(m_max, part_m[base + s]);
+    }
+
+    float l_tot = 0.0f;
+    float ov[16] = {0};
+    for (int s = 0; s < SPLITS; ++s) {
+        const float ls = part_l[base + s];
+        if (ls <= 0.0f) continue;
+        const float sc = expf(part_m[base + s] - m_max);
+        l_tot += ls * sc;
+        const float * po = part_o + (base + s) * 512;
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) ov[i] += po[i * 32 + lane] * sc;
+    }
+
+    const float inv_l = (l_tot > 0.0f) ? (1.0f / l_tot) : 0.0f;
+    float * op = out + (static_cast<size_t>(t) * n_heads + h) * 512;
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) op[i * 32 + lane] = ov[i] * inv_l;
 }
 
 __global__ void mla_head_sigmoid_gate_kernel(
@@ -1456,23 +1600,36 @@ void launch_mla_attn_d576_v512(
         }
     }
 
-    // Multi-Head-Shared Split-K Decode (and small-T fallback)
-    constexpr int S = 32;
-    constexpr int H_PER_BLK = 8;
+    // Multi-Head-Shared Split-K Decode (P_TILE=8, S=64: joint T=2 for MTP verify, or H_PER_BLK=16 for T=1!)
+    constexpr int S = 64;
     const size_t n_slots = static_cast<size_t>(T) * n_heads * S;
     float * pm = static_cast<float *>(d_scratch);
     float * pl = pm + n_slots;
     float * po = pl + n_slots;
-    dim3 grid((n_heads + H_PER_BLK - 1) / H_PER_BLK, S, T);
-    dim3 block(32, H_PER_BLK);
-    if (kv_is_q8_0) {
-        mla_mqa_d576_decode_shared_kernel<true, S, H_PER_BLK><<<grid, block, 0, stream>>>(
-            d_q576, d_kv_cache, d_pos, pm, pl, po, n_heads, scale);
+    if (T == 2) {
+        constexpr int H_PER_BLK = 8;
+        dim3 grid((n_heads + H_PER_BLK - 1) / H_PER_BLK, S);
+        dim3 block(32, 16);
+        if (kv_is_q8_0) {
+            mla_mqa_d576_decode_shared_t2_kernel<true, S><<<grid, block, 0, stream>>>(
+                d_q576, d_kv_cache, d_pos, pm, pl, po, n_heads, scale);
+        } else {
+            mla_mqa_d576_decode_shared_t2_kernel<false, S><<<grid, block, 0, stream>>>(
+                d_q576, d_kv_cache, d_pos, pm, pl, po, n_heads, scale);
+        }
     } else {
-        mla_mqa_d576_decode_shared_kernel<false, S, H_PER_BLK><<<grid, block, 0, stream>>>(
-            d_q576, d_kv_cache, d_pos, pm, pl, po, n_heads, scale);
+        constexpr int H_PER_BLK = 16;
+        dim3 grid((n_heads + H_PER_BLK - 1) / H_PER_BLK, S, T);
+        dim3 block(32, H_PER_BLK);
+        if (kv_is_q8_0) {
+            mla_mqa_d576_decode_shared_kernel<true, S, H_PER_BLK><<<grid, block, 0, stream>>>(
+                d_q576, d_kv_cache, d_pos, pm, pl, po, n_heads, scale);
+        } else {
+            mla_mqa_d576_decode_shared_kernel<false, S, H_PER_BLK><<<grid, block, 0, stream>>>(
+                d_q576, d_kv_cache, d_pos, pm, pl, po, n_heads, scale);
+        }
     }
-    mla_mqa_d512_reduce_kernel<S><<<dim3(n_heads, T), 32, 0, stream>>>(pm, pl, po, d_out, n_heads);
+    mla_mqa_d512_reduce_strided_kernel<S><<<dim3(n_heads, T), 32, 0, stream>>>(pm, pl, po, d_out, n_heads);
 }
 
 void launch_mla_head_sigmoid_gate(

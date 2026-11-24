@@ -174,7 +174,9 @@ void launch_moe_route_sigmoid(
     int           k,
     bool          renorm,
     float         scale,
-    cudaStream_t  stream);
+    cudaStream_t  stream,
+    int           n_expert_groups = 0,
+    int           n_group_used = 0);
 
 // Fused MoE FFN (routed top-K + shared expert) using pre-quantized x_q8 for T==1 or general T.
 void launch_moe_ffn_q8_0_with_shared(

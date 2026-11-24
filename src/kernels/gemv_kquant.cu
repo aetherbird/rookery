@@ -2056,6 +2056,522 @@ __global__ void moe_down_grouped_kquant_kernel(
     }
 }
 
+// Decode ONE Q6_K SoA 256-elem block ONCE into 16 int32s + 4 float scales, then accumulate across BT tokens!
+template <int BT>
+__device__ __forceinline__ void dot_q6_k_soa_row_q8_1_multi(
+    const int4 *          __restrict__ W_ql,
+    const int4 *          __restrict__ W_qh,
+    const int8_t *        __restrict__ W_sc,
+    const uint16_t *      __restrict__ W_d,
+    const BlockQ8_1_Act * __restrict__ s_x,
+    int x_stride_blks, int nb, int n_tile, int lane,
+    float acc[BT]) {
+
+    const int blk_in_warp = lane >> 2; // 0..7
+    const int sub         = lane & 3;  // 0..3
+    const int h           = sub >> 1;  // 0 or 1
+    const int is          = sub & 1;   // 0 or 1
+
+    #pragma unroll
+    for (int j = 0; j < BT; ++j) acc[j] = 0.0f;
+
+    for (int bi = blk_in_warp; bi < nb; bi += 8) {
+        const int4 qh_v  = __ldg(&W_qh[bi * 4 + sub]);
+        const int4 ql0_v = __ldg(&W_ql[bi * 8 + h * 4 + is]);
+        const int4 ql1_v = __ldg(&W_ql[bi * 8 + h * 4 + 2 + is]);
+
+        const int8_t * sc = W_sc + bi * 16 + h * 8 + is;
+        const float dw  = half_bits_to_f32(__ldg(&W_d[bi]));
+        const float sc0 = dw * static_cast<float>(__ldg(&sc[0]));
+        const float sc2 = dw * static_cast<float>(__ldg(&sc[2]));
+        const float sc4 = dw * static_cast<float>(__ldg(&sc[4]));
+        const float sc6 = dw * static_cast<float>(__ldg(&sc[6]));
+
+        auto unpack4 = [](uint32_t ql0, uint32_t ql1, uint32_t qh, int & q1, int & q2, int & q3, int & q4) {
+            q1 = static_cast<int>((ql0 & 0x0F0F0F0Fu) | ((qh & 0x03030303u) << 4));
+            q2 = static_cast<int>((ql1 & 0x0F0F0F0Fu) | ((qh & 0x0C0C0C0Cu) << 2));
+            q3 = static_cast<int>(((ql0 >> 4) & 0x0F0F0F0Fu) | (qh & 0x30303030u));
+            q4 = static_cast<int>(((ql1 >> 4) & 0x0F0F0F0Fu) | ((qh >> 2) & 0x30303030u));
+        };
+        int q1x, q2x, q3x, q4x, q1y, q2y, q3y, q4y, q1z, q2z, q3z, q4z, q1w, q2w, q3w, q4w;
+        unpack4(ql0_v.x, ql1_v.x, qh_v.x, q1x, q2x, q3x, q4x);
+        unpack4(ql0_v.y, ql1_v.y, qh_v.y, q1y, q2y, q3y, q4y);
+        unpack4(ql0_v.z, ql1_v.z, qh_v.z, q1z, q2z, q3z, q4z);
+        unpack4(ql0_v.w, ql1_v.w, qh_v.w, q1w, q2w, q3w, q4w);
+
+        const int xb = bi * 8 + h * 4;
+        #pragma unroll
+        for (int j = 0; j < BT; ++j) {
+            if (j < n_tile) {
+                const BlockQ8_1_Act * xj = s_x + j * x_stride_blks + xb;
+                const int4 x1 = reinterpret_cast<const int4 *>(xj[0].qs)[is];
+                const int4 x2 = reinterpret_cast<const int4 *>(xj[1].qs)[is];
+                const int4 x3 = reinterpret_cast<const int4 *>(xj[2].qs)[is];
+                const int4 x4 = reinterpret_cast<const int4 *>(xj[3].qs)[is];
+
+                const int s1 = dp4a_s32(q1x, x1.x, dp4a_s32(q1y, x1.y, dp4a_s32(q1z, x1.z, dp4a_s32(q1w, x1.w, 0))));
+                const int s2 = dp4a_s32(q2x, x2.x, dp4a_s32(q2y, x2.y, dp4a_s32(q2z, x2.z, dp4a_s32(q2w, x2.w, 0))));
+                const int s3 = dp4a_s32(q3x, x3.x, dp4a_s32(q3y, x3.y, dp4a_s32(q3z, x3.z, dp4a_s32(q3w, x3.w, 0))));
+                const int s4 = dp4a_s32(q4x, x4.x, dp4a_s32(q4y, x4.y, dp4a_s32(q4z, x4.z, dp4a_s32(q4w, x4.w, 0))));
+
+                const int sx0 = is ? xj[0].s1 : xj[0].s0;
+                const int sx1 = is ? xj[1].s1 : xj[1].s0;
+                const int sx2 = is ? xj[2].s1 : xj[2].s0;
+                const int sx3 = is ? xj[3].s1 : xj[3].s0;
+
+                acc[j] += (sc0 * xj[0].d) * static_cast<float>(s1 - 32 * sx0)
+                        + (sc2 * xj[1].d) * static_cast<float>(s2 - 32 * sx1)
+                        + (sc4 * xj[2].d) * static_cast<float>(s3 - 32 * sx2)
+                        + (sc6 * xj[3].d) * static_cast<float>(s4 - 32 * sx3);
+            }
+        }
+    }
+}
+
+// Q8_0 SoA LDG.128 + dp4a MoE kernels (supporting optional SwiGLU clamping for Ling-3.2-Air REAP Q8_0!)
+__global__ void moe_gate_up_q8_0_soa_clamp_kernel(
+    const int4 *          __restrict__ g_q,
+    const uint16_t *      __restrict__ g_s,
+    const int4 *          __restrict__ u_q,
+    const uint16_t *      __restrict__ u_s,
+    const BlockQ8_1_Act * __restrict__ x_q8,
+    const int32_t *       __restrict__ top_ids,
+    float *               __restrict__ act,
+    int ff, int K, int k_used, float clamp_limit) {
+
+    extern __shared__ BlockQ8_1_Act s_x[];
+    const int slot     = blockIdx.y;
+    const int t        = blockIdx.z;
+    const int K_blocks = K >> 5;
+    const int tid      = threadIdx.y * 32 + threadIdx.x;
+    const int nthr     = blockDim.y * 32;
+
+    const int n_i4 = (K_blocks * static_cast<int>(sizeof(BlockQ8_1_Act))) / 16;
+    const int4 * sx_in  = reinterpret_cast<const int4 *>(x_q8 + static_cast<size_t>(t) * K_blocks);
+    int4 *       sx_out = reinterpret_cast<int4 *>(s_x);
+    for (int i = tid; i < n_i4; i += nthr) sx_out[i] = sx_in[i];
+    __syncthreads();
+
+    const int row = blockIdx.x * blockDim.y + threadIdx.y;
+    if (row >= ff) return;
+
+    const int lane = threadIdx.x;
+    const int blk_w = lane >> 1;
+    const int half  = lane & 1;
+    const int eid   = top_ids[static_cast<size_t>(t) * k_used + slot];
+    const size_t roff = (static_cast<size_t>(eid) * ff + row) * K_blocks;
+    const int4 *     gq = g_q + roff * 2;
+    const uint16_t * gs = g_s + roff;
+    const int4 *     uq = u_q + roff * 2;
+    const uint16_t * us = u_s + roff;
+
+    float ag = 0.0f, au = 0.0f;
+    for (int b = blk_w; b < K_blocks; b += 16) {
+        const int4 x4 = reinterpret_cast<const int4 *>(s_x[b].qs)[half];
+        const float xd = s_x[b].d;
+        const int4 gw = __ldg(&gq[b * 2 + half]);
+        const int  sg = dp4a_s32(gw.x, x4.x, dp4a_s32(gw.y, x4.y, dp4a_s32(gw.z, x4.z, dp4a_s32(gw.w, x4.w, 0))));
+        ag += (half_bits_to_f32(__ldg(&gs[b])) * xd) * static_cast<float>(sg);
+        const int4 uw = __ldg(&uq[b * 2 + half]);
+        const int  su = dp4a_s32(uw.x, x4.x, dp4a_s32(uw.y, x4.y, dp4a_s32(uw.z, x4.z, dp4a_s32(uw.w, x4.w, 0))));
+        au += (half_bits_to_f32(__ldg(&us[b])) * xd) * static_cast<float>(su);
+    }
+    ag = warp_sum(ag);
+    au = warp_sum(au);
+    if (lane == 0) {
+        if (clamp_limit > 0.0f) {
+            ag = fminf(fmaxf(ag, -clamp_limit), clamp_limit);
+            au = fminf(fmaxf(au, -clamp_limit), clamp_limit);
+        }
+        act[(static_cast<size_t>(t) * k_used + slot) * ff + row] = (ag / (1.0f + expf(-ag))) * au;
+    }
+}
+
+template <int BT, int R_PER_WARP>
+__global__ void moe_gate_up_grouped_q8_0_soa_kernel(
+    const int4 *          __restrict__ g_q,
+    const uint16_t *      __restrict__ g_s,
+    const int4 *          __restrict__ u_q,
+    const uint16_t *      __restrict__ u_s,
+    const BlockQ8_1_Act * __restrict__ x_q8,
+    const int32_t *       __restrict__ exp_offsets,
+    const int32_t *       __restrict__ sorted_pairs,
+    float *               __restrict__ act,
+    int ff, int K, int k_used, float clamp_limit) {
+
+    const int eid   = blockIdx.y;
+    const int start = exp_offsets[eid];
+    const int end   = exp_offsets[eid + 1];
+    if (start >= end) return;
+
+    extern __shared__ BlockQ8_1_Act s_x[];
+    __shared__ int32_t s_pairs[BT];
+
+    const int K_blocks = K >> 5;
+    const int tid      = threadIdx.y * 32 + threadIdx.x;
+    const int nthr     = blockDim.y * 32;
+    const int lane     = threadIdx.x;
+    const int blk_w    = lane >> 1;
+    const int half     = lane & 1;
+    const int row_base = blockIdx.x * (blockDim.y * R_PER_WARP) + threadIdx.y;
+    const int n_i4_tok = (K_blocks * static_cast<int>(sizeof(BlockQ8_1_Act))) / 16;
+
+    for (int base_i = start; base_i < end; base_i += BT) {
+        const int n_tile = (base_i + BT < end) ? BT : (end - base_i);
+        if (tid < n_tile) s_pairs[tid] = sorted_pairs[base_i + tid];
+        __syncthreads();
+
+        for (int j = 0; j < n_tile; ++j) {
+            const int tok = s_pairs[j] >> 4;
+            const int4 * src = reinterpret_cast<const int4 *>(x_q8 + static_cast<size_t>(tok) * K_blocks);
+            int4 *       dst = reinterpret_cast<int4 *>(s_x + j * K_blocks);
+            for (int i = tid; i < n_i4_tok; i += nthr) dst[i] = src[i];
+        }
+        __syncthreads();
+
+        for (int rr = 0; rr < R_PER_WARP; ++rr) {
+            const int row = row_base + rr * blockDim.y;
+            if (row >= ff) break;
+
+            const size_t roff = (static_cast<size_t>(eid) * ff + row) * K_blocks;
+            const int4 *     gq = g_q + roff * 2;
+            const uint16_t * gs = g_s + roff;
+            const int4 *     uq = u_q + roff * 2;
+            const uint16_t * us = u_s + roff;
+
+            float ag[BT], au[BT];
+            #pragma unroll
+            for (int j = 0; j < BT; ++j) { ag[j] = 0.0f; au[j] = 0.0f; }
+
+            for (int b = blk_w; b < K_blocks; b += 16) {
+                const int4  gw = __ldg(&gq[b * 2 + half]);
+                const float gd = half_bits_to_f32(__ldg(&gs[b]));
+                const int4  uw = __ldg(&uq[b * 2 + half]);
+                const float ud = half_bits_to_f32(__ldg(&us[b]));
+                #pragma unroll
+                for (int j = 0; j < BT; ++j) {
+                    if (j < n_tile) {
+                        const BlockQ8_1_Act & xb = s_x[j * K_blocks + b];
+                        const int4 x4 = reinterpret_cast<const int4 *>(xb.qs)[half];
+                        const int sg = dp4a_s32(gw.x, x4.x, dp4a_s32(gw.y, x4.y, dp4a_s32(gw.z, x4.z, dp4a_s32(gw.w, x4.w, 0))));
+                        const int su = dp4a_s32(uw.x, x4.x, dp4a_s32(uw.y, x4.y, dp4a_s32(uw.z, x4.z, dp4a_s32(uw.w, x4.w, 0))));
+                        ag[j] += (gd * xb.d) * static_cast<float>(sg);
+                        au[j] += (ud * xb.d) * static_cast<float>(su);
+                    }
+                }
+            }
+
+            #pragma unroll
+            for (int j = 0; j < BT; ++j) {
+                if (j < n_tile) {
+                    float g = warp_sum(ag[j]);
+                    float u = warp_sum(au[j]);
+                    if (lane == 0) {
+                        if (clamp_limit > 0.0f) {
+                            g = fminf(fmaxf(g, -clamp_limit), clamp_limit);
+                            u = fminf(fmaxf(u, -clamp_limit), clamp_limit);
+                        }
+                        const int pair = s_pairs[j];
+                        const int tok  = pair >> 4;
+                        const int slot = pair & 15;
+                        act[(static_cast<size_t>(tok) * k_used + slot) * ff + row] = (g / (1.0f + expf(-g))) * u;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
+
+__global__ void moe_down_q8_0_soa_kernel(
+    const int4 *          __restrict__ dn_q,
+    const uint16_t *      __restrict__ dn_s,
+    const int4 *          __restrict__ sh_q,
+    const uint16_t *      __restrict__ sh_s,
+    const BlockQ8_1_Act * __restrict__ act_q8,
+    const BlockQ8_1_Act * __restrict__ sh_act_q8,
+    const int32_t *       __restrict__ top_ids,
+    const float *         __restrict__ top_w,
+    float *               __restrict__ out,
+    int n_embd, int ff, int ff_sh, int k_used) {
+
+    extern __shared__ BlockQ8_1_Act s_buf[];
+    const int t        = blockIdx.y;
+    const int ff_blk   = ff >> 5;
+    const int sh_blk   = ff_sh >> 5;
+    const int exp_blks = k_used * ff_blk;
+    const int tid      = threadIdx.y * 32 + threadIdx.x;
+    const int nthr     = blockDim.y * 32;
+    const int lane     = threadIdx.x;
+    const int blk_w    = lane >> 1;
+    const int half     = lane & 1;
+    const int row      = blockIdx.x * blockDim.y + threadIdx.y;
+
+    const BlockQ8_1_Act * g_act = act_q8    + static_cast<size_t>(t) * exp_blks;
+    const BlockQ8_1_Act * g_sh  = sh_act_q8 + static_cast<size_t>(t) * sh_blk;
+    const int n_i4_e = (ff_blk * static_cast<int>(sizeof(BlockQ8_1_Act))) / 16;
+
+    float total = 0.0f;
+    for (int slot = 0; slot < k_used; ++slot) {
+        const int4 * in_e = reinterpret_cast<const int4 *>(g_act + slot * ff_blk);
+        int4 *       ou_e = reinterpret_cast<int4 *>(s_buf);
+        for (int i = tid; i < n_i4_e; i += nthr) ou_e[i] = in_e[i];
+        __syncthreads();
+
+        if (row < n_embd) {
+            const int   eid = top_ids[static_cast<size_t>(t) * k_used + slot];
+            const float ew  = top_w  [static_cast<size_t>(t) * k_used + slot];
+            const size_t roff = (static_cast<size_t>(eid) * n_embd + row) * ff_blk;
+            const int4 *     dq = dn_q + roff * 2;
+            const uint16_t * ds = dn_s + roff;
+            float acc = 0.0f;
+            for (int b = blk_w; b < ff_blk; b += 16) {
+                const int4 w4 = __ldg(&dq[b * 2 + half]);
+                const int4 a4 = reinterpret_cast<const int4 *>(s_buf[b].qs)[half];
+                const int  si = dp4a_s32(w4.x, a4.x, dp4a_s32(w4.y, a4.y, dp4a_s32(w4.z, a4.z, dp4a_s32(w4.w, a4.w, 0))));
+                acc += (half_bits_to_f32(__ldg(&ds[b])) * s_buf[b].d) * static_cast<float>(si);
+            }
+            total += ew * warp_sum(acc);
+        }
+        __syncthreads();
+    }
+
+    if (sh_q != nullptr) {
+        const int n_i4_s = (sh_blk * static_cast<int>(sizeof(BlockQ8_1_Act))) / 16;
+        const int4 * in_s = reinterpret_cast<const int4 *>(g_sh);
+        int4 *       ou_s = reinterpret_cast<int4 *>(s_buf);
+        for (int i = tid; i < n_i4_s; i += nthr) ou_s[i] = in_s[i];
+        __syncthreads();
+
+        if (row < n_embd) {
+            const size_t roff = static_cast<size_t>(row) * sh_blk;
+            const int4 *     sq = sh_q + roff * 2;
+            const uint16_t * ss = sh_s + roff;
+            float acc = 0.0f;
+            for (int b = blk_w; b < sh_blk; b += 16) {
+                const int4 w4 = __ldg(&sq[b * 2 + half]);
+                const int4 a4 = reinterpret_cast<const int4 *>(s_buf[b].qs)[half];
+                const int  si = dp4a_s32(w4.x, a4.x, dp4a_s32(w4.y, a4.y, dp4a_s32(w4.z, a4.z, dp4a_s32(w4.w, a4.w, 0))));
+                acc += (half_bits_to_f32(__ldg(&ss[b])) * s_buf[b].d) * static_cast<float>(si);
+            }
+            total += warp_sum(acc);
+        }
+    }
+
+    if (row < n_embd && lane == 0) out[static_cast<size_t>(t) * n_embd + row] = total;
+}
+
+template <int BT, int R_PER_WARP, bool USE_SLOTS>
+__global__ void moe_down_grouped_q8_0_soa_kernel(
+    const int4 *          __restrict__ dn_q,
+    const uint16_t *      __restrict__ dn_s,
+    const BlockQ8_1_Act * __restrict__ act_q8,
+    const float *         __restrict__ top_w,
+    const int32_t *       __restrict__ exp_offsets,
+    const int32_t *       __restrict__ sorted_pairs,
+    float *               __restrict__ out,
+    int n_embd, int ff, int k_used) {
+
+    const int eid   = blockIdx.y;
+    const int start = exp_offsets[eid];
+    const int end   = exp_offsets[eid + 1];
+    if (start >= end) return;
+
+    extern __shared__ BlockQ8_1_Act s_a[];
+    __shared__ int32_t s_pairs[BT];
+
+    const int ff_blk   = ff >> 5;
+    const int tid      = threadIdx.y * 32 + threadIdx.x;
+    const int nthr     = blockDim.y * 32;
+    const int lane     = threadIdx.x;
+    const int blk_w    = lane >> 1;
+    const int half     = lane & 1;
+    const int row_base = blockIdx.x * (blockDim.y * R_PER_WARP) + threadIdx.y;
+    const int n_i4_tok = (ff_blk * static_cast<int>(sizeof(BlockQ8_1_Act))) / 16;
+
+    for (int base_i = start; base_i < end; base_i += BT) {
+        const int n_tile = (base_i + BT < end) ? BT : (end - base_i);
+        if (tid < n_tile) s_pairs[tid] = sorted_pairs[base_i + tid];
+        __syncthreads();
+
+        for (int j = 0; j < n_tile; ++j) {
+            const int pair = s_pairs[j];
+            const int tok  = pair >> 4;
+            const int slot = pair & 15;
+            const int4 * src = reinterpret_cast<const int4 *>(act_q8 + (static_cast<size_t>(tok) * k_used + slot) * ff_blk);
+            int4 *       dst = reinterpret_cast<int4 *>(s_a + j * ff_blk);
+            for (int i = tid; i < n_i4_tok; i += nthr) dst[i] = src[i];
+        }
+        __syncthreads();
+
+        for (int rr = 0; rr < R_PER_WARP; ++rr) {
+            const int row = row_base + rr * blockDim.y;
+            if (row >= n_embd) break;
+
+            const size_t roff = (static_cast<size_t>(eid) * n_embd + row) * ff_blk;
+            const int4 *     dq = dn_q + roff * 2;
+            const uint16_t * ds = dn_s + roff;
+
+            float acc[BT];
+            #pragma unroll
+            for (int j = 0; j < BT; ++j) acc[j] = 0.0f;
+
+            for (int b = blk_w; b < ff_blk; b += 16) {
+                const int4  dw = __ldg(&dq[b * 2 + half]);
+                const float dd = half_bits_to_f32(__ldg(&ds[b]));
+                #pragma unroll
+                for (int j = 0; j < BT; ++j) {
+                    if (j < n_tile) {
+                        const BlockQ8_1_Act & xb = s_a[j * ff_blk + b];
+                        const int4 a4 = reinterpret_cast<const int4 *>(xb.qs)[half];
+                        const int si = dp4a_s32(dw.x, a4.x, dp4a_s32(dw.y, a4.y, dp4a_s32(dw.z, a4.z, dp4a_s32(dw.w, a4.w, 0))));
+                        acc[j] += (dd * xb.d) * static_cast<float>(si);
+                    }
+                }
+            }
+
+            #pragma unroll
+            for (int j = 0; j < BT; ++j) {
+                if (j < n_tile) {
+                    const float v = warp_sum(acc[j]);
+                    if (lane == 0) {
+                        const int pair = s_pairs[j];
+                        const int tok  = pair >> 4;
+                        const int slot = pair & 15;
+                        const float ew = top_w[static_cast<size_t>(tok) * k_used + slot];
+                        if constexpr (USE_SLOTS) {
+                            out[(static_cast<size_t>(tok) * k_used + slot) * n_embd + row] = ew * v;
+                        } else {
+                            atomicAdd(&out[static_cast<size_t>(tok) * n_embd + row], ew * v);
+                        }
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
+
+__global__ void moe_gate_up_q6_k_soa_kernel(
+    const int4 *          __restrict__ g_ql,
+    const int4 *          __restrict__ g_qh,
+    const int8_t *        __restrict__ g_sc,
+    const uint16_t *      __restrict__ g_d,
+    const int4 *          __restrict__ u_ql,
+    const int4 *          __restrict__ u_qh,
+    const int8_t *        __restrict__ u_sc,
+    const uint16_t *      __restrict__ u_d,
+    const BlockQ8_1_Act * __restrict__ x_q8,
+    const int32_t *       __restrict__ top_ids,
+    float *               __restrict__ act,
+    int ff, int K, int k_used, float clamp_limit) {
+
+    extern __shared__ BlockQ8_1_Act s_x[];
+    const int slot     = blockIdx.y;
+    const int t        = blockIdx.z;
+    const int K_blocks = K >> 5;
+    const int nb       = K >> 8;
+    const int tid      = threadIdx.y * 32 + threadIdx.x;
+    const int nthr     = blockDim.y * 32;
+
+    const int n_i4 = (K_blocks * static_cast<int>(sizeof(BlockQ8_1_Act))) / 16;
+    const int4 * sx_in  = reinterpret_cast<const int4 *>(x_q8 + static_cast<size_t>(t) * K_blocks);
+    int4 *       sx_out = reinterpret_cast<int4 *>(s_x);
+    for (int i = tid; i < n_i4; i += nthr) sx_out[i] = sx_in[i];
+    __syncthreads();
+
+    const int row = blockIdx.x * blockDim.y + threadIdx.y;
+    if (row >= ff) return;
+
+    const int lane = threadIdx.x;
+    const int eid  = top_ids[static_cast<size_t>(t) * k_used + slot];
+    const size_t rblk = (static_cast<size_t>(eid) * ff + row) * nb;
+    float g = dot_q6_k_soa_row_q8_1(g_ql + rblk * 8, g_qh + rblk * 4, g_sc + rblk * 16, g_d + rblk, s_x, nb, lane);
+    float u = dot_q6_k_soa_row_q8_1(u_ql + rblk * 8, u_qh + rblk * 4, u_sc + rblk * 16, u_d + rblk, s_x, nb, lane);
+    if (lane == 0) {
+        if (clamp_limit > 0.0f) {
+            g = fminf(fmaxf(g, -clamp_limit), clamp_limit);
+            u = fminf(fmaxf(u, -clamp_limit), clamp_limit);
+        }
+        act[(static_cast<size_t>(t) * k_used + slot) * ff + row] = (g / (1.0f + expf(-g))) * u;
+    }
+}
+
+template <int BT, int R_PER_WARP>
+__global__ void moe_gate_up_grouped_q6_k_soa_kernel(
+    const int4 *          __restrict__ g_ql,
+    const int4 *          __restrict__ g_qh,
+    const int8_t *        __restrict__ g_sc,
+    const uint16_t *      __restrict__ g_d,
+    const int4 *          __restrict__ u_ql,
+    const int4 *          __restrict__ u_qh,
+    const int8_t *        __restrict__ u_sc,
+    const uint16_t *      __restrict__ u_d,
+    const BlockQ8_1_Act * __restrict__ x_q8,
+    const int32_t *       __restrict__ exp_offsets,
+    const int32_t *       __restrict__ sorted_pairs,
+    float *               __restrict__ act,
+    int ff, int K, int k_used, float clamp_limit) {
+
+    const int eid   = blockIdx.y;
+    const int start = exp_offsets[eid];
+    const int end   = exp_offsets[eid + 1];
+    if (start >= end) return;
+
+    extern __shared__ BlockQ8_1_Act s_x[];
+    __shared__ int32_t s_pairs[BT];
+
+    const int K_blocks = K >> 5;
+    const int nb       = K >> 8;
+    const int tid      = threadIdx.y * 32 + threadIdx.x;
+    const int nthr     = blockDim.y * 32;
+    const int lane     = threadIdx.x;
+    const int row_base = blockIdx.x * (blockDim.y * R_PER_WARP) + threadIdx.y;
+    const int n_i4_tok = (K_blocks * static_cast<int>(sizeof(BlockQ8_1_Act))) / 16;
+
+    for (int base_i = start; base_i < end; base_i += BT) {
+        const int n_tile = (base_i + BT < end) ? BT : (end - base_i);
+        if (tid < n_tile) s_pairs[tid] = sorted_pairs[base_i + tid];
+        __syncthreads();
+
+        for (int j = 0; j < n_tile; ++j) {
+            const int tok = s_pairs[j] >> 4;
+            const int4 * src = reinterpret_cast<const int4 *>(x_q8 + static_cast<size_t>(tok) * K_blocks);
+            int4 *       dst = reinterpret_cast<int4 *>(s_x + j * K_blocks);
+            for (int i = tid; i < n_i4_tok; i += nthr) dst[i] = src[i];
+        }
+        __syncthreads();
+
+        for (int rr = 0; rr < R_PER_WARP; ++rr) {
+            const int row = row_base + rr * blockDim.y;
+            if (row >= ff) break;
+
+            const size_t rblk = (static_cast<size_t>(eid) * ff + row) * nb;
+            float ag[BT], au[BT];
+            dot_q6_k_soa_row_q8_1_multi<BT>(g_ql + rblk * 8, g_qh + rblk * 4, g_sc + rblk * 16, g_d + rblk, s_x, K_blocks, nb, n_tile, lane, ag);
+            dot_q6_k_soa_row_q8_1_multi<BT>(u_ql + rblk * 8, u_qh + rblk * 4, u_sc + rblk * 16, u_d + rblk, s_x, K_blocks, nb, n_tile, lane, au);
+            #pragma unroll
+            for (int j = 0; j < BT; ++j) {
+                if (j < n_tile) {
+                    float g = warp_sum(ag[j]);
+                    float u = warp_sum(au[j]);
+                    if (lane == 0) {
+                        if (clamp_limit > 0.0f) {
+                            g = fminf(fmaxf(g, -clamp_limit), clamp_limit);
+                            u = fminf(fmaxf(u, -clamp_limit), clamp_limit);
+                        }
+                        const int pair = s_pairs[j];
+                        const int tok  = pair >> 4;
+                        const int slot = pair & 15;
+                        act[(static_cast<size_t>(tok) * k_used + slot) * ff + row] = (g / (1.0f + expf(-g))) * u;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
+
 // Deterministic reduction of down_slots[T, k_used, n_embd] into out[T, n_embd] (adds to down_shexp!)
 template <int BT, int R_PER_WARP, bool USE_SLOTS>
 __global__ void moe_down_grouped_q6_k_soa_kernel(
@@ -2106,19 +2622,22 @@ __global__ void moe_down_grouped_q6_k_soa_kernel(
             if (row >= n_embd) break;
 
             const size_t rblk = (static_cast<size_t>(eid) * n_embd + row) * nb;
-            for (int j = 0; j < n_tile; ++j) {
-                const float v = dot_q6_k_soa_row_q8_1(
-                    dn_ql + rblk * 8, dn_qh + rblk * 4, dn_sc + rblk * 16, dn_d + rblk,
-                    s_a + j * ff_blk, nb, lane);
-                if (lane == 0) {
-                    const int pair = s_pairs[j];
-                    const int tok  = pair >> 4;
-                    const int slot = pair & 15;
-                    const float ew = top_w[static_cast<size_t>(tok) * k_used + slot];
-                    if constexpr (USE_SLOTS) {
-                        out[(static_cast<size_t>(tok) * k_used + slot) * n_embd + row] = ew * v;
-                    } else {
-                        atomicAdd(&out[static_cast<size_t>(tok) * n_embd + row], ew * v);
+            float acc[BT];
+            dot_q6_k_soa_row_q8_1_multi<BT>(dn_ql + rblk * 8, dn_qh + rblk * 4, dn_sc + rblk * 16, dn_d + rblk, s_a, ff_blk, nb, n_tile, lane, acc);
+            #pragma unroll
+            for (int j = 0; j < BT; ++j) {
+                if (j < n_tile) {
+                    const float v = warp_sum(acc[j]);
+                    if (lane == 0) {
+                        const int pair = s_pairs[j];
+                        const int tok  = pair >> 4;
+                        const int slot = pair & 15;
+                        const float ew = top_w[static_cast<size_t>(tok) * k_used + slot];
+                        if constexpr (USE_SLOTS) {
+                            out[(static_cast<size_t>(tok) * k_used + slot) * n_embd + row] = ew * v;
+                        } else {
+                            atomicAdd(&out[static_cast<size_t>(tok) * n_embd + row], ew * v);
+                        }
                     }
                 }
             }
@@ -2502,7 +3021,21 @@ void launch_moe_ffn_kquant_with_shared(
             moe_gate_up_grouped_kquant_kernel<DTG, DTG, BT_GU, R_PER_WARP><<<gu_grp_grid, dim3(32, wpb_grp), gu_grp_smem, stream>>>(
                 gp, up, xq8, exp_offsets, sorted_pairs, act, ff, K, k_used, clamp_exp);
         };
-        if (gate_exps.dtype == DType::IQ2_S && up_exps.dtype == DType::IQ2_S)          run_gu_grp(std::integral_constant<DType, DType::IQ2_S>{});
+        if (gate_exps.dtype == DType::Q8_0 && gate_exps.is_soa && up_exps.dtype == DType::Q8_0 && up_exps.is_soa) {
+            moe_gate_up_grouped_q8_0_soa_kernel<BT_GU, R_PER_WARP><<<gu_grp_grid, dim3(32, wpb_grp), gu_grp_smem, stream>>>(
+                static_cast<const int4 *>(gate_exps.ptr), static_cast<const uint16_t *>(gate_exps.scales_ptr),
+                static_cast<const int4 *>(up_exps.ptr),   static_cast<const uint16_t *>(up_exps.scales_ptr),
+                xq8, exp_offsets, sorted_pairs, act, ff, K, k_used, clamp_exp);
+        }
+        else if (gate_exps.dtype == DType::Q6_K && gate_exps.is_soa && up_exps.dtype == DType::Q6_K && up_exps.is_soa) {
+            moe_gate_up_grouped_q6_k_soa_kernel<BT_GU, R_PER_WARP><<<gu_grp_grid, dim3(32, wpb_grp), gu_grp_smem, stream>>>(
+                static_cast<const int4 *>(gate_exps.ptr), static_cast<const int4 *>(gate_exps.aux_ptr),
+                static_cast<const int8_t *>(gate_exps.scales_ptr), static_cast<const uint16_t *>(gate_exps.d_ptr),
+                static_cast<const int4 *>(up_exps.ptr), static_cast<const int4 *>(up_exps.aux_ptr),
+                static_cast<const int8_t *>(up_exps.scales_ptr), static_cast<const uint16_t *>(up_exps.d_ptr),
+                xq8, exp_offsets, sorted_pairs, act, ff, K, k_used, clamp_exp);
+        }
+        else if (gate_exps.dtype == DType::IQ2_S && up_exps.dtype == DType::IQ2_S)     run_gu_grp(std::integral_constant<DType, DType::IQ2_S>{});
         else if (gate_exps.dtype == DType::IQ2_XXS && up_exps.dtype == DType::IQ2_XXS) run_gu_grp(std::integral_constant<DType, DType::IQ2_XXS>{});
         else if (gate_exps.dtype == DType::IQ4_XS && up_exps.dtype == DType::IQ4_XS)   run_gu_grp(std::integral_constant<DType, DType::IQ4_XS>{});
         else if (gate_exps.dtype == DType::Q2_K && up_exps.dtype == DType::Q2_K)       run_gu_grp(std::integral_constant<DType, DType::Q2_K>{});
@@ -2536,7 +3069,18 @@ void launch_moe_ffn_kquant_with_shared(
                     dp, aq8, d_top_w, exp_offsets, sorted_pairs, dn_target, K, ff, k_used);
             }
         };
-        if (down_exps.dtype == DType::Q6_K && down_exps.is_soa) {
+        if (down_exps.dtype == DType::Q8_0 && down_exps.is_soa) {
+            if (use_slots) {
+                moe_down_grouped_q8_0_soa_kernel<BT_DN, R_PER_WARP, true><<<dn_grp_grid, dim3(32, wpb_grp), dn_grp_smem, stream>>>(
+                    static_cast<const int4 *>(down_exps.ptr), static_cast<const uint16_t *>(down_exps.scales_ptr),
+                    aq8, d_top_w, exp_offsets, sorted_pairs, dn_target, K, ff, k_used);
+            } else {
+                moe_down_grouped_q8_0_soa_kernel<BT_DN, R_PER_WARP, false><<<dn_grp_grid, dim3(32, wpb_grp), dn_grp_smem, stream>>>(
+                    static_cast<const int4 *>(down_exps.ptr), static_cast<const uint16_t *>(down_exps.scales_ptr),
+                    aq8, d_top_w, exp_offsets, sorted_pairs, dn_target, K, ff, k_used);
+            }
+        }
+        else if (down_exps.dtype == DType::Q6_K && down_exps.is_soa) {
             if (use_slots) {
                 moe_down_grouped_q6_k_soa_kernel<BT_DN, R_PER_WARP, true><<<dn_grp_grid, dim3(32, wpb_grp), dn_grp_smem, stream>>>(
                     static_cast<const int4 *>(down_exps.ptr), static_cast<const int4 *>(down_exps.aux_ptr),
@@ -2568,7 +3112,19 @@ void launch_moe_ffn_kquant_with_shared(
     // 2. Decode / low-batch (T < 16): Routed experts gate + up + SwiGLU (shared-memory BlockQ8_1 + LUT + dp4a!)
     dim3 gu_grid((ff + wpb - 1) / wpb, k_used, T);
 
-    if (gate_exps.dtype == DType::IQ2_S && up_exps.dtype == DType::IQ2_S) {
+    if (gate_exps.dtype == DType::Q8_0 && gate_exps.is_soa && up_exps.dtype == DType::Q8_0 && up_exps.is_soa) {
+        moe_gate_up_q8_0_soa_clamp_kernel<<<gu_grid, dim3(32, wpb), gu_smem, stream>>>(
+            static_cast<const int4 *>(gate_exps.ptr), static_cast<const uint16_t *>(gate_exps.scales_ptr),
+            static_cast<const int4 *>(up_exps.ptr),   static_cast<const uint16_t *>(up_exps.scales_ptr),
+            xq8, d_top_ids, act, ff, K, k_used, clamp_exp);
+    } else if (gate_exps.dtype == DType::Q6_K && gate_exps.is_soa && up_exps.dtype == DType::Q6_K && up_exps.is_soa) {
+        moe_gate_up_q6_k_soa_kernel<<<gu_grid, dim3(32, wpb), gu_smem, stream>>>(
+            static_cast<const int4 *>(gate_exps.ptr), static_cast<const int4 *>(gate_exps.aux_ptr),
+            static_cast<const int8_t *>(gate_exps.scales_ptr), static_cast<const uint16_t *>(gate_exps.d_ptr),
+            static_cast<const int4 *>(up_exps.ptr), static_cast<const int4 *>(up_exps.aux_ptr),
+            static_cast<const int8_t *>(up_exps.scales_ptr), static_cast<const uint16_t *>(up_exps.d_ptr),
+            xq8, d_top_ids, act, ff, K, k_used, clamp_exp);
+    } else if (gate_exps.dtype == DType::IQ2_S && up_exps.dtype == DType::IQ2_S) {
         moe_gate_up_kquant_q8_1_kernel<DType::IQ2_S, DType::IQ2_S><<<gu_grid, dim3(32, wpb), gu_smem, stream>>>(gp, up, xq8, d_top_ids, act, ff, K, k_used, clamp_exp);
     } else if (gate_exps.dtype == DType::IQ2_XXS && up_exps.dtype == DType::IQ2_XXS) {
         moe_gate_up_kquant_q8_1_kernel<DType::IQ2_XXS, DType::IQ2_XXS><<<gu_grid, dim3(32, wpb), gu_smem, stream>>>(gp, up, xq8, d_top_ids, act, ff, K, k_used, clamp_exp);
@@ -2598,11 +3154,13 @@ void launch_moe_ffn_kquant_with_shared(
 
     dim3 dn_grid((K + wpb - 1) / wpb, T);
     const size_t dn_smem = static_cast<size_t>(std::max(ff >> 5, ff_sh >> 5)) * sizeof(BlockQ8_1_Act);
-    const bool has_sh = (down_shexp.dtype == DType::Q6_K && down_shexp.is_soa);
-    const auto * sh_ql = has_sh ? static_cast<const int4 *>(down_shexp.ptr)           : nullptr;
-    const auto * sh_qh = has_sh ? static_cast<const int4 *>(down_shexp.aux_ptr)       : nullptr;
-    const auto * sh_sc = has_sh ? static_cast<const int8_t *>(down_shexp.scales_ptr)  : nullptr;
-    const auto * sh_d  = has_sh ? static_cast<const uint16_t *>(down_shexp.d_ptr)     : nullptr;
+    const bool has_sh_q6 = (down_shexp.dtype == DType::Q6_K && down_shexp.is_soa);
+    const bool has_sh_q8 = (down_exps.dtype == DType::Q8_0 && down_exps.is_soa && down_shexp.dtype == DType::Q8_0 && down_shexp.is_soa);
+    const bool has_sh = has_sh_q8 || (down_exps.dtype != DType::Q8_0 && has_sh_q6);
+    const auto * sh_ql = has_sh_q6 ? static_cast<const int4 *>(down_shexp.ptr)           : nullptr;
+    const auto * sh_qh = has_sh_q6 ? static_cast<const int4 *>(down_shexp.aux_ptr)       : nullptr;
+    const auto * sh_sc = has_sh_q6 ? static_cast<const int8_t *>(down_shexp.scales_ptr)  : nullptr;
+    const auto * sh_d  = has_sh_q6 ? static_cast<const uint16_t *>(down_shexp.d_ptr)     : nullptr;
 
     auto run_dn = [&](auto dt_tag) {
         constexpr DType DTD = decltype(dt_tag)::value;
@@ -2610,7 +3168,14 @@ void launch_moe_ffn_kquant_with_shared(
             dp, sh_ql, sh_qh, sh_sc, sh_d, aq8, sq8, d_top_ids, d_top_w, d_out, K, ff, ff_sh, k_used);
     };
 
-    if (down_exps.dtype == DType::Q6_K && down_exps.is_soa) {
+    if (down_exps.dtype == DType::Q8_0 && down_exps.is_soa) {
+        moe_down_q8_0_soa_kernel<<<dn_grid, dim3(32, wpb), dn_smem, stream>>>(
+            static_cast<const int4 *>(down_exps.ptr), static_cast<const uint16_t *>(down_exps.scales_ptr),
+            has_sh_q8 ? static_cast<const int4 *>(down_shexp.ptr) : nullptr,
+            has_sh_q8 ? static_cast<const uint16_t *>(down_shexp.scales_ptr) : nullptr,
+            aq8, sq8, d_top_ids, d_top_w, d_out, K, ff, ff_sh, k_used);
+    }
+    else if (down_exps.dtype == DType::Q6_K && down_exps.is_soa) {
         moe_down_q6_k_soa_kernel<<<dn_grid, dim3(32, wpb), dn_smem, stream>>>(
             static_cast<const int4 *>(down_exps.ptr), static_cast<const int4 *>(down_exps.aux_ptr),
             static_cast<const int8_t *>(down_exps.scales_ptr), static_cast<const uint16_t *>(down_exps.d_ptr),
