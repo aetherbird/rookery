@@ -112,7 +112,14 @@ python3 scripts/engram_pipeline.py build \
 
 # (For Level-3 temp-calibrated contrastive gated training, pass --mode level3 --max-tokens 200000 --base-scale 0.05)
 
-# 3. Serve with strict RKAD v3 contract validation & zero-recapture per-request runtime controls
+# 3. Optional N + M canonical Z composition (`engram-z-v1`, zero extra runtime overhead):
+#    Fit provider exporters (.rkex) and host importers (.rkim) independently, then fold any pair into RKAD v3
+python3 scripts/engram_z_bridge.py compose \
+  --exporter /path/to/exporter_provider.rkex \
+  --importer /path/to/importer_host.rkim \
+  --out /path/to/composed_zeroshot_v3.rkad
+
+# 4. Serve with strict RKAD v3 contract validation & zero-recapture per-request runtime controls
 ./build/rookery-server -m /path/to/host-model.gguf --gpus 0,1 -ts 20,28 \
   --engram /path/to/engram-table.gguf \
   --engram-adapter /path/to/adapter_v3.rkad \
