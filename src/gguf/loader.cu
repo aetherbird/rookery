@@ -299,7 +299,7 @@ namespace {
 
 inline float f16_bits_to_f32(uint16_t h) {
     __half hh;
-    std::memcpy(&hh, &h, 2);
+    std::memcpy(static_cast<void *>(&hh), &h, 2);
     return __half2float(hh);
 }
 
