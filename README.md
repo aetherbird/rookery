@@ -1,6 +1,6 @@
 # rookery
 
-A pure C++20 + CUDA LLM inference and serving engine built for modern MoE and hybrid linear/sparse-attention architectures on heterogeneous multi-GPU setups (Volta `sm_70` + Ampere `sm_86`).
+A pure C++20 + CUDA LLM inference and serving engine built for modern MoE and hybrid linear/sparse-attention architectures on heterogeneous multi-GPU setups (Maxwell `sm_50`/`sm_52`, Pascal `sm_60`/`sm_61`, Volta `sm_70`, and Ampere `sm_86`).
 
 `rookery` loads standard GGUF models directly (including sharded multi-file GGUFs) and exposes a drop-in OpenAI-compatible HTTP/SSE server (`rookery-server`) compatible with `llama-swap` and standard OpenAI clients.
 
@@ -34,6 +34,9 @@ Measured against `llama.cpp` (`-fa 1 -ctk q8_0 -ctv q8_0`) on heterogeneous mult
 | **Qwen3.6-35B-A3B-MTP** (`Q8_0`) | 3090 + V100 | Decode (no MTP / + MTP) | `113.2 tok/s` | `134.0` / **`195.6 tok/s`** | **+18% / +73%** |
 | **Qwen3.6-35B-A3B-MTP** (`Q8_0`) | 3090 + V100 | Prefill `pp2048` | — | **`1,887.4 tok/s`** | `0.000000` ckpt parity |
 | **Qwen3.8-Flash-Next** (`UD-Q6_K_XL`) | 3090 + 2×3060 + 3×V100 | Decode (`ctx=5` / `ctx=4096`) | `41.6 tok/s` | **`50.5` / `50.1 tok/s`** | **+21%** |
+| **Qwen3.6-35B-A3B** (`UD-Q3_K_XL`) | P100 + GTX 1060 (`sm_60/61`) | Decode `tg128` | `38.0 tok/s` | **`53.4 tok/s`** | **+41%** |
+| **Maxwell-V1-Flash** (`Q3_K_M`) | P100 + GTX 1060 (`sm_60/61`) | Decode `tg64` | Unsupported | **`26.3 tok/s`** | — |
+| **Inkling-2-Mini** (`IQ4_NL`) | P100 + GTX 1060 (`sm_60/61`) | Decode `tg64` (asym 2-GPU) | Unsupported | **`27.7 tok/s`** | — |
 
 See [bench/baseline.md](bench/baseline.md), [bench/engram_audit_v1.md](bench/engram_audit_v1.md), and [bench/engram_vertical_slice_v2.md](bench/engram_vertical_slice_v2.md) for detailed logs and Engram vertical-slice audits.
 
@@ -43,7 +46,7 @@ Requirements:
 - CMake >= 3.24
 - C++20 compiler (GCC 12+ / Clang 16+)
 - CUDA Toolkit 12.x (`nvcc`, `cuBLAS`, `cuSOLVER`)
-- NVIDIA GPUs with compute capability `>= 7.0` (`sm_70`, `sm_86`, etc.)
+- NVIDIA GPUs with compute capability `>= 5.0` (default build targets `sm_70;sm_86`; override with `-DCMAKE_CUDA_ARCHITECTURES="50;52;60;61"` for Maxwell/Pascal)
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release
@@ -85,6 +88,41 @@ Common flags:
 - `--engram <table.gguf>`, `--engram-adapter <adapter.rkad>`, `--engram-scale <f>` — Cross-model Engram sidecar options
 
 `rookery-server` also accepts common `llama-server` compatibility flags (`-ngl`, `-fa`, `--jinja`, `--reasoning-format`, etc.) for drop-in `llama-swap` configuration.
+
+### Cross-Model Engram Sidecar (End-to-End)
+
+`rookery` supports zero-VRAM host-RAM `mmap` Engram/PLE grafting across decoupled providers (`deepseek41`, `qwen4exp`, `hy_v4_flash`, `unigram_ple`) and all 5 host model architectures (`maxwell-moe`, `qwen35moe`, `glm5_next`, `qwen4exp`, `inkling2_loop`) using strict self-describing `RKAD v3` manifests (`provider_fingerprint`, host architecture/layer/stream contract checks), an incremental boundary-anchored BPE commit cache (`100.00%` causal parity, `~7.9 µs/tok`), and sub-1% warm-RAM decode overhead (`+0.90%` decode / `+0.49%` prefill on `DeepSeek-V4.1-Flash` 103 GiB → `Maxwell-V1-Flash`).
+
+```bash
+# 1. Inspect a provider table, host GGUF, or .rkad adapter
+python3 scripts/engram_pipeline.py inspect \
+  --engram /path/to/DeepSeek-V4.1-Flash-00005-of-00005.gguf \
+  --model /path/to/host-model.gguf
+
+# 2. End-to-end automated pipeline:
+#    inspect -> 100% addressing gate -> dump -> RKAD v3 calibrate/train -> 4-way quality gate -> register .json card
+python3 scripts/engram_pipeline.py build \
+  --model /path/to/host-model.gguf \
+  --engram /path/to/engram-table.gguf \
+  --mode level2 \
+  --corpus /path/to/train_corpus.txt \
+  --eval-tech /path/to/eval_tech.txt \
+  --eval-prose /path/to/eval_prose.txt \
+  --out /path/to/adapter_v3.rkad
+
+# (For Level-3 temp-calibrated contrastive gated training, pass --mode level3 --max-tokens 200000 --base-scale 0.05)
+
+# 3. Serve with strict RKAD v3 contract validation & zero-recapture per-request runtime controls
+./build/rookery-server -m /path/to/host-model.gguf --gpus 0,1 -ts 20,28 \
+  --engram /path/to/engram-table.gguf \
+  --engram-adapter /path/to/adapter_v3.rkad \
+  --engram-scale 1.0
+```
+
+Per-request JSON fields in `/v1/completions` and `/v1/chat/completions` override Engram behavior dynamically without recapturing CUDA Graphs:
+- `"engram_scale"` (float, `0.0` = exact bit-identical disable)
+- `"engram_gate_bias"` (float, additive logit bias inside sigmoid gate)
+- `"engram_delta_clip"` (float, caps `||delta||_rms / ||h||_rms`)
 
 ### Testing
 

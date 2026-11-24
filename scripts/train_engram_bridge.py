@@ -90,22 +90,101 @@ def load_maxwell_head(safetensors_dir: str, device: torch.device):
     return hc_fn, hc_scale, hc_base, out_norm, lm_head
 
 
+def load_gguf_tail_head(gguf_path: str, device: torch.device):
+    """Load frozen output_norm.weight + output.weight directly from a GGUF file (for hc=1 models like qwen35moe)."""
+    def read_str(f):
+        (n,) = struct.unpack("<Q", f.read(8))
+        return f.read(n).decode("utf-8", "replace")
+
+    def skip_val(f, t):
+        if t in (0, 1, 7):
+            f.read(1)
+        elif t in (2, 3):
+            f.read(2)
+        elif t in (4, 5, 6):
+            f.read(4)
+        elif t in (10, 11, 12):
+            f.read(8)
+        elif t == 8:
+            read_str(f)
+        elif t == 9:
+            et, cnt = struct.unpack("<IQ", f.read(12))
+            for _ in range(cnt):
+                skip_val(f, et)
+
+    with open(gguf_path, "rb") as f:
+        magic = f.read(4)
+        if magic != b"GGUF":
+            raise ValueError(f"Not a GGUF file: {gguf_path}")
+        (ver,) = struct.unpack("<I", f.read(4))
+        nt, nkv = struct.unpack("<QQ", f.read(16))
+        align = 32
+        for _ in range(nkv):
+            k = read_str(f)
+            (t,) = struct.unpack("<I", f.read(4))
+            if k == "general.alignment" and t == 4:
+                (align,) = struct.unpack("<I", f.read(4))
+            else:
+                skip_val(f, t)
+        tensors = {}
+        for _ in range(nt):
+            name = read_str(f)
+            (nd,) = struct.unpack("<I", f.read(4))
+            dims = [struct.unpack("<Q", f.read(8))[0] for _ in range(nd)]
+            tt, off = struct.unpack("<IQ", f.read(12))
+            tensors[name] = (dims, tt, off)
+        pos = f.tell()
+        data_off = ((pos + align - 1) // align) * align
+
+        def load_t(name: str) -> torch.Tensor:
+            dims, tt, off = tensors[name]
+            ne = 1
+            for d in dims:
+                ne *= d
+            f.seek(data_off + off)
+            if tt == 0:  # F32
+                arr = np.frombuffer(f.read(ne * 4), dtype=np.float32).copy()
+            elif tt == 1:  # F16
+                arr = np.frombuffer(f.read(ne * 2), dtype=np.float16).astype(np.float32)
+            elif tt == 30:  # BF16
+                u16 = np.frombuffer(f.read(ne * 2), dtype=np.uint16).astype(np.uint32) << 16
+                arr = u16.view(np.float32).copy()
+            elif tt == 8:  # Q8_0 (2B fp16 d + 32 int8 qs = 34B per 32 elems)
+                nblk = ne // 32
+                raw = np.frombuffer(f.read(nblk * 34), dtype=np.uint8).reshape(nblk, 34)
+                d = raw[:, :2].copy().view(np.float16).astype(np.float32)
+                qs = raw[:, 2:].view(np.int8).astype(np.float32)
+                arr = (d * qs).reshape(ne)
+            else:
+                raise ValueError(f"Unsupported GGUF tensor type {tt} for {name}")
+            # GGUF dims are reversed relative to PyTorch row-major [rows, cols]
+            shape = tuple(reversed(dims))
+            return torch.from_numpy(arr.reshape(shape))
+
+        out_norm = load_t("output_norm.weight").to(device=device, dtype=torch.float32)
+        lm_head = load_t("output.weight").to(device=device, dtype=torch.float16)
+    return None, None, None, out_norm, lm_head
+
+
 def maxwell_head_logits(
-    h_hc: torch.Tensor,  # [B, 4, d_host] fp32
-    hc_fn: torch.Tensor,  # [4, 4*d_host] fp32
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,  # [4] fp32
+    h_hc: torch.Tensor,  # [B, hc, d_host] fp32
+    hc_fn,               # [4, 4*d_host] fp32 or None (for standard hc=1 models)
+    hc_scale,
+    hc_base,
     out_norm: torch.Tensor,  # [d_host] fp32
-    lm_head: torch.Tensor,  # [vocab, d_host] fp16
+    lm_head: torch.Tensor,   # [vocab, d_host] fp16
     rms_eps: float = 1e-6,
     hc_eps: float = 1e-6,
 ) -> torch.Tensor:
     B, hc, D = h_hc.shape
-    flat = h_hc.reshape(B, hc * D)
-    inv_flat = torch.rsqrt(flat.pow(2).mean(dim=-1, keepdim=True) + rms_eps)
-    mixes = F.linear(flat * inv_flat, hc_fn)  # [B, 4]
-    pre = torch.sigmoid(mixes * hc_scale + hc_base) + hc_eps  # [B, 4]
-    mixed = (pre.unsqueeze(-1) * h_hc).sum(dim=1)  # [B, D]
+    if hc_fn is not None:
+        flat = h_hc.reshape(B, hc * D)
+        inv_flat = torch.rsqrt(flat.pow(2).mean(dim=-1, keepdim=True) + rms_eps)
+        mixes = F.linear(flat * inv_flat, hc_fn)  # [B, 4]
+        pre = torch.sigmoid(mixes * hc_scale + hc_base) + hc_eps  # [B, 4]
+        mixed = (pre.unsqueeze(-1) * h_hc).sum(dim=1)  # [B, D]
+    else:
+        mixed = h_hc.mean(dim=1)  # [B, D] for standard hc=1 models (qwen35moe, etc.)
     inv_rms = torch.rsqrt(mixed.pow(2).mean(dim=-1, keepdim=True) + rms_eps)
     x_norm = mixed * inv_rms * out_norm
     logits = F.linear(x_norm.to(lm_head.dtype), lm_head).float()
@@ -205,7 +284,7 @@ def write_rkad_v2(
 def evaluate(bridge, h_val, e_val, y_val, mu_e_t, head_tensors, batch_size=256, shuffled=False):
     bridge.eval()
     hc_fn, hc_scale, hc_base, out_norm, lm_head = head_tensors
-    device = hc_fn.device
+    device = out_norm.device
     N = h_val.shape[0]
     perm = torch.randperm(N, generator=torch.Generator().manual_seed(1337)) if shuffled else None
     tot_nll = 0.0
@@ -241,8 +320,9 @@ def evaluate(bridge, h_val, e_val, y_val, mu_e_t, head_tensors, batch_size=256, 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rkce", required=True, help="Path to RKCE v1 dump")
-    ap.add_argument("--safetensors-dir", required=True, help="Directory with Maxwell safetensors + index.json")
-    ap.add_argument("--out", required=True, help="Output RKAD v2 path")
+    ap.add_argument("--safetensors-dir", default="", help="Directory with Maxwell safetensors + index.json")
+    ap.add_argument("--gguf", default="", help="Host GGUF path for standard hc=1 tail loading (output_norm + output)")
+    ap.add_argument("--out", required=True, help="Output RKAD v2/v3 path")
     ap.add_argument("--src-layer", type=int, default=0, help="Engram source layer index (0 or 1)")
     ap.add_argument("--rank", type=int, default=128)
     ap.add_argument("--scale", type=float, default=0.05)
@@ -286,7 +366,12 @@ def main():
     mu_e = e_tr.astype(np.float64).mean(axis=0).astype(np.float32)
     mu_e_t = torch.from_numpy(mu_e).to(device=device, dtype=torch.float32)
 
-    head_tensors = load_maxwell_head(args.safetensors_dir, device)
+    if args.safetensors_dir:
+        head_tensors = load_maxwell_head(args.safetensors_dir, device)
+    elif args.gguf:
+        head_tensors = load_gguf_tail_head(args.gguf, device)
+    else:
+        raise ValueError("Must specify either --safetensors-dir (for maxwell-moe) or --gguf (for hc=1 models like qwen35moe)")
     hc_fn, hc_scale, hc_base, out_norm, lm_head = head_tensors
 
     bridge = RookeryGatedBridge(meta["d_eng"], meta["d_host"], meta["hc"], args.rank, args.scale, args.dropout).to(device)

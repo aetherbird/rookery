@@ -145,6 +145,7 @@ int main(int argc, char ** argv) {
     std::string model_path;
     std::string engram_path;
     std::string adapter_path;
+    std::string inspect_adapter_path;
     std::string dump_path;
     std::string dump_ce_path;
     std::string corpus_path;
@@ -172,6 +173,7 @@ int main(int argc, char ** argv) {
         if (a == "-m" || a == "--model")            model_path = next();
         else if (a == "--engram")                   engram_path = next();
         else if (a == "--engram-adapter")           adapter_path = next();
+        else if (a == "--inspect-adapter")          inspect_adapter_path = next();
         else if (a == "--engram-scale")             scale = std::strtof(next().c_str(), nullptr);
         else if (a == "--scale-sweep")              scale_sweep = parse_csv_floats(next());
         else if (a == "--engram-layers")            engram_layers = parse_csv_ints(next());
@@ -194,8 +196,61 @@ int main(int argc, char ** argv) {
         else if (a == "--bench")                    bench_mode = true;
     }
 
+    // -1. Fast standalone RKAD v1/v2/v3 adapter inspector (no GPU or GGUF required!)
+    if (!inspect_adapter_path.empty()) {
+        FILE * fp = std::fopen(inspect_adapter_path.c_str(), "rb");
+        if (!fp) {
+            std::fprintf(stderr, "Cannot open RKAD adapter: %s\n", inspect_adapter_path.c_str());
+            return 1;
+        }
+        char magic[4]{};
+        uint32_t hdr[6]{};
+        if (std::fread(magic, 1, 4, fp) != 4 || std::memcmp(magic, "RKAD", 4) != 0 ||
+            std::fread(hdr, sizeof(uint32_t), 6, fp) != 6) {
+            std::fclose(fp);
+            std::fprintf(stderr, "Invalid RKAD header in %s\n", inspect_adapter_path.c_str());
+            return 1;
+        }
+        const uint32_t ver = hdr[0], nh = hdr[1], de = hdr[2], dh = hdr[3], r_hdr = hdr[4], hg_hdr = hdr[5];
+        std::printf("RKAD Adapter: %s\n", inspect_adapter_path.c_str());
+        std::printf("  format_version=%u  n_hooks=%u  d_engram=%u  d_host=%u  default_rank=%u\n", ver, nh, de, dh, r_hdr);
+        uint32_t hc_est = 4;
+        if (ver >= 3) {
+            uint32_t mlen = 0;
+            if (std::fread(&mlen, sizeof(uint32_t), 1, fp) != 1) { std::fclose(fp); return 1; }
+            std::string mstr(mlen, '\0');
+            if (mlen > 0 && std::fread(mstr.data(), 1, mlen, fp) != mlen) { std::fclose(fp); return 1; }
+            std::printf("  manifest=%s\n", mstr.c_str());
+            auto pos_hc = mstr.find("\"host_hc_mult\":");
+            if (pos_hc != std::string::npos) hc_est = static_cast<uint32_t>(std::atoi(mstr.c_str() + pos_hc + 15));
+        }
+        for (uint32_t i = 0; i < nh; ++i) {
+            int32_t meta[2]{};
+            float sc = 0.0f, clip = 0.0f;
+            uint32_t hr = r_hdr;
+            bool has_mu = (ver >= 2), has_g = (hg_hdr != 0);
+            if (std::fread(meta, sizeof(int32_t), 2, fp) != 2 || std::fread(&sc, sizeof(float), 1, fp) != 1) break;
+            if (ver >= 3) {
+                uint32_t ex[2]{};
+                if (std::fread(ex, sizeof(uint32_t), 2, fp) != 2 || std::fread(&clip, sizeof(float), 1, fp) != 1) break;
+                hr = ex[0];
+                has_mu = (ex[1] & 1u) != 0;
+                has_g  = (ex[1] & 2u) != 0;
+                if ((ex[1] & 4u) == 0) clip = 0.0f;
+            }
+            size_t skip_floats = (has_mu ? de : 0) + (hr ? (size_t(hr) * de + size_t(dh) * hr) : size_t(dh) * de);
+            if (has_g) skip_floats += (hr ? (size_t(hr) * de + size_t(dh) * hr) : size_t(dh) * de) + size_t(hc_est) * dh;
+            std::fseek(fp, static_cast<long>(skip_floats * sizeof(float)), SEEK_CUR);
+            std::printf("  hook[%u]: src_layer=%d -> host_layer=%d  rank=%u  scale=%.4f  centered=%s  gated=%s  delta_clip=%.3f  params=%.2fM\n",
+                        i, meta[1], meta[0], hr, sc, has_mu ? "yes" : "no", has_g ? "yes" : "no", clip,
+                        static_cast<double>(skip_floats) / 1e6);
+        }
+        std::fclose(fp);
+        return 0;
+    }
+
     if (engram_path.empty()) {
-        std::fprintf(stderr, "Usage: %s --engram <table.gguf> [-m <host.gguf>] [--engram-adapter <a.rkad>] [--engram-scale 0.0] [--scale-sweep 0,0.25,0.5,1] [--dump-pairs <p.rkpr>] [--dump-delta] [--eval-ppl <txt>] [--shuffle-salt 0] [--verify-addressing] [--bench] [--table-only]\n", argv[0]);
+        std::fprintf(stderr, "Usage: %s --engram <table.gguf> [-m <host.gguf>] [--engram-adapter <a.rkad>] [--inspect-adapter <a.rkad>] [--engram-scale 0.0] [--scale-sweep 0,0.25,0.5,1] [--dump-pairs <p.rkpr>] [--dump-delta] [--eval-ppl <txt>] [--eval-factual <tsv>] [--shuffle-salt 0] [--verify-addressing] [--bench] [--table-only]\n", argv[0]);
         return 1;
     }
 
