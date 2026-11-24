@@ -167,7 +167,13 @@ void EngramTable::open(const std::string & path) {
         cfg_.heads_per_ngram = static_cast<int>(meta.get_u64(pfx + "ple.heads_per_ngram", 8));
         cfg_.n_cols          = (cfg_.ngram_size - 1) * cfg_.heads_per_ngram;
         cfg_.head_dim        = static_cast<int>(meta.get_u64(pfx + "embedding_length_per_layer_input", 96));
-        cfg_.pad_token_id    = static_cast<int32_t>(meta.get_u64(pfx + "engram.pad_token_id", 0));
+        if (meta.has_kv(pfx + "engram.pad_token_id")) {
+            cfg_.pad_token_id = static_cast<int32_t>(meta.get_u64(pfx + "engram.pad_token_id", 0));
+        } else if (meta.has_kv(pfx + "ple.eos_token_id")) {
+            cfg_.pad_token_id = static_cast<int32_t>(meta.get_u64(pfx + "ple.eos_token_id", 248044));
+        } else {
+            cfg_.pad_token_id = 0;
+        }
     } else {
         // Fallback: Unigram PLE (e.g. Gemma 3n/4 E2B/E4B or harvested standalone table)
         cfg_.mode            = EngramMode::UNIGRAM_PLE;
@@ -278,10 +284,13 @@ void EngramTable::hash_tokens(int engram_layer_idx,
     const uint64_t * mult   = cfg_.layer_multipliers.data() + static_cast<size_t>(e) * n_gram;
     const uint32_t * primes = cfg_.head_vocab_sizes.data()  + static_cast<size_t>(e) * n_cols;
     const uint32_t * offs   = cfg_.head_offsets.data()      + static_cast<size_t>(e) * n_cols;
-    const int64_t    pad    = (cfg_.pad_token_id >= 0 && static_cast<size_t>(cfg_.pad_token_id) < cfg_.token_map.size())
-                                  ? cfg_.token_map[cfg_.pad_token_id] : 0;
+    const bool has_tmap     = !cfg_.token_map.empty();
+    const int64_t pad       = (has_tmap && cfg_.pad_token_id >= 0 && static_cast<size_t>(cfg_.pad_token_id) < cfg_.token_map.size())
+                                  ? cfg_.token_map[cfg_.pad_token_id]
+                                  : static_cast<int64_t>(cfg_.pad_token_id);
 
     auto cid = [&](int32_t t) -> int64_t {
+        if (!has_tmap) return (t >= 0) ? static_cast<int64_t>(t) : -1;
         if (t < 0 || static_cast<size_t>(t) >= cfg_.token_map.size()) return -1;
         return cfg_.token_map[t];
     };
@@ -291,19 +300,34 @@ void EngramTable::hash_tokens(int engram_layer_idx,
 
     for (int i = 0; i < n_toks; ++i) {
         const int pos = start_idx + i;
-        int64_t c0 = (pos >= 0 && pos < static_cast<int>(seq_tokens.size())) ? cid(seq_tokens[pos]) : -1;
-        bool blocked = (c0 < 0);
-        const bool dead = blocked;
-        toks[0] = blocked ? static_cast<uint64_t>(pad) : static_cast<uint64_t>(c0);
+        bool dead = false;
+        if (!has_tmap) {
+            // Direct raw token-ID hashing with EOS boundary cut (exact match to qwen4exp / Qwen3.8-Flash-Next PLE!)
+            const int32_t t0 = (pos >= 0 && pos < static_cast<int>(seq_tokens.size())) ? seq_tokens[pos] : -1;
+            dead = (t0 < 0);
+            toks[0] = dead ? static_cast<uint64_t>(pad) : static_cast<uint64_t>(t0);
+            bool cut = false;
+            for (int s = 1; s < n_gram; ++s) {
+                const int p = pos - s;
+                const int32_t ts = (cut || p < 0 || p >= static_cast<int>(seq_tokens.size())) ? -1 : seq_tokens[p];
+                cut = cut || (ts < 0) || (ts == cfg_.pad_token_id);
+                toks[s] = cut ? static_cast<uint64_t>(pad) : static_cast<uint64_t>(ts);
+            }
+        } else {
+            int64_t c0 = (pos >= 0 && pos < static_cast<int>(seq_tokens.size())) ? cid(seq_tokens[pos]) : -1;
+            bool blocked = (c0 < 0);
+            dead = blocked;
+            toks[0] = blocked ? static_cast<uint64_t>(pad) : static_cast<uint64_t>(c0);
 
-        for (int s = 1; s < n_gram; ++s) {
-            const int p = pos - s;
-            int64_t cs = (p >= 0 && p < static_cast<int>(seq_tokens.size())) ? cid(seq_tokens[p]) : -1;
-            if (cascade_block) {
-                blocked = blocked || (cs < 0);
-                toks[s] = blocked ? static_cast<uint64_t>(pad) : static_cast<uint64_t>(cs);
-            } else {
-                toks[s] = (cs < 0) ? static_cast<uint64_t>(pad) : static_cast<uint64_t>(cs);
+            for (int s = 1; s < n_gram; ++s) {
+                const int p = pos - s;
+                int64_t cs = (p >= 0 && p < static_cast<int>(seq_tokens.size())) ? cid(seq_tokens[p]) : -1;
+                if (cascade_block) {
+                    blocked = blocked || (cs < 0);
+                    toks[s] = blocked ? static_cast<uint64_t>(pad) : static_cast<uint64_t>(cs);
+                } else {
+                    toks[s] = (cs < 0) ? static_cast<uint64_t>(pad) : static_cast<uint64_t>(cs);
+                }
             }
         }
 

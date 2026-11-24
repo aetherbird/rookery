@@ -1,6 +1,7 @@
 #include "engram/engram_sidecar.h"
 #include "gguf/reader.h"
 #include "models/maxwell_moe.h"
+#include "models/qwen35_moe.h"
 #include "tokenizer/bpe.h"
 
 #include <algorithm>
@@ -9,10 +10,45 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <memory>
 #include <numeric>
 #include <sstream>
 #include <string>
 #include <vector>
+
+struct HostEvalModel {
+    std::string arch;
+    std::unique_ptr<rookery::MaxwellMoeModel> maxwell;
+    std::unique_ptr<rookery::Qwen35MoeModel>  qwen35;
+
+    void load(const std::string & path, const std::vector<int> & gpus, const std::vector<float> & split, int max_ctx) {
+        auto gguf = rookery::GgufFile::open(path);
+        arch = gguf.get_str("general.architecture", "maxwell-moe");
+        if (arch == "qwen35moe") {
+            qwen35 = std::make_unique<rookery::Qwen35MoeModel>();
+            qwen35->load(path, gpus, split, max_ctx, true, false);
+        } else {
+            maxwell = std::make_unique<rookery::MaxwellMoeModel>();
+            maxwell->load(path, gpus, split, max_ctx, true, false);
+        }
+    }
+    int n_embd() const { return qwen35 ? qwen35->config().n_embd : maxwell->config().n_embd; }
+    int hc_mult() const { return qwen35 ? 1 : maxwell->config().hc_mult; }
+    std::vector<int> layer_devices() const { return qwen35 ? qwen35->layer_devices() : maxwell->layer_devices(); }
+    void set_layer_hook(rookery::LayerHook * h) { if (qwen35) qwen35->set_layer_hook(h); else maxwell->set_layer_hook(h); }
+    void set_use_cuda_graphs(bool en) { if (qwen35) qwen35->set_use_cuda_graphs(en); else maxwell->set_use_cuda_graphs(en); }
+    void warmup_decode_graphs() { if (qwen35) qwen35->warmup_decode_graphs(); else maxwell->warmup_decode_graphs(); }
+    void reset_state() { if (qwen35) qwen35->reset_state(); }
+    void forward(const std::vector<int32_t> & t, const std::vector<int32_t> & p, std::vector<float> & l) {
+        if (qwen35) qwen35->forward(t, p, l); else maxwell->forward(t, p, l);
+    }
+    int32_t forward_decode_greedy(int32_t t, int32_t p) {
+        return qwen35 ? qwen35->forward_decode_greedy(t, p) : maxwell->forward_decode_greedy(t, p);
+    }
+    void forward_decode_logits(int32_t t, int32_t p, std::vector<float> & l) {
+        if (qwen35) qwen35->forward_decode_logits(t, p, l); else maxwell->forward_decode_logits(t, p, l);
+    }
+};
 
 static std::vector<int> parse_csv_ints(const std::string & s) {
     std::vector<int> out;
@@ -52,13 +88,14 @@ struct EvalMetrics {
 };
 
 static EvalMetrics eval_token_ppl(
-    rookery::MaxwellMoeModel & model,
+    HostEvalModel & model,
     rookery::EngramSidecar * sidecar,
     const std::vector<int32_t> & ids) {
 
     EvalMetrics m;
     if (ids.size() < 2) return m;
 
+    model.reset_state();
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<float> logits;
 
@@ -265,13 +302,13 @@ int main(int argc, char ** argv) {
     const int ctx_need = dump_ce_path.empty()
         ? std::max(8192, std::max(max_toks, eval_toks) + 128)
         : std::max(4096, doc_ctx + 128);
-    rookery::MaxwellMoeModel model;
-    model.load(model_path, gpus, split, ctx_need, true, false);
+    HostEvalModel model;
+    model.load(model_path, gpus, split, ctx_need);
 
     rookery::EngramSidecar sidecar;
     sidecar.init(engram_path, &host_tok, model.layer_devices(),
-                 model.config().n_embd, model.config().hc_mult,
-                 512, adapter_path, scale, engram_layers, "maxwell-moe");
+                 model.n_embd(), model.hc_mult(),
+                 512, adapter_path, scale, engram_layers, model.arch);
     if (shuffle_salt != 0) {
         sidecar.set_shuffle_salt(shuffle_salt);
         std::printf("CONTROL MODE: Engram hash shuffle_salt = 0x%llx\n", static_cast<unsigned long long>(shuffle_salt));
@@ -285,6 +322,7 @@ int main(int argc, char ** argv) {
         std::printf("Calibration dump corpus: %zu host tokens (mode=%s)\n",
                     ids.size(), dump_delta ? "delta" : "state");
 
+        model.reset_state();
         sidecar.set_global_scale(0.0f);
         sidecar.enable_calibration_dump(dump_path, dump_delta);
         model.set_layer_hook(&sidecar);
@@ -319,6 +357,7 @@ int main(int argc, char ** argv) {
         const size_t chunk = 256;
         // Process in non-overlapping windows of up to doc_ctx tokens (resets position to 0 each window to keep KV small)
         for (size_t win_start = 0; win_start + 1 < ids.size(); win_start += static_cast<size_t>(doc_ctx)) {
+            model.reset_state();
             const size_t win_end = std::min(ids.size(), win_start + static_cast<size_t>(doc_ctx));
             const size_t win_len = win_end - win_start;
             for (size_t off = 0; off < win_len; off += chunk) {
@@ -358,6 +397,7 @@ int main(int argc, char ** argv) {
             int total_ans_toks = 0, hit1 = 0, hit5 = 0, exact_first1 = 0, exact_first5 = 0;
             std::vector<float> logits;
             for (const auto & [q, a] : qa_pairs) {
+                model.reset_state();
                 auto q_ids = host_tok.encode(q, true, false);
                 auto a_ids = host_tok.encode(a, false, false);
                 if (q_ids.empty() || a_ids.empty()) continue;
@@ -504,6 +544,7 @@ int main(int argc, char ** argv) {
         std::vector<float> logits;
 
         auto run_decode_bench = [&](const char * label, bool use_hook, bool call_prep, float sc, bool use_graph, bool gpu_prof) {
+            model.reset_state();
             model.set_use_cuda_graphs(use_graph);
             sidecar.set_global_scale(sc);
             sidecar.set_shuffle_salt(0);
@@ -573,6 +614,7 @@ int main(int argc, char ** argv) {
         std::iota(pp_pos.begin(), pp_pos.end(), 0);
 
         auto run_pp_bench = [&](const char * label, bool use_hook, float sc) {
+            model.reset_state();
             sidecar.set_global_scale(sc);
             sidecar.set_gpu_profiling(false);
             model.set_layer_hook(use_hook ? &sidecar : nullptr);

@@ -745,6 +745,9 @@ void Qwen4ExpModel::run_gpu_segment(size_t gi, int T, bool run_argmax, int kv_le
 
         // 6. Post-FFN mHC combine
         launch_hc_combine(rt.d_res_hc, rt.d_sub_out, rt.d_hc_inject, inv_hc, H, hc, T, st);
+        if (hook_ != nullptr) {
+            hook_->on_post_layer(il, rt.device, rt.d_res_hc, T, H, hc, st);
+        }
     }
 
     // 7. Final Output mHC Head Mix (no separate output_norm!) -> LM head

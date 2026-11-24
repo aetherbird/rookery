@@ -694,6 +694,9 @@ void Inkling2LoopModel::run_layer(DevRuntime & rt, int il, int ip, int T, int & 
 
     cudaMemcpyAsync(rt.d_cur, rt.d_ffn_inp, TH * sizeof(float), cudaMemcpyDeviceToDevice, st);
     launch_add_inplace(rt.d_cur, rt.d_sub_out, static_cast<int64_t>(TH), st);
+    if (hook_ != nullptr) {
+        hook_->on_post_layer(ip, rt.device, rt.d_cur, T, H, 1, st);
+    }
 }
 
 void Inkling2LoopModel::run_prelude(int T, int kv_len_max) {

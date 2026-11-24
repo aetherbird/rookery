@@ -149,7 +149,30 @@ Replacing per-step 256–352B suffix re-tokenization with a boundary-anchored in
 Scaling the `L44` causal dump to `200,000` mixed Wiki + Tech tokens (`base val PPL = 15.091`) surfaced an important failure mode caught directly by our 4-way `[SHUFFLED]` control:
 - Under vanilla `CE + 0.5*KL` on high-entropy raw Wiki completions (`base PPL = 15.091`), a late-layer bridge placed directly before `output_norm` can exploit an **RMSNorm logit-softening shortcut** (increasing `||h + delta||` scales down logits like temperature `T > 1`), causing both `[REAL]` and `[SHUFFLED]` PPL to drop on raw prose/tech completions (`SHUFFLED` drops even more because uniform random hash rows have higher variance than frequent-token rows), while hurting calibrated `EVAL_FACTUAL` (`1.400 → 1.426`).
 - Adding **contrastive shuffled-batch KL regularization** (`--shuf-kl-beta 2.0`) + **relative delta-norm penalty** (`--delta-reg 2.0`) + `delta_clip=0.15` restored monotonic `EVAL_FACTUAL` gains (`1.400 → 1.397 → 1.396 → 1.395`, `SHUF − REAL = +0.030`, vs shuffled degrading `1.400 → 1.409 → 1.422 → 1.425`) and produced a `+0.444` in-distribution `SHUF − REAL` gap (`13.931` vs `14.321`), though residual norm-inflation before `output_norm` still left a small `-0.02` to `-0.09` shuffled bias on raw-text `EVAL_TECH`/`EVAL_PROSE`.
-- **Architectural conclusion:** Early-layer bridges (`L1`, 44 layers before `output_norm`) are naturally immune to logit-temperature shortcuts (beating both Base and Shuffled on `EVAL_TECH` and `EVAL_PROSE`). Future Level-3 late-layer bridges should project `delta` onto the hypersphere tangent plane (`delta ⊥ h`, preserving `||h||` identically) or backpropagate into early layers (`L1..L4`).
+- **Architectural conclusion & mathematical fix (`--calibrate-base-temp`):** Because `output_norm` projects onto the unit sphere, any perturbation of relative norm $r$ shrinks base logits by $\cos\theta = 1/\sqrt{1+r^2}$, giving free temperature softening whenever the base model is overconfident ($\tau^* > 1$). Fitting the base model's optimal scalar temperature $\tau^*$ once before epoch 1 ($\tau^* = 1.30$ on the 200K mixed corpus) zeroes $\partial \mathrm{CE}/\partial(\cos\theta) = 0$ during training while keeping inference unmodified ($\tau = 1.0$). Combined with `--shuf-kl-beta 1.5 --delta-reg 1.0` and `RKAD v3` (`clip=0.15`), **`[REAL]` beat `[SHUFFLED]` on 9 / 9 scale settings across all three held-out suites**:
+
+| Held-Out Eval (Temp-Calibrated 200K `RKAD v3`) | `[BASE]` | `[DISABLED]` | `[REAL]` (`0.5 / 1.0 / 1.5`) | `[SHUFFLED]` (`0.5 / 1.0 / 1.5`) | `SHUF − REAL` |
+|---|---:|---:|---|---|---|
+| **`EVAL_FACTUAL`** (60 QA items) | `1.400` (`91.7%`/`94.3%`/`96.2%`) | `1.400` (`+0.000000`) | **`1.396 → 1.392 → 1.391`** (`93.3%`/`95.2%`/`97.1%`) | `1.402 → 1.406 → 1.407` (flat `91.7%`) | **`+0.006 / +0.014 / +0.016`** (3/3) |
+| **`EVAL_TECH`** (2,048 tok) | `12.746` (`top5 75.63%`) | `12.746` (`+0.000000`) | **`12.612 → 12.509 → 12.464`** (`-0.282`, `top5 76.22%`) | `12.708 → 12.708 → 12.736` | **`+0.096 / +0.200 / +0.271`** (3/3) |
+| **`EVAL_PROSE`** (2,048 tok, OOD) | `4.759` | `4.759` (`+0.000000`) | **`4.759 (-0.0005)`** / `4.765` / `4.772` | `4.767 → 4.781 → 4.799` | **`+0.009 / +0.017 / +0.027`** (3/3) |
+
+---
+
+## 7. Multi-Provider & Multi-Host Decoupling Proof (`Qwen3.8-Flash-Next` Provider + `Qwen3.6-35B-A3B` Host)
+
+Using the exact same `EngramTable` + `EngramSidecar` + `RKAD v3` contract (zero model-specific bridge code):
+
+1. **Provider #2 — `Qwen3.8-Flash-Next` (`qwen4exp`, 50.66 GiB `Q8_0` `mmap` PLE table, `fp=0xea58e1fab6490963`):**
+   - `1 layer × 16 heads × head_dim=160 (d_engram=2560)`, `320,001,536` rows, EOS-cut raw-token N-gram hashing: opens in `119.3 ms` (0 GiB VRAM), `2.71 µs/tok` warm lookup.
+   - `--verify-addressing` against `Maxwell-V1-Flash` host tokenizer: **`851 / 851` (100.00%)** tokens, **`13,616 / 13,616` (100.00%)** hash cols (`avg tail = 60.4 B`).
+2. **Host #2 — `DeepSeek-V4.1-Flash` (103 GiB) → `Qwen3.6-35B-A3B` (`qwen35moe`, GDN + GQA MoE, `hc=1`, 40 layers):**
+   - `--verify-addressing`: **`927 / 927` (100.00%)** mixed (`44,496 / 44,496` hashes) and **`1,500 / 1,500` (100.00%)** tech (`72,000 / 72,000` hashes).
+   - Pure closed-form Level-2 delta-Ridge fit (`rookery-fit-adapter --auto-lam --rkad-v3`, `4.96 s` on GPU): `L1 val R² = +0.2080` (`lam=2.0`), `L14 val R² = +0.0184` (`lam=5.0`).
+   - 4-way held-out evals (`[DISABLED]` = `+0.000000` on both):
+     - **`EVAL_TECH` (2,048 tok):** Base `5.738` (`top1 60.45%`) → Real `5.709` (`-0.029`, `top1 60.69%`, `top5 82.03%`) at `scale=1.0`, beating Shuffled on 3/3 scales (`+0.0155 / +0.0282 / +0.0070`).
+     - **`EVAL_PROSE` (2,048 tok, OOD):** Base `2.782` (`top1 75.73%`) → Real `2.779` (`-0.0034`, `top1 75.98%`) at `scale=0.5` (`+0.0082` vs Shuffled) and `2.781` (`top1 76.07%`) at `scale=2.0` (`+0.0211` vs Shuffled).
+   - **Memory-residency note (`tg128`, `133.8 tok/s` base):** Disabled overhead is `+21.6 µs/tok` (`+0.29%`); warm-RAM active overhead is `~77.8 µs/tok` (`~1.04%`: `tok=11.8`, `hash=1.4`, `gath=17.1`, `h2d=9.9`, `gpu_hooks=37.6 µs`), whereas cold NVMe page faults after loading a 36 GiB model + 103 GiB table on a 128 GiB RAM host add `~2.0 ms/tok` until pages warm up.
 
 ---
 

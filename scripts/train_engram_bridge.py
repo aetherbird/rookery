@@ -255,6 +255,8 @@ def main():
                     help="Contrastive shuffled-batch KL(p_base || p_shuf) penalty to prevent RMSNorm logit-softening shortcuts")
     ap.add_argument("--delta-reg", type=float, default=0.0,
                     help="L2 penalty on mean ||delta||_rms / ||h||_rms to keep perturbations small and well-calibrated")
+    ap.add_argument("--calibrate-base-temp", action="store_true",
+                    help="Fit optimal scalar base temperature tau* before training so dCE/d(cos theta)=0 (eliminates RMSNorm logit-softening shortcut!)")
     ap.add_argument("--dropout", type=float, default=0.0)
     ap.add_argument("--val-frac", type=float, default=0.1)
     ap.add_argument("--rkad-v3", action="store_true", help="Emit self-describing RKAD v3 with strict JSON contract manifest")
@@ -295,6 +297,25 @@ def main():
     b_nll, b_ppl, b_t1, r_nll, r_ppl, r_t1 = evaluate(bridge, h_va, e_va, y_va, mu_e_t, head_tensors)
     print(f"[Epoch 0] val BASE: NLL={b_nll:.5f} PPL={b_ppl:.3f} top1={b_t1:.2f}% | init PPL={r_ppl:.3f}")
 
+    # Optional: fit scalar base temperature tau* on a 16K training subset so dCE/d(cos theta)=0 during training
+    train_tau = 1.0
+    if args.calibrate_base_temp:
+        sub_n = min(n_tr, 16384)
+        taus = [0.85, 0.95, 1.0, 1.05, 1.1, 1.15, 1.2, 1.25, 1.3, 1.4, 1.5]
+        nll_sums = [0.0 for _ in taus]
+        with torch.no_grad():
+            for i in range(0, sub_n, 256):
+                j = min(sub_n, i + 256)
+                hb = torch.from_numpy(h_tr[i:j]).to(device=device, dtype=torch.float32)
+                yb = torch.from_numpy(y_tr[i:j]).to(device=device, dtype=torch.long)
+                bl = maxwell_head_logits(hb, hc_fn, hc_scale, hc_base, out_norm, lm_head)
+                for ti, tval in enumerate(taus):
+                    nll_sums[ti] += F.cross_entropy(bl / tval, yb, reduction="sum").item()
+        best_ti = int(np.argmin(nll_sums))
+        train_tau = taus[best_ti]
+        print(f"[TempCalib] Optimal base temperature tau*={train_tau:.2f} "
+              f"(base NLL@1.0={nll_sums[taus.index(1.0)]/sub_n:.4f} -> @{train_tau:.2f}={nll_sums[best_ti]/sub_n:.4f})")
+
     best_val_score = float("inf")
     best_val_nll = b_nll
     best_state = {k: v.detach().cpu().clone() for k, v in bridge.state_dict().items()}
@@ -317,12 +338,12 @@ def main():
 
             with torch.no_grad():
                 base_logits = maxwell_head_logits(hb, hc_fn, hc_scale, hc_base, out_norm, lm_head)
-                base_logp = F.log_softmax(base_logits, dim=-1)
+                base_logp = F.log_softmax(base_logits / train_tau, dim=-1)
                 base_p = base_logp.exp()
 
             h_out, rel_norm, _ = bridge(hb, eb, return_stats=True)
             logits = maxwell_head_logits(h_out, hc_fn, hc_scale, hc_base, out_norm, lm_head)
-            logp = F.log_softmax(logits, dim=-1)
+            logp = F.log_softmax(logits / train_tau, dim=-1)
 
             ce = F.nll_loss(logp, yb)
             # KL(p_base || p_grafted) = sum p_base * (log p_base - log p_grafted)
@@ -334,7 +355,7 @@ def main():
                 perm = torch.roll(torch.arange(eb.shape[0], device=device), shifts=1)
                 h_shuf = bridge(hb, eb[perm])
                 shuf_logits = maxwell_head_logits(h_shuf, hc_fn, hc_scale, hc_base, out_norm, lm_head)
-                shuf_logp = F.log_softmax(shuf_logits, dim=-1)
+                shuf_logp = F.log_softmax(shuf_logits / train_tau, dim=-1)
                 # Force shuffled Engram inputs to leave base distribution unchanged (prevents isotropic softening!)
                 skl = (base_p * (base_logp - shuf_logp)).sum(dim=-1).mean()
                 loss = loss + args.shuf_kl_beta * skl

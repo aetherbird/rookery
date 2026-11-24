@@ -46,21 +46,35 @@ int main(int argc, char ** argv) {
     bool  gated    = false;
     bool  center   = true;
     bool  auto_lam = false;
+    bool  rkad_v3  = false;
     int   device   = 0;
+    std::string provider_arch;
+    std::string provider_fp;
+    std::string host_arch;
+    int   host_n_layers = 0;
+    int   host_hc_mult  = 4;
+    float delta_clip    = 0.0f;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&]() -> std::string { return (i + 1 < argc) ? argv[++i] : ""; };
-        if (a == "--pairs")          pairs_path = next();
-        else if (a == "--out")       out_path = next();
-        else if (a == "--rank")      rank = std::atoi(next().c_str());
-        else if (a == "--lam")       lam = std::strtof(next().c_str(), nullptr);
-        else if (a == "--auto-lam")  auto_lam = true;
-        else if (a == "--scale")     scale = std::strtof(next().c_str(), nullptr);
-        else if (a == "--gated")     gated = true;
-        else if (a == "--center")    center = true;
-        else if (a == "--no-center") center = false;
-        else if (a == "--device")    device = std::atoi(next().c_str());
+        if (a == "--pairs")               pairs_path = next();
+        else if (a == "--out")            out_path = next();
+        else if (a == "--rank")           rank = std::atoi(next().c_str());
+        else if (a == "--lam")            lam = std::strtof(next().c_str(), nullptr);
+        else if (a == "--auto-lam")       auto_lam = true;
+        else if (a == "--scale")          scale = std::strtof(next().c_str(), nullptr);
+        else if (a == "--gated")          gated = true;
+        else if (a == "--center")         center = true;
+        else if (a == "--no-center")      center = false;
+        else if (a == "--device")         device = std::atoi(next().c_str());
+        else if (a == "--rkad-v3")        rkad_v3 = true;
+        else if (a == "--provider-arch")  provider_arch = next();
+        else if (a == "--provider-fp")    provider_fp = next();
+        else if (a == "--host-arch")      host_arch = next();
+        else if (a == "--host-n-layers")  host_n_layers = std::atoi(next().c_str());
+        else if (a == "--host-hc-mult")   host_hc_mult = std::atoi(next().c_str());
+        else if (a == "--delta-clip")     delta_clip = std::strtof(next().c_str(), nullptr);
     }
 
     if (pairs_path.empty() || out_path.empty()) {
@@ -122,13 +136,27 @@ int main(int argc, char ** argv) {
 
     const int eff_rank = (rank > 0 && rank < static_cast<int>(std::min(d_engram, d_host))) ? rank : 0;
 
-    const uint32_t out_ver = center ? 2u : 1u;
+    const uint32_t out_ver = rkad_v3 ? 3u : (center ? 2u : 1u);
     FILE * out = std::fopen(out_path.c_str(), "wb");
     if (!out) throw std::runtime_error("Cannot open output " + out_path);
     const char omagic[4] = {'R', 'K', 'A', 'D'};
-    uint32_t ohdr[6] = {out_ver, n_hooks, d_engram, d_host, static_cast<uint32_t>(eff_rank), gated ? 1u : 0u};
+    uint32_t ohdr[6] = {out_ver, n_hooks, d_engram, d_host, static_cast<uint32_t>(eff_rank), (rkad_v3 ? 0u : (gated ? 1u : 0u))};
     std::fwrite(omagic, 1, 4, out);
     std::fwrite(ohdr, sizeof(uint32_t), 6, out);
+
+    if (rkad_v3) {
+        std::string mj = "{\"schema\":\"rookery.engram.adapter.v3\"";
+        if (!provider_arch.empty()) mj += ",\"provider_arch\":\"" + provider_arch + "\"";
+        if (!provider_fp.empty())   mj += ",\"provider_fingerprint\":\"" + provider_fp + "\"";
+        if (!host_arch.empty())     mj += ",\"host_arch\":\"" + host_arch + "\"";
+        if (host_n_layers > 0)      mj += ",\"host_n_layers\":" + std::to_string(host_n_layers);
+        mj += ",\"host_d_embd\":" + std::to_string(d_host);
+        if (host_hc_mult > 0)       mj += ",\"host_hc_mult\":" + std::to_string(host_hc_mult);
+        mj += ",\"calibration\":\"level2_delta_ridge_auto\"}";
+        uint32_t mlen = static_cast<uint32_t>(mj.size());
+        std::fwrite(&mlen, sizeof(uint32_t), 1, out);
+        std::fwrite(mj.data(), 1, mlen, out);
+    }
 
     int * d_info = nullptr;
     cuda_ok(cudaMalloc(&d_info, sizeof(int)), "malloc info");
@@ -253,10 +281,16 @@ int main(int argc, char ** argv) {
         const float hook_scale = (auto_lam && N_val > 0 && val_r2 <= 0.0) ? 0.0f : scale;
 
         // W_cm[de, dh] IS Wt_rm[dh, de] in row-major!
-        // Write hook header (+ mu_E[de] for RKAD v2)
+        // Write hook header (+ RKAD v3 extension + mu_E[de] for RKAD v2/v3)
         int32_t hmeta[2] = {hp.target_layer, hp.src_layer};
         std::fwrite(hmeta, sizeof(int32_t), 2, out);
         std::fwrite(&hook_scale, sizeof(float), 1, out);
+        if (rkad_v3) {
+            uint32_t hflags = (center ? 1u : 0u) | (gated ? 2u : 0u) | (delta_clip > 0.0f ? 4u : 0u);
+            uint32_t hextra[2] = {static_cast<uint32_t>(eff_rank), hflags};
+            std::fwrite(hextra, sizeof(uint32_t), 2, out);
+            std::fwrite(&delta_clip, sizeof(float), 1, out);
+        }
         if (center) {
             std::fwrite(mu_E.data(), sizeof(float), de, out);
         }
@@ -269,7 +303,7 @@ int main(int argc, char ** argv) {
             std::fwrite(h_Wt.data(), sizeof(float), h_Wt.size(), out);
             if (gated) {
                 std::fwrite(h_Wt.data(), sizeof(float), h_Wt.size(), out);
-                std::vector<float> gw(static_cast<size_t>(4) * dh, 1.0f);
+                std::vector<float> gw(static_cast<size_t>(std::max(1, host_hc_mult)) * dh, 1.0f);
                 std::fwrite(gw.data(), sizeof(float), gw.size(), out);
             }
         } else {
@@ -352,7 +386,7 @@ int main(int argc, char ** argv) {
             if (gated) {
                 std::fwrite(A_v.data(), sizeof(float), A_v.size(), out);
                 std::fwrite(B_v.data(), sizeof(float), B_v.size(), out);
-                std::vector<float> gw(static_cast<size_t>(4) * dh, 1.0f);
+                std::vector<float> gw(static_cast<size_t>(std::max(1, host_hc_mult)) * dh, 1.0f);
                 std::fwrite(gw.data(), sizeof(float), gw.size(), out);
             }
         }
