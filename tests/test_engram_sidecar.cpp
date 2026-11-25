@@ -215,6 +215,7 @@ int main(int argc, char ** argv) {
     bool     dump_delta   = false;
     bool     verify_addr  = false;
     bool     bench_mode   = false;
+    bool     parse_special = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -244,6 +245,7 @@ int main(int argc, char ** argv) {
         else if (a == "--table-only")               table_only = true;
         else if (a == "--verify-addressing")        verify_addr = true;
         else if (a == "--bench")                    bench_mode = true;
+        else if (a == "--parse-special")            parse_special = true;
     }
 
     // -1. Fast standalone RKAD v1/v2/v3 adapter inspector (no GPU or GGUF required!)
@@ -450,9 +452,10 @@ int main(int argc, char ** argv) {
     // Mode A2: Tail-CE Supervised Bridge Dataset Dump ("RKCE" v1, strictly causal addressing, doc-windowed!)
     if (!dump_ce_path.empty()) {
         std::string text = corpus_path.empty() ? "The capital of France is Paris." : read_text_file(corpus_path);
-        auto ids = host_tok.encode(text, true, false);
+        auto ids = host_tok.encode(text, true, parse_special);
         if (static_cast<int>(ids.size()) > max_toks) ids.resize(max_toks);
-        std::printf("Tail-CE dump corpus: %zu host tokens (layer=%d, doc_ctx=%d)\n", ids.size(), ce_layer, doc_ctx);
+        std::printf("Tail-CE dump corpus: %zu host tokens (layer=%d, doc_ctx=%d, parse_special=%s)\n",
+                    ids.size(), ce_layer, doc_ctx, parse_special ? "yes" : "no");
 
         sidecar.set_global_scale(0.0f);
         sidecar.enable_tail_ce_dump(dump_ce_path, ce_layer, ce_src_layer);

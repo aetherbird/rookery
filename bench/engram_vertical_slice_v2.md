@@ -292,6 +292,38 @@ Causal addressing parity for `DeepSeek-V4.1-Flash → Ling-3.0-tiny (bailingmoe3
    - **Baseline (`ling3-tiny-base`):** Runs `14.0` (F), `15.0` (F), `18.0` (C) → **`15.67 ± 2.08 / 28` (`56.0%`)**, median `15.0`, avg wall `34.8 min`, `8` timeouts, `3` errors, `0` template leaks.
    - **Engram-Grafted (`ling3-tiny-engram`):** Runs `17.0` (C), `18.0` (C), `15.0` (F) → **`16.67 ± 1.53 / 28` (`59.5%`, `+1.00 pt` mean / `+2.0 pts` median)**, avg wall **`28.2 min` (`-19%`)**, `6` timeouts, `5` errors, `0` template leaks.
    - **Category breakdown (84 attempts each):** `compliance` **`11/15 (73.3%) → 13/15 (86.7%)` (+2)**, `parser` **`6/12 (50.0%) → 7/12 (58.3%)` (+1)**, `precision` **`13/36 (36.1%) → 14/36 (38.9%)` (+1)**, `text-processing` `2/3 → 1/3` (-1), all 6 other categories identical. *(Honest statistical note: at `n=3`, the `+1.00` mean delta sits within ~0.6σ of run-to-run sampling variance; the clearest confirmed result is zero chat/tool/schema regression, 0 template leaks, 19% faster wall time, and a mild positive tilt matching `Ling-3.0-tiny`'s `-0.4%` code PPL gain.)*
+4. **Live Agentic Downstream Evaluation on `Inkling-2-Mini` (`IQ4_NL`, RTX 3090, `-c 65536 -ctk q4_0 -ctv q4_0`):**
+   - **Live Chat Factual QA (`180` prompts, `temp=0`, `enable_thinking=false`):** `FACTUAL-60` `57/60 (95.0%) → 58/60 (96.7%)` (`scale=0.5/1.0`); `FACTUAL-120` `120/120 (100.0%) → 119/120 (99.2%)` @ `1.0`.
+   - **Paired `ling-test v2` (28 tasks, teacher-forced PPL vs. autoregressive loop ablation):**
+     - `BASE`: **`26.0 / 28` (Grade A, `8.7 min`, `0` timeouts, `0` errors)**
+     - `L5 (un-gated) + L23 @ scale=1.0`: `23.0 / 28` (Grade B, `14.5 min`) — despite winning 5/5 teacher-forced PPL suites (`-9.01%` code), un-gated `L5` amplified across 3 loop passes + high `L23` norm (`||d||/||h|| ≈ 0.069`) triggered a 5m `<think>` repetition loop (`lt_think_then_edit`) and a 6-round repeated-tool-call error (`iter_cli_documentation`).
+     - **`L23`-only @ `scale=0.5`** (`||d||/||h|| ≈ 0.034`, Engram active inside `<think>`): **`26.0 / 28` (Grade A, `~8.5 min`, `0` timeouts, `0` errors)** — eliminated the loop regressions cleanly.
+   - **On-Policy Chat + `<think>` + Tool-Use Calibration (`--parse-special`, `r=128`, `kl_beta=1.5`, `shuf_kl_beta=2.5`, `delta_reg=2.5`, `delta_clip=0.08`, `||d||/||h|| = 0.0366`):**
+     - 30K held-out mixed val (including formatted `<|content_thinking|>` + `<|content_invoke_tool_json|>`): **`4.555 → 4.058 (-10.91%)`** vs `SHUF 4.560` (`SHUF − REAL = +0.502`); unseen `EVAL_CODE -6.5% / -7.3%`, `EVAL_TECH -3.4%`, `EVAL_PROSE -2.4%`, `EVAL_FACTUAL_120 2.194 → 2.169` (`SHUF − REAL = +0.003` @1.5).
+     - **Paired `core_v14_local` (37 harder software-engineering tasks):** `BASE` **`38.0 / 47` (Grade B, `32/37 PASS`, `5 ERROR`, `92.7 min`)** vs `ENGRAM chatcal L23 @ 1.0` **`36.8 / 47` (Grade B, `30/37 PASS`, `2 partial FAIL`, `5 ERROR`, `83.9 min` = `-9.5%` wall time, `0` timeouts)** (`iter_async_bounded_map` flipped `ERROR → PASS`; `hard_sql_migration`, `hard_expr_parser_eval`, and `hard_mariana_todo_scope` dropped). *Honest takeaway:* late-layer (`L23`) foreign-host grafting delivers large teacher-forced fluency/calibration improvements with zero loop regressions once KL-disciplined, while remaining roughly neutral on multi-step algorithmic coding tasks.
+
+---
+
+## 11. `engram-z-v3`: $W_V$-Anchored Canonical $Z$ Hub ($N + M$ Zero-Shot Transfer at Scale)
+
+Porting native provider `W_V` pre-decoding + algebraic folding (`W_ex = W_pca @ W_V_norm`) and `logit_softcap=30.0` + KL-disciplined importer fitting into `scripts/engram_z_bridge.py` upgrades the $N + M$ hub to **`engram-z-v3` (`d_z = 1024`)**:
+
+- **Anchor Exporter (`DeepSeek-V4.1-Flash` `6144 → W_V_ds[5120] → Z[1024]`, `5.52s`, zero host model):** retains **`81.0%`** of probe-activation variance in the `5,120`-D post-$W_V$ space (vs. `51.9%` of raw `6,144`-D variance in `v2`).
+- **Provider #2 Exporter (`Qwen3.8-Flash-Next` `2560 → Z[1024]`, `1.99s`, zero host model):** held-out probe alignment cosine rose **`+0.4815 → +0.5024`** (`>16σ` above random in 1,024-D).
+- **One-Time Host Importers (`.rkim`, zero knowledge of `Qwen3.8-Flash-Next`):** `importer_inkling2_l23_z1024_v3.rkim` (`val 6.003 → 5.820`, `||d||/||h|| = 0.0342`, `0%` code / `0%` prose in training) and `importer_ling3tiny_l23_z1024_v3.rkim` (`val 5.717 → 5.625`, `||d||/||h|| = 0.0333`).
+- **Instant `<1s` Algebraic `compose` → Zero-Additional-Overhead `RKAD v3` (`[DISABLED] = +0.000000` everywhere, `0.4%` decode overhead `68.3 vs 68.6 tok/s`):**
+
+| `engram-z-v3` Composed Pair | Unseen Eval Suite | `[BASE]` | `[REAL @ 1.5]` | `[SHUFFLED @ 1.5]` | `SHUF − REAL` | Zero-Shot Retention vs Anchor |
+|---|---|---:|---:|---:|---:|---:|
+| **Anchor `DeepSeek → Z_v3 → Inkling-2-Mini`** | `EVAL_CODE` *(0% code)* | `1.623` (`88.62%`) | **`1.543`** (`-4.9%`, `89.16%`) | `1.630` *(> BASE)* | **`+0.0867`** (3/3) | 100% (anchor) |
+| **Blind Zero-Shot `Qwen3.8 → Z_v3 → Inkling-2-Mini`** | **`EVAL_CODE`** *(0% code)* | `1.623` (`88.62%`) | **`1.553`** (**`-4.30%`**, **`89.06%`**) | `1.626` *(> BASE)* | **`+0.0728`** (3/3) | **`87.8%`** |
+| **Anchor `DeepSeek → Z_v3 → Inkling-2-Mini`** | `EVAL_TECH` *(2K)* | `4.840` (`63.82%`) | **`4.685`** (`-3.2%`, `64.21%`) | `4.834` | **`+0.1491`** (3/3) | 100% (anchor) |
+| **Blind Zero-Shot `Qwen3.8 → Z_v3 → Inkling-2-Mini`** | **`EVAL_TECH`** *(2K)* | `4.840` (`63.82%`) | **`4.717`** (**`-2.52%`**, **`64.01%`**) | `4.838` | **`+0.1210`** (3/3) | **`79.0%`** |
+| **Anchor `DeepSeek → Z_v3 → Inkling-2-Mini`** | `EVAL_PROSE` *(0% prose)* | `2.468` (`78.66%`) | **`2.416`** (`-2.1%`, `78.91%`) | `2.469` *(> BASE)* | **`+0.0537`** (3/3) | 100% (anchor) |
+| **Blind Zero-Shot `Qwen3.8 → Z_v3 → Inkling-2-Mini`** | **`EVAL_PROSE`** *(0% prose)* | `2.468` (`78.66%`) | **`2.424`** (**`-1.78%`**, **`78.81%`**) | `2.474` *(> BASE)* | **`+0.0496`** (3/3) | **`83.1%`** |
+| **Anchor `DeepSeek → Z_v3 → Inkling-2-Mini`** | `EVAL_FACTUAL` *(60 QA)* | `1.860` (`99.2% top5`) | **`1.853`** (`top5 100.0%`) | `1.855` | **`+0.0026`** (3/3) | 100% (anchor) |
+| **Blind Zero-Shot `Qwen3.8 → Z_v3 → Inkling-2-Mini`** | **`EVAL_FACTUAL`** *(60 QA)* | `1.860` (`99.2% top5`) | **`1.851`** (`-0.0096`, **`top5 100.0%`**) | `1.857` | **`+0.0059`** (3/3) | **126% (beat anchor)** |
+| **Blind Zero-Shot `Qwen3.8 → Z_v3 → Ling-3.0-tiny`** | `EVAL_FACTUAL` / `EVAL_CODE` | `1.842` / `2.003` | **`1.828`** (`top5 94.5%`) / `2.003` | `1.834` / `2.004` | **`+0.0069` / `+0.0014`** | *(TECH/PROSE flat)* |
 
 ---
 

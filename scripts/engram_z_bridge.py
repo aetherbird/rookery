@@ -30,6 +30,7 @@ from train_engram_bridge import (
     evaluate as eval_l3,
     load_gguf_tail_head,
     load_maxwell_head,
+    load_provider_engram_kv,
     load_rkce,
     maxwell_head_logits,
 )
@@ -140,7 +141,8 @@ def load_json_npz(path: str, expected_magic: str):
 
 
 def cmd_fit_anchor_exporter(args):
-    """Define canonical Z (engram-z-v1) via whitened top-d_z SVD subspace of the anchor Engram table,
+    """Define canonical Z (engram-z-v1/v2/v3) via whitened top-d_z SVD subspace of the anchor Engram table,
+    optionally pre-decoding through the provider's native engram_kv W_V (and algebraically folding it into W_ex),
     and save both the anchor Exporter (.rkex) and the canonical probe targets Z_probe.npy!
     """
     t0 = time.time()
@@ -149,18 +151,38 @@ def cmd_fit_anchor_exporter(args):
     mu_e = E.mean(axis=0, dtype=np.float64).astype(np.float32)
     Ec = E - mu_e
 
-    # Compute top-d_z principal directions of Ec on GPU via covariance eigendecomposition
     dev = torch.device(args.device if torch.cuda.is_available() else "cpu")
     X = torch.from_numpy(Ec).to(dev, dtype=torch.float32)
+
+    W_V_norm = None
+    kv_name = ""
+    if args.engram_kv_gguf:
+        W_V_raw, _, kv_name = load_provider_engram_kv(
+            args.engram_kv_gguf, info["src_layer"], args.engram_kv_tensor, args.engram_kv_hc, dev
+        )
+        with torch.no_grad():
+            sub = X[:: max(1, N // 16384)]
+            rms_v = math.sqrt(max(F.linear(sub, W_V_raw).pow(2).mean().item(), 1e-12))
+            W_V_norm = W_V_raw / rms_v  # [d_prov, d_eng]
+            X = F.linear(X, W_V_norm)   # [N, d_prov] clean provider semantic space!
+        print(f"[Anchor Exporter] Pre-decoded via {kv_name} ({W_V_norm.shape[0]}x{d_eng}, rms_v={rms_v:.4f})")
+
+    # Compute top-d_z principal directions of X (either raw Ec or W_V_norm(Ec)) on GPU
     cov = (X.t() @ X) / float(N)
     evals, evecs = torch.linalg.eigh(cov)
     idx = torch.argsort(evals, descending=True)[: args.d_z]
     top_vals = torch.clamp(evals[idx], min=1e-6)
-    top_vecs = evecs[:, idx]  # [d_eng, d_z]
+    top_vecs = evecs[:, idx]  # [d_in, d_z]
     var_kept = float(top_vals.sum().item() / torch.clamp(evals, min=0.0).sum().item())
 
-    # Unit-variance whitened canonical basis: Z = Ec @ W_ex^T has Cov(Z) = I_{d_z}
-    W_ex = (top_vecs / torch.sqrt(top_vals).unsqueeze(0)).t().contiguous().cpu().numpy().astype(np.float32)  # [d_z, d_eng]
+    # Unit-variance whitened canonical basis: Z = X @ W_pca^T has Cov(Z) = I_{d_z}
+    W_pca = (top_vecs / torch.sqrt(top_vals).unsqueeze(0)).t().contiguous()  # [d_z, d_in]
+    if W_V_norm is not None:
+        # Algebraically fold W_V_norm directly into W_ex so .rkex remains 100% zero-overhead!
+        W_ex_t = (W_pca @ W_V_norm).contiguous()  # [d_z, d_eng]
+    else:
+        W_ex_t = W_pca
+    W_ex = W_ex_t.cpu().numpy().astype(np.float32)
     Z_probe = (Ec @ W_ex.T).astype(np.float32)
 
     meta = {
@@ -173,13 +195,15 @@ def cmd_fit_anchor_exporter(args):
         "src_engram_layer": info["src_layer"],
         "d_engram": d_eng,
         "is_anchor": True,
+        "kv_folded": bool(W_V_norm is not None),
+        "kv_tensor": kv_name,
         "variance_explained": round(var_kept, 4),
     }
     save_json_npz(args.out, meta, {"mu_e": mu_e, "W_ex": W_ex})
     if args.save_z_probe:
         np.save(args.save_z_probe, Z_probe)
     print(f"[Anchor Exporter] Saved {args.out} (z_space={args.z_space_id}, d_engram={d_eng} -> d_z={args.d_z}, "
-          f"var_kept={100*var_kept:.1f}%, N={N}) in {time.time()-t0:.2f}s")
+          f"kv_folded={bool(W_V_norm is not None)}, var_kept={100*var_kept:.1f}%, N={N}) in {time.time()-t0:.2f}s")
 
 
 def cmd_align_exporter(args):
@@ -302,11 +326,12 @@ def cmd_fit_importer_l3(args):
             zb = F.linear(eb, W_ex_t)
             z_all[i:j] = zb.to(torch.float16).cpu().numpy()
 
-    n_val = max(256, int(N * 0.1))
+    n_val = min(args.max_val, max(256, int(N * 0.1)))
     n_tr = N - n_val
     h_tr, z_tr, y_tr = h_all[:n_tr], z_all[:n_tr], y_all[:n_tr]
     h_va, z_va, y_va = h_all[n_tr:], z_all[n_tr:], y_all[n_tr:]
     zero_mu_z = torch.zeros(d_z, device=device, dtype=torch.float32)
+    logit_softcap = args.logit_softcap if args.logit_softcap >= 0.0 else (30.0 if args.host_arch in ("inkling2_loop", "inkling2") else 0.0)
 
     if args.safetensors_dir:
         head_tensors = load_maxwell_head(args.safetensors_dir, device)
@@ -323,19 +348,20 @@ def cmd_fit_importer_l3(args):
             j = min(sub_n, i + 256)
             hb = torch.from_numpy(h_tr[i:j]).to(device=device, dtype=torch.float32)
             yb = torch.from_numpy(y_tr[i:j]).to(device=device, dtype=torch.long)
-            bl = maxwell_head_logits(hb, hc_fn, hc_scale, hc_base, out_norm, lm_head)
+            bl = maxwell_head_logits(hb, hc_fn, hc_scale, hc_base, out_norm, lm_head, logit_softcap=logit_softcap)
             for ti, tv in enumerate(taus):
                 nll_sums[ti] += F.cross_entropy(bl / tv, yb, reduction="sum").item()
     train_tau = taus[int(np.argmin(nll_sums))]
-    print(f"[Host Importer L3] Canonical Z (d_z={d_z}) -> {args.host_arch} L{meta_ce['target_layer']}, tau*={train_tau:.2f}")
+    print(f"[Host Importer L3] Canonical Z ({ex_meta['z_space_id']}, d_z={d_z}) -> {args.host_arch} L{meta_ce['target_layer']}, "
+          f"tau*={train_tau:.2f}, logit_softcap={logit_softcap:.1f}", flush=True)
 
     bridge = RookeryGatedBridge(d_z, meta_ce["d_host"], meta_ce["hc"], args.rank, args.scale, args.dropout).to(device)
     opt = torch.optim.AdamW(bridge.parameters(), lr=args.lr, weight_decay=2e-2)
     total_steps = args.epochs * ((n_tr + args.batch_size - 1) // args.batch_size)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, total_steps), eta_min=args.lr * 0.05)
 
-    b_nll, b_ppl, b_t1, _, _, _ = eval_l3(bridge, h_va, z_va, y_va, zero_mu_z, head_tensors)
-    print(f"[Epoch 0] val BASE: PPL={b_ppl:.3f} top1={b_t1:.2f}%")
+    b_nll, b_ppl, b_t1, _, _, _ = eval_l3(bridge, h_va, z_va, y_va, zero_mu_z, head_tensors, logit_softcap=logit_softcap)
+    print(f"[Epoch 0] val BASE: PPL={b_ppl:.3f} top1={b_t1:.2f}%", flush=True)
 
     best_score = float("inf")
     best_state = {k: v.detach().cpu().clone() for k, v in bridge.state_dict().items()}
@@ -344,6 +370,8 @@ def cmd_fit_importer_l3(args):
     for ep in range(1, args.epochs + 1):
         bridge.train()
         order = rng.permutation(n_tr)
+        tr_kl_sum = tr_skl_sum = tr_rel_sum = 0.0
+        steps = 0
         for i in range(0, n_tr, args.batch_size):
             idx = order[i : min(n_tr, i + args.batch_size)]
             hb = torch.from_numpy(h_tr[idx]).to(device=device, dtype=torch.float32)
@@ -351,34 +379,41 @@ def cmd_fit_importer_l3(args):
             yb = torch.from_numpy(y_tr[idx]).to(device=device, dtype=torch.long)
 
             with torch.no_grad():
-                base_logits = maxwell_head_logits(hb, hc_fn, hc_scale, hc_base, out_norm, lm_head)
+                base_logits = maxwell_head_logits(hb, hc_fn, hc_scale, hc_base, out_norm, lm_head, logit_softcap=logit_softcap)
                 base_logp = F.log_softmax(base_logits / train_tau, dim=-1)
                 base_p = base_logp.exp()
 
             h_out, rel_norm, _ = bridge(hb, zb, return_stats=True)
-            logp = F.log_softmax(maxwell_head_logits(h_out, hc_fn, hc_scale, hc_base, out_norm, lm_head) / train_tau, dim=-1)
+            logp = F.log_softmax(maxwell_head_logits(h_out, hc_fn, hc_scale, hc_base, out_norm, lm_head, logit_softcap=logit_softcap) / train_tau, dim=-1)
             ce = F.nll_loss(logp, yb)
             kl = (base_p * (base_logp - logp)).sum(dim=-1).mean()
             loss = ce + args.kl_beta * kl + args.delta_reg * (rel_norm ** 2)
 
+            skl_val = 0.0
             if args.shuf_kl_beta > 0.0 and zb.shape[0] > 1:
                 perm = torch.roll(torch.arange(zb.shape[0], device=device), shifts=1)
                 shuf_logp = F.log_softmax(
-                    maxwell_head_logits(bridge(hb, zb[perm]), hc_fn, hc_scale, hc_base, out_norm, lm_head) / train_tau, dim=-1
+                    maxwell_head_logits(bridge(hb, zb[perm]), hc_fn, hc_scale, hc_base, out_norm, lm_head, logit_softcap=logit_softcap) / train_tau, dim=-1
                 )
                 skl = (base_p * (base_logp - shuf_logp)).sum(dim=-1).mean()
                 loss = loss + args.shuf_kl_beta * skl
+                skl_val = skl.item()
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(bridge.parameters(), 1.0)
             opt.step()
             sched.step()
+            tr_kl_sum += kl.item()
+            tr_skl_sum += skl_val
+            tr_rel_sum += rel_norm.item()
+            steps += 1
 
-        _, _, _, r_nll, r_ppl, r_t1 = eval_l3(bridge, h_va, z_va, y_va, zero_mu_z, head_tensors, shuffled=False)
-        _, _, _, s_nll, s_ppl, _ = eval_l3(bridge, h_va, z_va, y_va, zero_mu_z, head_tensors, shuffled=True)
-        print(f"[Epoch {ep:2d}] val REAL: PPL={r_ppl:.3f} (vs base {r_ppl-b_ppl:+.3f}, top1={r_t1:.2f}%) | "
-              f"SHUF: PPL={s_ppl:.3f} (shuf-real={s_ppl-r_ppl:+.3f})")
+        _, _, _, r_nll, r_ppl, r_t1 = eval_l3(bridge, h_va, z_va, y_va, zero_mu_z, head_tensors, shuffled=False, logit_softcap=logit_softcap)
+        _, _, _, s_nll, s_ppl, _ = eval_l3(bridge, h_va, z_va, y_va, zero_mu_z, head_tensors, shuffled=True, logit_softcap=logit_softcap)
+        print(f"[Epoch {ep:2d}] tr_KL={tr_kl_sum/steps:.4f} shuf_KL={tr_skl_sum/steps:.4f} ||d||/||h||={tr_rel_sum/steps:.4f} | "
+              f"val REAL: PPL={r_ppl:.3f} (vs base {r_ppl-b_ppl:+.3f}, top1={r_t1:.2f}%) | "
+              f"SHUF: PPL={s_ppl:.3f} (shuf-real={s_ppl-r_ppl:+.3f})", flush=True)
         if r_nll < s_nll and r_nll < best_score:
             best_score = r_nll
             best_state = {k: v.detach().cpu().clone() for k, v in bridge.state_dict().items()}
@@ -584,10 +619,13 @@ def main():
     p1 = sub.add_parser("fit-anchor-exporter")
     p1.add_argument("--rkpr", required=True)
     p1.add_argument("--hook-idx", type=int, default=0)
-    p1.add_argument("--z-space-id", default="engram-z-v1")
-    p1.add_argument("--d-z", type=int, default=256)
+    p1.add_argument("--z-space-id", default="engram-z-v3")
+    p1.add_argument("--d-z", type=int, default=1024)
     p1.add_argument("--provider-arch", required=True)
     p1.add_argument("--provider-fp", required=True)
+    p1.add_argument("--engram-kv-gguf", default="", help="Optional provider GGUF shard with native blk.<L>.engram_kv.weight (algebraically folded into W_ex)")
+    p1.add_argument("--engram-kv-tensor", default="")
+    p1.add_argument("--engram-kv-hc", type=int, default=4)
     p1.add_argument("--out", required=True)
     p1.add_argument("--save-z-probe", default="")
     p1.add_argument("--device", default="cuda:0")
@@ -637,6 +675,8 @@ def main():
     p4.add_argument("--shuf-kl-beta", type=float, default=1.5)
     p4.add_argument("--delta-reg", type=float, default=1.0)
     p4.add_argument("--dropout", type=float, default=0.25)
+    p4.add_argument("--max-val", type=int, default=40000)
+    p4.add_argument("--logit-softcap", type=float, default=-1.0, help="Optional final logit softcap (default: auto 30.0 for inkling2_loop, 0 otherwise)")
     p4.add_argument("--out", required=True)
     p4.add_argument("--device", default="cuda:0")
     p4.set_defaults(func=cmd_fit_importer_l3)
