@@ -12,6 +12,11 @@
 
 namespace rookery {
 
+inline bool is_ws_char(char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+#ifdef ROOKERY_ENABLE_CUDA
 namespace {
 
 inline void cuda_ok(cudaError_t err, const char * msg) {
@@ -54,11 +59,8 @@ inline uint16_t f32_to_f16_bits(float v) {
     return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp) << 10) | (rounded >> 13));
 }
 
-inline bool is_ws_char(char c) {
-    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
-}
-
 } // namespace
+#endif
 
 // Find the LATEST BPE pre-tokenizer-safe cut offset in [min_cut, max_cut] so encoding text[cut:]
 // produces exact suffix token IDs identical to encoding full text[0:].
@@ -97,7 +99,6 @@ size_t EngramSidecar::find_safe_bpe_cut(const std::string & text, size_t min_cut
     }
     return 0;
 }
-
 EngramAdapterManifest validate_rkad_v3_manifest(
     const std::string & manifest_json,
     const EngramConfig & table_cfg,
@@ -182,6 +183,7 @@ EngramAdapterManifest validate_rkad_v3_manifest(
     return m;
 }
 
+#ifdef ROOKERY_ENABLE_CUDA
 EngramSidecar::~EngramSidecar() {
     close_calibration_dump();
     close_tail_ce_dump();
@@ -1113,5 +1115,14 @@ void EngramSidecar::on_post_layer(int layer_idx, int device, float * d_inpL, int
         prof_.gpu_hook_calls += 1;
     }
 }
+#else
+EngramSidecar::~EngramSidecar() = default;
+void EngramSidecar::init(const std::string &, const BpeTokenizer *, const std::vector<int> &,
+                         int, int, int, const std::string &, float, const std::vector<int> &, const std::string &) {
+    throw std::runtime_error("EngramSidecar requires a CUDA build");
+}
+void EngramSidecar::prepare_step(const std::vector<int32_t> &, int, const EngramRuntimeParams &, int) {}
+void EngramSidecar::on_post_layer(int, int, float *, int, int, int, cudaStream_t) {}
+#endif
 
 } // namespace rookery

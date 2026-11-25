@@ -1,6 +1,6 @@
 # rookery
 
-A pure C++20 + CUDA LLM inference and serving engine built for modern MoE and hybrid linear/sparse-attention architectures on heterogeneous multi-GPU setups (Maxwell `sm_50`/`sm_52`, Pascal `sm_60`/`sm_61`, Volta `sm_70`, and Ampere `sm_86`).
+A pure C++20 + CUDA LLM inference and serving engine built for modern MoE and hybrid linear/sparse-attention architectures on heterogeneous multi-GPU setups (Maxwell `sm_50`/`sm_52`, Pascal `sm_60`/`sm_61`, Volta `sm_70`, and Ampere `sm_86`) as well as standalone x86_64 AVX2/FMA/F16C CPU execution.
 
 `rookery` loads standard GGUF models directly (including sharded multi-file GGUFs) and exposes a drop-in OpenAI-compatible HTTP/SSE server (`rookery-server`) compatible with `llama-swap` and standard OpenAI clients.
 
@@ -13,7 +13,8 @@ A pure C++20 + CUDA LLM inference and serving engine built for modern MoE and hy
 | `inkling2_loop` / `inkling2` | Inkling 2 Mini | Recurrent loop-transformer with SWA FlashAttention (`T >= 8` Tensor Core prefill), `Q8_0` MoE |
 | `qwen35moe` | Qwen3.5 / Qwen3.6-35B-A3B-MTP | Hybrid Gated Delta Net (GDN) + GQA (`d=256`), grouped `__dp4a` MoE, NextN MTP speculative decoding, host-RAM GDN checkpoints |
 | `qwen4exp` | Qwen3.8-Flash-Next | mHC-4 + host-RAM mmap Per-Layer Embedding (PLE) + QSA sparse indexer (`top_k=2048`) + GDN + `Q6_K`/`Q8_0` MoE |
-| `bailingmoe3` | Ling-3.0-tiny / Ling-3.0-Flash / Ling-3.2-Air (incl. REAP-408) | Hybrid KDA linear attention + Gated RoPE-576 MLA (`P_TILE=8` zero-bank-conflict Split-K + Tensor Core FlashMLA), grouped top-k `Q6_K`/`Q8_0` SoA MoE with SwiGLU clamping, NextN MTP speculative decoding, host-RAM KDA checkpoints |
+| `bailingmoe3` | Ling-3.0-tiny / Ling-3.0-Flash / Ling-3.2-Air / Flapling | Hybrid KDA linear attention + Gated RoPE-576 MLA (`P_TILE=8` Split-K + FlashMLA), grouped top-k `Q4_K`/`Q6_K`/`Q8_0` MoE (incl. Maxwell/Pascal optimizations), NextN MTP, host-RAM KDA checkpoints, and standalone CPU backend (`--cpu`) |
+| `gemma4` | Gemma 4 | Per-Layer Embeddings (PLE), Proportional NeoX RoPE, SWA + Shared-KV MQA, GeGLU, logit softcap, SentencePiece-BPE (`▁` + `<0xXX>`) |
 
 Additional engine features:
 - **Heterogeneous multi-GPU pipeline execution:** Automatically discovers GPU topology (`sm_70` + `sm_86`), supports `--tensor-split` / `--gpus`, and converts `BF16` weights to `FP16` on Volta (`sm_70`) while keeping native `BF16` on Ampere (`sm_86`).
@@ -54,21 +55,22 @@ See [bench/baseline.md](bench/baseline.md), [bench/engram_audit_v1.md](bench/eng
 Requirements:
 - CMake >= 3.24
 - C++20 compiler (GCC 12+ / Clang 16+)
-- CUDA Toolkit 12.x (`nvcc`, `cuBLAS`, `cuSOLVER`)
+- CUDA Toolkit 12.x (`nvcc`, `cuBLAS`, `cuSOLVER`) — optional; automatically falls back to CPU-only mode when absent or when `-DROOKERY_CPU_ONLY=ON` is set
 - NVIDIA GPUs with compute capability `>= 5.0` (default build targets `sm_70;sm_86`; override with `-DCMAKE_CUDA_ARCHITECTURES="50;52;60;61"` for Maxwell/Pascal)
 
 ```bash
+# GPU + CPU build (default CUDA archs: "70;86"):
 cmake -B build -DCMAKE_BUILD_TYPE=Release
-# Override target CUDA architectures if needed (default: "70;86"):
-# cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="80;86;89"
+# CPU-only build (no CUDA toolkit required):
+# cmake -B build -DCMAKE_BUILD_TYPE=Release -DROOKERY_CPU_ONLY=ON
 cmake --build build -j$(nproc)
 ```
 
 This builds:
-- `build/rookery-server` — OpenAI-compatible inference server
-- `build/rookery-fit-adapter` — GPU Ridge adapter fitter for cross-model Engram grafting
-- `build/rookery_unit_test` — Chat template, tokenizer, and tool-parser unit tests
-- `build/rookery_{maxwell,glm5,inkling2,qwen35,qwen4exp,bailingmoe3,engram}_test` — Model parity & benchmark binaries
+- `build/rookery-server` — OpenAI-compatible inference server (GPU and `--cpu` modes)
+- `build/rookery-fit-adapter` — GPU Ridge adapter fitter for cross-model Engram grafting *(CUDA builds)*
+- `build/rookery_unit_test` — Chat template, tokenizer, RKAD v3 manifest, and Engram sequence-state unit tests
+- `build/rookery_{maxwell,glm5,inkling2,qwen35,qwen4exp,bailingmoe3,gemma4,engram}_test` — Model parity & benchmark binaries
 
 ## Usage
 
@@ -91,6 +93,7 @@ Common flags:
 - `--alias <name>` — Model ID reported by `/v1/models`
 - `-c, --ctx-size <n>` — Maximum context length (default `32768`)
 - `--gpus <0,1,...>` / `-ts, --tensor-split <w0,w1,...>` — Explicit GPU selection and layer split weights
+- `--cpu` / `-t, --threads <n>` — Run on the CPU backend (`bailingmoe3`, AVX2/FMA/F16C) with explicit worker thread count
 - `-ctk, --cache-type-k <q8_0|q4_0|f16>` / `-ctv, --cache-type-v <q8_0|q4_0|f16>` — KV cache quantization (default `q8_0`; `q4_0` cuts KV + MSA indexer cache VRAM ~2×–3.5× for `128K–256K` contexts on 22 GB VRAM setups)
 - `--mtp` / `--no-mtp` — Enable/disable NextN Multi-Token Prediction speculative decoding (default on when present)
 - `--temp`, `--top-p`, `--top-k` — Default sampling parameters
@@ -100,7 +103,7 @@ Common flags:
 
 ### Cross-Model Engram Sidecar (End-to-End)
 
-`rookery` supports zero-VRAM host-RAM `mmap` Engram/PLE grafting across decoupled providers (`deepseek41`, `qwen4exp`, `hy_v4_flash`, `unigram_ple`) and all 6 host model architectures (`maxwell-moe`, `qwen35moe`, `glm5_next`, `qwen4exp`, `inkling2_loop`, `bailingmoe3`) using strict self-describing `RKAD v3` manifests (`provider_fingerprint`, host architecture/layer/stream contract checks), per-token special-token masking (`token_type` 3/4 → exact `0.0` delta inside CUDA Graphs), an incremental boundary-anchored BPE commit cache (`100.00%` causal parity, `~7.9 µs/tok`), and sub-1% warm-RAM decode overhead (`+0.90%` decode / `+0.49%` prefill on `DeepSeek-V4.1-Flash` 103 GiB → `Maxwell-V1-Flash`).
+`rookery` supports zero-VRAM host-RAM `mmap` Engram/PLE grafting across 4 provider tiers (`DeepSeek-V4.1-Flash` 103 GiB, `Qwen3.8-Flash-Next` 50.66 GiB, `flapling-22b` 8B FP8 7.63 GiB, and `Gemma-4-E4B` 16L `UNIGRAM_PLE` FP8 1.00 GiB) and all hooked host architectures (`maxwell-moe`, `qwen35moe`, `glm5_next`, `qwen4exp`, `inkling2_loop`, `bailingmoe3`, `gemma4`) using strict self-describing `RKAD v3` manifests (`provider_fingerprint`, host architecture/layer/stream contract checks), per-token special-token masking (`token_type` 3/4 → exact `0.0` delta inside CUDA Graphs), dedicated non-blocking H2D streams, a bounded boundary-anchored BPE commit cache (`100.00%` causal parity, `~7.9 µs/tok`), and sub-1% warm-RAM decode overhead (`0.4%–0.9%`).
 
 ```bash
 # 1. Inspect a provider table, host GGUF, or .rkad adapter
@@ -108,7 +111,12 @@ python3 scripts/engram_pipeline.py inspect \
   --engram /path/to/DeepSeek-V4.1-Flash-00005-of-00005.gguf \
   --model /path/to/host-model.gguf
 
-# 2. End-to-end automated pipeline:
+# 2. Pack compact FP8 / UNIGRAM_PLE provider tables (optional)
+python3 scripts/pack_engram_table.py gemma4-ple \
+  --gemma4-gguf /path/to/gemma-4-e4b.gguf \
+  --out /path/to/gemma4_e4b_ple_fp8.gguf
+
+# 3. End-to-end automated pipeline:
 #    inspect -> 100% addressing gate -> dump -> RKAD v3 calibrate/train -> 4-way quality gate -> register .json card
 python3 scripts/engram_pipeline.py build \
   --model /path/to/host-model.gguf \
@@ -121,14 +129,14 @@ python3 scripts/engram_pipeline.py build \
 
 # (For Level-3 temp-calibrated contrastive gated training with native provider W_V/W_K pre-decoding & algebraic folding into zero-overhead RKAD v3, pass --mode level3 --engram-kv-gguf /path/to/provider-kv-shard.gguf --max-tokens 200000 --base-scale 0.05)
 
-# 3. Optional N + M canonical Z composition (`engram-z-v1`, zero extra runtime overhead):
+# 4. N + M canonical Z composition (`engram-z-v3`, zero extra runtime overhead):
 #    Fit provider exporters (.rkex) and host importers (.rkim) independently, then fold any pair into RKAD v3
 python3 scripts/engram_z_bridge.py compose \
   --exporter /path/to/exporter_provider.rkex \
   --importer /path/to/importer_host.rkim \
   --out /path/to/composed_zeroshot_v3.rkad
 
-# 4. Serve with strict RKAD v3 contract validation & zero-recapture per-request runtime controls
+# 5. Serve with strict RKAD v3 contract validation & zero-recapture per-request runtime controls
 ./build/rookery-server -m /path/to/host-model.gguf --gpus 0,1 -ts 20,28 \
   --engram /path/to/engram-table.gguf \
   --engram-adapter /path/to/adapter_v3.rkad \
@@ -152,14 +160,15 @@ python3 tests/test_server_e2e.py --url http://127.0.0.1:8080 --model my-model --
 
 ## Project Layout
 
-- `src/core/` — CUDA device topology discovery, memory helpers, and core types
+- `src/core/` — CUDA/CPU topology discovery, memory helpers, and core types
+- `src/cpu/` — Modular CPU backend (hybrid spin-park thread pool, AVX2/FMA/F16C quantized GEMV/SGEMM kernels, and `bailingmoe3` CPU engine)
 - `src/gguf/` — Zero-dependency GGUF v2/v3 parser, multi-shard reader, and SoA weight loader
-- `src/kernels/` — Custom CUDA kernels (`Q8_0`/`K-quant`/`IQ` GEMV, grouped `__dp4a` MoE, FlashAttention, GDN/KDA, MLA, mHC Sinkhorn, QSA/MSA sparse attention)
+- `src/kernels/` — Custom CUDA kernels (`Q8_0`/`K-quant`/`IQ` GEMV, grouped `__dp4a` MoE, FlashAttention, GDN/KDA, MLA, mHC Sinkhorn, QSA/MSA sparse attention, Gemma 4 PLE/SWA)
 - `src/models/` — Model forward/decode/MTP/checkpoint implementations
-- `src/tokenizer/` — Exact BPE tokenizer with Llama3/Qwen3/GLM/Maxwell pre-tokenization
+- `src/tokenizer/` — Exact BPE & SentencePiece-BPE tokenizer (`Llama3`/`Qwen3`/`GLM`/`Maxwell`/`Gemma4`)
 - `src/server/` — Chat templates and XML/JSON tool-call & reasoning parsers
 - `src/engram/` — Cross-model host-RAM Engram sidecar and CUDA injection kernels
-- `tools/` & `scripts/` — Engram adapter fitting tools
+- `tools/` & `scripts/` — Engram table packing, canonical `engram-z-v3` fitting/composition, and evaluation tools
 - `tests/` — Unit, forward parity, and end-to-end HTTP acceptance tests
 - `bench/` — Reproducible benchmarks and Engram audit reports
 

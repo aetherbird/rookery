@@ -4135,6 +4135,12 @@ void launch_linear_kquant(
         if (try_launch_linear_kquant_prefill_sm60_f16(cublas, W, d_x, d_y, T, d_scratch, scratch_bytes, stream)) {
             return;
         }
+        if (try_launch_linear_q6k_soa_prefill_sm60_f16(cublas, W, d_x, d_y, T, d_scratch, scratch_bytes, stream)) {
+            return;
+        }
+        if (try_launch_linear_kquant_prefill_sm61_dp4a(W, d_x, d_y, T, d_scratch, scratch_bytes, stream)) {
+            return;
+        }
         const bool use_tc = device_has_tensor_cores(W.device);
         if (use_tc && align_x + static_cast<size_t>(K) * sizeof(__half) <= scratch_bytes) {
             switch (W.dtype) {
@@ -4221,6 +4227,14 @@ void launch_moe_ffn_kquant_with_shared(
     int T, int k_used, float clamp_exp, float clamp_shexp, cudaStream_t stream) {
 
     if (try_launch_moe_q3k_q4k_fast(
+            cublas, gate_exps, up_exps, down_exps,
+            gate_shexp, up_shexp, down_shexp,
+            d_x, d_top_ids, d_top_w, d_out, d_scratch, scratch_bytes,
+            T, k_used, clamp_exp, clamp_shexp, stream)) {
+        return;
+    }
+
+    if (try_launch_moe_q4k_q6k_pascal(
             cublas, gate_exps, up_exps, down_exps,
             gate_shexp, up_shexp, down_shexp,
             d_x, d_top_ids, d_top_w, d_out, d_scratch, scratch_bytes,

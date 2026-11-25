@@ -788,4 +788,70 @@ bool try_launch_moe_q3k_q4k_fast(
     float * d_out, void * d_scratch, size_t scratch_bytes,
     int T, int k_used, float clamp_exp, float clamp_shexp, cudaStream_t stream);
 
+bool try_launch_linear_q6k_soa_prefill_sm60_f16(
+    cublasHandle_t cublas, const DeviceTensor & W,
+    const float * d_x, float * d_y, int T,
+    void * d_scratch, size_t scratch_bytes, cudaStream_t stream);
+
+bool try_launch_linear_kquant_prefill_sm61_dp4a(
+    const DeviceTensor & W, const float * d_x, float * d_y, int T,
+    void * d_scratch, size_t scratch_bytes, cudaStream_t stream);
+
+bool try_launch_moe_q4k_q6k_pascal(
+    cublasHandle_t cublas,
+    const DeviceTensor & gate_exps, const DeviceTensor & up_exps, const DeviceTensor & down_exps,
+    const DeviceTensor & gate_shexp, const DeviceTensor & up_shexp, const DeviceTensor & down_shexp,
+    const float * d_x, const int32_t * d_top_ids, const float * d_top_w,
+    float * d_out, void * d_scratch, size_t scratch_bytes,
+    int T, int k_used, float clamp_exp, float clamp_shexp, cudaStream_t stream);
+
+// --- Gemma 4 (PLE, Proportional NeoX RoPE, SWA + Shared-KV MQA, GeGLU, Softcap) ---
+void launch_gemma4_scale(float * d_x, int64_t n, float scale, cudaStream_t stream);
+void launch_gemma4_scale_dev(float * d_x, const float * d_scale, int64_t n, cudaStream_t stream);
+
+void launch_gemma4_ple_combine(
+    const float * d_proj, const float * d_raw_ple, const float * d_proj_norm_w,
+    float * d_ple_out, int T, int n_layers, int n_embd, int ple_dim,
+    float rms_eps, cudaStream_t stream);
+
+void launch_gemma4_geglu(const float * d_gate, const float * d_up, float * d_out, int64_t n, cudaStream_t stream);
+
+void launch_gemma4_ple_gate_gelu_mul(
+    float * d_gate, const float * d_ple,
+    int T, int n_layers, int il, int ple_dim, int ple_tok_off, cudaStream_t stream);
+
+void launch_gemma4_ple_f16_t1(
+    const void * d_w_gate_f16, const void * d_w_proj_f16,
+    const float * d_x, const float * d_ple,
+    float * d_gate_tmp, float * d_out,
+    int H, int ple_dim, int n_layers, int il, int ple_tok_off, cudaStream_t stream);
+
+void launch_gemma4_post_norm_add_scale(
+    const float * d_res, const float * d_sub, const float * d_norm_w,
+    const float * d_layer_scale, float * d_out,
+    int dim, int n_rows, float eps, cudaStream_t stream);
+
+void launch_gemma4_logit_softcap(float * d_logits, int64_t n, float cap, cudaStream_t stream);
+
+void launch_gemma4_qkv_norm_rope_kv_write(
+    float * d_q, float * d_k, const float * d_v,
+    const float * d_q_norm_w, const float * d_k_norm_w, const float * d_rope_freqs,
+    void * d_k_cache, void * d_v_cache, bool kv_q8_0,
+    const int32_t * d_pos, int T, int n_head, int n_kv,
+    int head_dim, int rope_dim, int max_ctx, float rms_eps, float freq_base,
+    bool has_kv, cudaStream_t stream);
+
+void launch_gemma4_attn(
+    cublasHandle_t cublas,
+    const float * d_q, const void * d_k_cache, const void * d_v_cache, bool kv_q8_0,
+    const int32_t * d_pos, float * d_out,
+    void * d_scratch, size_t scratch_bytes,
+    int T, int n_head, int n_kv, int head_dim, int max_ctx,
+    int swa_window, int pos_min, int pos_max, cudaStream_t stream);
+
+bool try_launch_gemma4_linear_sm60_f16(
+    cublasHandle_t cublas, const DeviceTensor & W,
+    const float * d_x, float * d_y, int T,
+    void * d_scratch, size_t scratch_bytes, cudaStream_t stream);
+
 } // namespace rookery

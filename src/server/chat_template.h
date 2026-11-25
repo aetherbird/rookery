@@ -809,4 +809,77 @@ inline std::string render_bailing3_chat_prompt(const json & messages,
     return out;
 }
 
+// Renders OpenAI chat messages into Gemma 4 turn format (<|turn>role\n...<turn|>\n).
+inline std::string render_gemma4_chat_prompt(const json & messages, bool enable_thinking = true) {
+    auto extract_text = [](const json & c) -> std::string {
+        if (c.is_string()) return c.get<std::string>();
+        if (c.is_array()) {
+            std::string s;
+            for (const auto & item : c) {
+                if (item.is_object() && item.value("type", "") == "text") s += item.value("text", "");
+            }
+            return s;
+        }
+        return "";
+    };
+
+    std::string out;
+    bool has_sys = false;
+    for (const auto & m : messages) {
+        if (m.value("role", "") == "system" || m.value("role", "") == "developer") {
+            has_sys = true;
+            break;
+        }
+    }
+    if (enable_thinking && !has_sys) {
+        out += "<|turn>system\n<|think|>\n<turn|>\n";
+    }
+    for (const auto & m : messages) {
+        const std::string role = m.value("role", "");
+        const std::string txt  = m.contains("content") ? extract_text(m["content"]) : "";
+        if (role == "system" || role == "developer") {
+            out += "<|turn>system\n";
+            if (enable_thinking && txt.find("<|think|>") == std::string::npos) out += "<|think|>\n";
+            out += txt + "<turn|>\n";
+        } else if (role == "user") {
+            out += "<|turn>user\n" + txt + "<turn|>\n";
+        } else if (role == "assistant") {
+            out += "<|turn>model\n" + txt + "<turn|>\n";
+        }
+    }
+    out += "<|turn>model\n";
+    if (enable_thinking) {
+        out += "<|channel>thought\n";
+    }
+    return out;
+}
+
+inline ParsedAssistantResponse parse_gemma4_output(const std::string & raw, bool started_in_think = true) {
+    ParsedAssistantResponse res;
+    std::string rest = raw;
+    static const std::string kStartCh = "<|channel>thought\n";
+    static const std::string kEndCh   = "<channel|>";
+    bool in_think = started_in_think;
+    if (!in_think && rest.compare(0, kStartCh.size(), kStartCh) == 0) {
+        rest.erase(0, kStartCh.size());
+        in_think = true;
+    }
+    if (in_think) {
+        size_t pos = rest.find(kEndCh);
+        if (pos != std::string::npos) {
+            res.reasoning_content = rest.substr(0, pos);
+            while (!res.reasoning_content.empty() && (res.reasoning_content.back() == '\n' || res.reasoning_content.back() == ' ')) {
+                res.reasoning_content.pop_back();
+            }
+            rest = rest.substr(pos + kEndCh.size());
+            while (!rest.empty() && rest.front() == '\n') rest.erase(rest.begin());
+        } else {
+            res.reasoning_content = rest;
+            return res;
+        }
+    }
+    res.content = rest;
+    return res;
+}
+
 } // namespace rookery

@@ -1,10 +1,27 @@
 #pragma once
 
 #include "engram/engram_table.h"
-#include "models/maxwell_moe.h"
 #include "tokenizer/bpe.h"
 
+#ifdef ROOKERY_ENABLE_CUDA
+#include "models/maxwell_moe.h"
 #include <cuda_runtime.h>
+#else
+using cudaStream_t = void *;
+using cudaEvent_t  = void *;
+namespace rookery {
+struct LayerHook {
+    virtual ~LayerHook() = default;
+    virtual bool hooks_layer(int /*layer_idx*/) const { return true; }
+    virtual void on_post_layer(int layer_idx, int device, float * d_inpL, int n_tokens, int n_embd, int hc, cudaStream_t stream) = 0;
+};
+struct MtpStats {
+    int steps    = 0;
+    int accepted = 0;
+    int emitted  = 0;
+};
+} // namespace rookery
+#endif
 #include <cstdint>
 #include <cstdio>
 #include <string>

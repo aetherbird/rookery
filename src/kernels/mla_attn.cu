@@ -1841,6 +1841,115 @@ __global__ void mla_head_sigmoid_gate_kernel(
     o[(static_cast<size_t>(t) * n_heads + h) * head_dim + d] *= g;
 }
 
+__global__ void mla_f16_to_f32_bulk_kernel(
+    const __half * __restrict__ src, float * __restrict__ dst, int64_t n) {
+    const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __half2float(__ldg(&src[i]));
+}
+
+__global__ void transpose_htd_to_thd_f16_to_f32_kernel(
+    const __half * __restrict__ src, float * __restrict__ dst, int T, int n_heads, int D) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int tot = T * n_heads * D;
+    if (idx >= tot) return;
+    const int d   = idx % D;
+    const int rem = idx / D;
+    const int h   = rem % n_heads;
+    const int t   = rem / n_heads;
+    dst[idx] = __half2float(__ldg(&src[(static_cast<size_t>(h) * T + t) * D + d]));
+}
+
+__global__ void mla_flash_online_softmax_rescale_f16_kernel(
+    const __half *  __restrict__ s_tile, // [M, kc] FP16
+    __half *        __restrict__ p_tile, // [M, kc] FP16
+    const int32_t * __restrict__ pos,    // [T]
+    float *         __restrict__ m_buf,  // [M]
+    float *         __restrict__ l_buf,  // [M]
+    float *         __restrict__ d_out,  // [M, 512]
+    int n_heads, int k0, int kc) {
+
+    const int r    = blockIdx.x;
+    const int t    = r / n_heads;
+    const int maxp = pos[t];
+    const int tid  = threadIdx.x; // 0..127
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+
+    const __half * s_row = s_tile + static_cast<size_t>(r) * kc;
+    __half *       p_row = p_tile + static_cast<size_t>(r) * kc;
+
+    if (k0 > maxp) {
+        const __half hz = __float2half_rn(0.0f);
+        for (int c = tid; c < kc; c += blockDim.x) p_row[c] = hz;
+        return;
+    }
+
+    const int valid_c = (k0 + kc - 1 <= maxp) ? kc : (maxp - k0 + 1);
+
+    float local_m = -FLT_MAX;
+    for (int c = tid; c < valid_c; c += blockDim.x) {
+        local_m = fmaxf(local_m, __half2float(s_row[c]));
+    }
+    local_m = warp_max(local_m);
+    __shared__ float s_red[4];
+    if (lane == 0) s_red[warp] = local_m;
+    __syncthreads();
+    if (warp == 0) {
+        float v = (lane < 4) ? s_red[lane] : -FLT_MAX;
+        v = warp_max(v);
+        if (lane == 0) s_red[0] = v;
+    }
+    __syncthreads();
+    const float m_tile = s_red[0];
+
+    const float m_old = m_buf[r];
+    const float m_new = fmaxf(m_old, m_tile);
+    const float alpha = (m_old == -FLT_MAX) ? 0.0f : expf(m_old - m_new);
+
+    float local_l = 0.0f;
+    const __half hz = __float2half_rn(0.0f);
+    for (int c = tid; c < kc; c += blockDim.x) {
+        if (c < valid_c) {
+            const float e = expf(__half2float(s_row[c]) - m_new);
+            p_row[c] = __float2half_rn(e);
+            local_l += e;
+        } else {
+            p_row[c] = hz;
+        }
+    }
+    local_l = warp_sum(local_l);
+    if (lane == 0) s_red[warp] = local_l;
+    __syncthreads();
+    if (warp == 0) {
+        float v = (lane < 4) ? s_red[lane] : 0.0f;
+        v = warp_sum(v);
+        if (lane == 0) {
+            m_buf[r] = m_new;
+            l_buf[r] = l_buf[r] * alpha + v;
+        }
+    }
+
+    auto * o4 = reinterpret_cast<float4 *>(d_out + static_cast<size_t>(r) * 512);
+    if (alpha == 0.0f) {
+        o4[tid] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    } else if (alpha != 1.0f) {
+        float4 v = o4[tid];
+        o4[tid] = make_float4(v.x * alpha, v.y * alpha, v.z * alpha, v.w * alpha);
+    }
+}
+
+__global__ void mla_flash_add_f16_to_f32_kernel(
+    const __half * __restrict__ src, float * __restrict__ dst, int M) {
+    const int r   = blockIdx.x;
+    const int tid = threadIdx.x; // 0..127 -> 512 elems via float4 / uint2!
+    const uint2 h4 = reinterpret_cast<const uint2 *>(src + static_cast<size_t>(r) * 512)[tid];
+    const float2 f0 = __half22float2(*reinterpret_cast<const __half2 *>(&h4.x));
+    const float2 f1 = __half22float2(*reinterpret_cast<const __half2 *>(&h4.y));
+    auto * o4 = reinterpret_cast<float4 *>(dst + static_cast<size_t>(r) * 512);
+    float4 cur = o4[tid];
+    o4[tid] = make_float4(cur.x + f0.x, cur.y + f0.y, cur.z + f1.x, cur.w + f1.y);
+}
+
 } // namespace
 
 void launch_mla_rope_split_q(
@@ -1879,7 +1988,10 @@ void launch_batched_head_proj_f16(
 
     if (T >= 8 && cublas != nullptr && d_scratch != nullptr) {
         auto align256 = [](size_t n) { return (n + 255) & ~size_t(255); };
-        if (device_has_tensor_cores(-1)) {
+        const bool use_tc = device_has_tensor_cores(W.device);
+        const bool use_h2 = !use_tc && device_has_fast_fp16(W.device);
+
+        if (use_tc) {
             const size_t x_bytes = align256(static_cast<size_t>(n_heads) * T * K * sizeof(__half));
             const size_t y_bytes = align256(static_cast<size_t>(n_heads) * T * M * sizeof(float));
             if (x_bytes + y_bytes <= scratch_bytes) {
@@ -1908,6 +2020,70 @@ void launch_batched_head_proj_f16(
                 transpose_htd_to_thd_f32_kernel<<<(tot_y + 255) / 256, 256, 0, stream>>>(d_yh, d_y, T, n_heads, M);
                 return;
             }
+        } else if (use_h2) {
+            // Pascal sm_60 (native 2:1 FP16 cublasHgemmStridedBatched)
+            const size_t x_bytes = align256(static_cast<size_t>(n_heads) * T * K * sizeof(__half));
+            const size_t y_bytes = align256(static_cast<size_t>(n_heads) * T * M * sizeof(__half));
+            if (x_bytes + y_bytes <= scratch_bytes) {
+                auto * base  = static_cast<uint8_t *>(d_scratch);
+                auto * d_x16 = reinterpret_cast<__half *>(base);
+                auto * d_y16 = reinterpret_cast<__half *>(base + x_bytes);
+
+                const int tot_x = T * n_heads * K;
+                transpose_thd_to_htd_kernel<__half><<<(tot_x + 255) / 256, 256, 0, stream>>>(d_x, d_x16, T, n_heads, K);
+
+                const __half h_one = __float2half_rn(1.0f), h_zero = __float2half_rn(0.0f);
+                cublasSetStream(cublas, stream);
+                cublasHgemmStridedBatched(
+                    cublas,
+                    CUBLAS_OP_T, CUBLAS_OP_N,
+                    M, T, K,
+                    &h_one,
+                    static_cast<const __half *>(W.ptr), K, static_cast<long long>(M) * K,
+                    d_x16, K, static_cast<long long>(T) * K,
+                    &h_zero,
+                    d_y16, M, static_cast<long long>(T) * M,
+                    n_heads);
+
+                const int tot_y = T * n_heads * M;
+                transpose_htd_to_thd_f16_to_f32_kernel<<<(tot_y + 255) / 256, 256, 0, stream>>>(d_y16, d_y, T, n_heads, M);
+                return;
+            }
+        } else {
+            // Maxwell sm_50/52 & Pascal sm_61 (no fast FP16): FP32 cublasSgemmStridedBatched
+            const size_t w_bytes = align256(static_cast<size_t>(n_heads) * M * K * sizeof(float));
+            const size_t x_bytes = align256(static_cast<size_t>(n_heads) * T * K * sizeof(float));
+            const size_t y_bytes = align256(static_cast<size_t>(n_heads) * T * M * sizeof(float));
+            if (w_bytes + x_bytes + y_bytes <= scratch_bytes) {
+                auto * base  = static_cast<uint8_t *>(d_scratch);
+                auto * d_w32 = reinterpret_cast<float *>(base);
+                auto * d_x32 = reinterpret_cast<float *>(base + w_bytes);
+                auto * d_yh  = reinterpret_cast<float *>(base + w_bytes + x_bytes);
+
+                const int64_t nw = static_cast<int64_t>(n_heads) * M * K;
+                mla_f16_to_f32_bulk_kernel<<<(nw + 255) / 256, 256, 0, stream>>>(
+                    static_cast<const __half *>(W.ptr), d_w32, nw);
+
+                const int tot_x = T * n_heads * K;
+                transpose_thd_to_htd_kernel<float><<<(tot_x + 255) / 256, 256, 0, stream>>>(d_x, d_x32, T, n_heads, K);
+
+                const float alpha = 1.0f, beta = 0.0f;
+                cublasSetStream(cublas, stream);
+                cublasSgemmStridedBatched(
+                    cublas,
+                    CUBLAS_OP_T, CUBLAS_OP_N,
+                    M, T, K,
+                    &alpha,
+                    d_w32, K, static_cast<long long>(M) * K,
+                    d_x32, K, static_cast<long long>(T) * K,
+                    &beta,
+                    d_yh,  M, static_cast<long long>(T) * M,
+                    n_heads);
+
+                const int tot_y = T * n_heads * M;
+                transpose_htd_to_thd_f32_kernel<<<(tot_y + 255) / 256, 256, 0, stream>>>(d_yh, d_y, T, n_heads, M);
+                return;
+            }
         }
     }
 
@@ -1923,139 +2099,288 @@ void launch_mla_attn_d576_v512(
     int T, int n_heads, float scale, cudaStream_t stream,
     cublasHandle_t cublas, size_t scratch_bytes, int kv_len_max) {
 
-    // Fast Tiled FlashMLA Prefill (T >= 8): FP16 Tensor Core with large K_TILE (up to 2048 -> 4x less O DRAM!)
-    if (T >= 8 && cublas != nullptr && kv_len_max > 0 && device_has_tensor_cores(-1)) {
+    // Fast Tiled FlashMLA Prefill (T >= 8):
+    //   - sm_70+: FP16 Tensor Core (cublasGemmEx)
+    //   - sm_60:  Native 2:1 FP16 (cublasHgemm + FP32 online softmax accumulator)
+    //   - sm_50/52/61: FP32 SGEMM (cublasSgemm)
+    if (T >= 8 && cublas != nullptr && kv_len_max > 0) {
         auto align256 = [](size_t n) { return (n + 255) & ~size_t(255); };
+        const bool use_tc = device_has_tensor_cores(-1);
+        const bool use_h2 = !use_tc && device_has_fast_fp16(-1);
         const int K_TILE = (kv_len_max > 2048) ? 2048 : ((kv_len_max > 512) ? 1024 : 512);
-        // Pick largest t_slice <= T whose scratch (q16 + k16 + s32 + p16 + m + l) fits in scratch_bytes!
-        const size_t k16_b = align256(static_cast<size_t>(K_TILE) * 576 * sizeof(__half));
-        const size_t per_m = 576 * sizeof(__half) + static_cast<size_t>(K_TILE) * (sizeof(float) + sizeof(__half)) + 2 * sizeof(float);
-        int max_m = (scratch_bytes > k16_b + 4096) ? static_cast<int>((scratch_bytes - k16_b - 4096) / per_m) : 0;
-        int t_slice = std::min(T, std::max(0, max_m / n_heads));
-        if (t_slice >= 8) {
-            const float one = 1.0f, zero = 0.0f;
-            cublasSetStream(cublas, stream);
-            for (int t0 = 0; t0 < T; t0 += t_slice) {
-                const int tc = std::min(t_slice, T - t0);
-                const int M  = tc * n_heads;
-                const size_t q16_b = align256(static_cast<size_t>(M) * 576 * sizeof(__half));
-                const size_t s32_b = align256(static_cast<size_t>(M) * K_TILE * sizeof(float));
-                const size_t p16_b = align256(static_cast<size_t>(M) * K_TILE * sizeof(__half));
-                const size_t ml_b  = align256(static_cast<size_t>(M) * sizeof(float));
 
-                auto * base = static_cast<uint8_t *>(d_scratch);
-                size_t off = 0;
-                auto * d_q16 = reinterpret_cast<__half *>(base + off); off += q16_b;
-                auto * d_k16 = reinterpret_cast<__half *>(base + off); off += k16_b;
-                auto * d_s32 = reinterpret_cast<float  *>(base + off); off += s32_b;
-                auto * d_p16 = reinterpret_cast<__half *>(base + off); off += p16_b;
-                auto * d_m   = reinterpret_cast<float  *>(base + off); off += ml_b;
-                auto * d_l   = reinterpret_cast<float  *>(base + off);
+        if (use_tc) {
+            const size_t k16_b = align256(static_cast<size_t>(K_TILE) * 576 * sizeof(__half));
+            const size_t per_m = 576 * sizeof(__half) + static_cast<size_t>(K_TILE) * (sizeof(float) + sizeof(__half)) + 2 * sizeof(float);
+            int max_m = (scratch_bytes > k16_b + 4096) ? static_cast<int>((scratch_bytes - k16_b - 4096) / per_m) : 0;
+            int t_slice = std::min(T, std::max(0, max_m / n_heads));
+            if (t_slice >= 8) {
+                const float one = 1.0f, zero = 0.0f;
+                cublasSetStream(cublas, stream);
+                for (int t0 = 0; t0 < T; t0 += t_slice) {
+                    const int tc = std::min(t_slice, T - t0);
+                    const int M  = tc * n_heads;
+                    const size_t q16_b = align256(static_cast<size_t>(M) * 576 * sizeof(__half));
+                    const size_t s32_b = align256(static_cast<size_t>(M) * K_TILE * sizeof(float));
+                    const size_t p16_b = align256(static_cast<size_t>(M) * K_TILE * sizeof(__half));
+                    const size_t ml_b  = align256(static_cast<size_t>(M) * sizeof(float));
 
-                const float * q_ptr = d_q576 + static_cast<size_t>(t0) * n_heads * 576;
-                float *       o_ptr = d_out  + static_cast<size_t>(t0) * n_heads * 512;
-                const int32_t * p_ptr = d_pos + t0;
+                    auto * base = static_cast<uint8_t *>(d_scratch);
+                    size_t off = 0;
+                    auto * d_q16 = reinterpret_cast<__half *>(base + off); off += q16_b;
+                    auto * d_k16 = reinterpret_cast<__half *>(base + off); off += k16_b;
+                    auto * d_s32 = reinterpret_cast<float  *>(base + off); off += s32_b;
+                    auto * d_p16 = reinterpret_cast<__half *>(base + off); off += p16_b;
+                    auto * d_m   = reinterpret_cast<float  *>(base + off); off += ml_b;
+                    auto * d_l   = reinterpret_cast<float  *>(base + off);
 
-                const int64_t nq = static_cast<int64_t>(M) * 576;
-                mla_scale_cast_kernel<__half><<<(nq + 255) / 256, 256, 0, stream>>>(q_ptr, d_q16, nq, scale);
-                mla_init_flash_state_kernel<<<(M + 255) / 256, 256, 0, stream>>>(d_m, d_l, M);
+                    const float * q_ptr = d_q576 + static_cast<size_t>(t0) * n_heads * 576;
+                    float *       o_ptr = d_out  + static_cast<size_t>(t0) * n_heads * 512;
+                    const int32_t * p_ptr = d_pos + t0;
 
-                for (int k0 = 0; k0 < kv_len_max; k0 += K_TILE) {
-                    const int kc = (k0 + K_TILE < kv_len_max) ? K_TILE : (kv_len_max - k0);
-                    if (kv_is_q8_0) {
-                        mla_dequant_kv576_tile_kernel<true, __half><<<kc, 256, 0, stream>>>(d_kv_cache, d_k16, k0, kc);
-                    } else {
-                        mla_dequant_kv576_tile_kernel<false, __half><<<kc, 256, 0, stream>>>(d_kv_cache, d_k16, k0, kc);
+                    const int64_t nq = static_cast<int64_t>(M) * 576;
+                    mla_scale_cast_kernel<__half><<<(nq + 255) / 256, 256, 0, stream>>>(q_ptr, d_q16, nq, scale);
+                    mla_init_flash_state_kernel<<<(M + 255) / 256, 256, 0, stream>>>(d_m, d_l, M);
+
+                    for (int k0 = 0; k0 < kv_len_max; k0 += K_TILE) {
+                        const int kc = (k0 + K_TILE < kv_len_max) ? K_TILE : (kv_len_max - k0);
+                        if (kv_is_q8_0) {
+                            mla_dequant_kv576_tile_kernel<true, __half><<<kc, 256, 0, stream>>>(d_kv_cache, d_k16, k0, kc);
+                        } else {
+                            mla_dequant_kv576_tile_kernel<false, __half><<<kc, 256, 0, stream>>>(d_kv_cache, d_k16, k0, kc);
+                        }
+
+                        cublasGemmEx(
+                            cublas,
+                            CUBLAS_OP_T, CUBLAS_OP_N,
+                            kc, M, 576,
+                            &one,
+                            d_k16, CUDA_R_16F, 576,
+                            d_q16, CUDA_R_16F, 576,
+                            &zero,
+                            d_s32, CUDA_R_32F, kc,
+                            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+                        mla_flash_online_softmax_rescale_kernel<__half><<<M, 128, 0, stream>>>(
+                            d_s32, d_p16, p_ptr, d_m, d_l, o_ptr, n_heads, k0, kc);
+
+                        cublasGemmEx(
+                            cublas,
+                            CUBLAS_OP_N, CUBLAS_OP_N,
+                            512, M, kc,
+                            &one,
+                            d_k16, CUDA_R_16F, 576,
+                            d_p16, CUDA_R_16F, kc,
+                            &one,
+                            o_ptr, CUDA_R_32F, 512,
+                            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
                     }
 
-                    cublasGemmEx(
-                        cublas,
-                        CUBLAS_OP_T, CUBLAS_OP_N,
-                        kc, M, 576,
-                        &one,
-                        d_k16, CUDA_R_16F, 576,
-                        d_q16, CUDA_R_16F, 576,
-                        &zero,
-                        d_s32, CUDA_R_32F, kc,
-                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-
-                    mla_flash_online_softmax_rescale_kernel<__half><<<M, 128, 0, stream>>>(
-                        d_s32, d_p16, p_ptr, d_m, d_l, o_ptr, n_heads, k0, kc);
-
-                    cublasGemmEx(
-                        cublas,
-                        CUBLAS_OP_N, CUBLAS_OP_N,
-                        512, M, kc,
-                        &one,
-                        d_k16, CUDA_R_16F, 576,
-                        d_p16, CUDA_R_16F, kc,
-                        &one,
-                        o_ptr, CUDA_R_32F, 512,
-                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                    mla_flash_finalize_out_kernel<<<M, 128, 0, stream>>>(o_ptr, d_l, M);
                 }
-
-                mla_flash_finalize_out_kernel<<<M, 128, 0, stream>>>(o_ptr, d_l, M);
+                return;
             }
-            return;
+        } else if (use_h2) {
+            // Pascal sm_60: Native 2:1 FP16 cublasHgemm + FP32 online softmax accumulator!
+            const size_t k16_b = align256(static_cast<size_t>(K_TILE) * 576 * sizeof(__half));
+            const size_t per_m = (576 + 512) * sizeof(__half) + static_cast<size_t>(K_TILE) * 2 * sizeof(__half) + 2 * sizeof(float);
+            int max_m = (scratch_bytes > k16_b + 4096) ? static_cast<int>((scratch_bytes - k16_b - 4096) / per_m) : 0;
+            int t_slice = std::min(T, std::max(0, max_m / n_heads));
+            if (t_slice >= 8) {
+                const __half h_one = __float2half_rn(1.0f), h_zero = __float2half_rn(0.0f);
+                cublasSetStream(cublas, stream);
+                for (int t0 = 0; t0 < T; t0 += t_slice) {
+                    const int tc = std::min(t_slice, T - t0);
+                    const int M  = tc * n_heads;
+                    const size_t q16_b  = align256(static_cast<size_t>(M) * 576 * sizeof(__half));
+                    const size_t s16_b  = align256(static_cast<size_t>(M) * K_TILE * sizeof(__half));
+                    const size_t p16_b  = align256(static_cast<size_t>(M) * K_TILE * sizeof(__half));
+                    const size_t ov16_b = align256(static_cast<size_t>(M) * 512 * sizeof(__half));
+                    const size_t ml_b   = align256(static_cast<size_t>(M) * sizeof(float));
+
+                    auto * base = static_cast<uint8_t *>(d_scratch);
+                    size_t off = 0;
+                    auto * d_q16  = reinterpret_cast<__half *>(base + off); off += q16_b;
+                    auto * d_k16  = reinterpret_cast<__half *>(base + off); off += k16_b;
+                    auto * d_s16  = reinterpret_cast<__half *>(base + off); off += s16_b;
+                    auto * d_p16  = reinterpret_cast<__half *>(base + off); off += p16_b;
+                    auto * d_ov16 = reinterpret_cast<__half *>(base + off); off += ov16_b;
+                    auto * d_m    = reinterpret_cast<float  *>(base + off); off += ml_b;
+                    auto * d_l    = reinterpret_cast<float  *>(base + off);
+
+                    const float * q_ptr = d_q576 + static_cast<size_t>(t0) * n_heads * 576;
+                    float *       o_ptr = d_out  + static_cast<size_t>(t0) * n_heads * 512;
+                    const int32_t * p_ptr = d_pos + t0;
+
+                    const int64_t nq = static_cast<int64_t>(M) * 576;
+                    mla_scale_cast_kernel<__half><<<(nq + 255) / 256, 256, 0, stream>>>(q_ptr, d_q16, nq, scale);
+                    mla_init_flash_state_kernel<<<(M + 255) / 256, 256, 0, stream>>>(d_m, d_l, M);
+
+                    for (int k0 = 0; k0 < kv_len_max; k0 += K_TILE) {
+                        const int kc = (k0 + K_TILE < kv_len_max) ? K_TILE : (kv_len_max - k0);
+                        if (kv_is_q8_0) {
+                            mla_dequant_kv576_tile_kernel<true, __half><<<kc, 256, 0, stream>>>(d_kv_cache, d_k16, k0, kc);
+                        } else {
+                            mla_dequant_kv576_tile_kernel<false, __half><<<kc, 256, 0, stream>>>(d_kv_cache, d_k16, k0, kc);
+                        }
+
+                        cublasHgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                                    kc, M, 576,
+                                    &h_one,  d_k16, 576,
+                                    d_q16, 576,
+                                    &h_zero, d_s16, kc);
+
+                        mla_flash_online_softmax_rescale_f16_kernel<<<M, 128, 0, stream>>>(
+                            d_s16, d_p16, p_ptr, d_m, d_l, o_ptr, n_heads, k0, kc);
+
+                        cublasHgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                                    512, M, kc,
+                                    &h_one,  d_k16, 576,
+                                    d_p16, kc,
+                                    &h_zero, d_ov16, 512);
+
+                        mla_flash_add_f16_to_f32_kernel<<<M, 128, 0, stream>>>(d_ov16, o_ptr, M);
+                    }
+
+                    mla_flash_finalize_out_kernel<<<M, 128, 0, stream>>>(o_ptr, d_l, M);
+                }
+                return;
+            }
+        } else {
+            // Maxwell sm_50/52 & Pascal sm_61: FP32 cublasSgemm FlashMLA prefill!
+            const size_t k32_b = align256(static_cast<size_t>(K_TILE) * 576 * sizeof(float));
+            const size_t per_m = 576 * sizeof(float) + static_cast<size_t>(K_TILE) * 2 * sizeof(float) + 2 * sizeof(float);
+            int max_m = (scratch_bytes > k32_b + 4096) ? static_cast<int>((scratch_bytes - k32_b - 4096) / per_m) : 0;
+            int t_slice = std::min(T, std::max(0, max_m / n_heads));
+            if (t_slice >= 8) {
+                const float one = 1.0f, zero = 0.0f;
+                cublasSetStream(cublas, stream);
+                for (int t0 = 0; t0 < T; t0 += t_slice) {
+                    const int tc = std::min(t_slice, T - t0);
+                    const int M  = tc * n_heads;
+                    const size_t q32_b = align256(static_cast<size_t>(M) * 576 * sizeof(float));
+                    const size_t s32_b = align256(static_cast<size_t>(M) * K_TILE * sizeof(float));
+                    const size_t p32_b = align256(static_cast<size_t>(M) * K_TILE * sizeof(float));
+                    const size_t ml_b  = align256(static_cast<size_t>(M) * sizeof(float));
+
+                    auto * base = static_cast<uint8_t *>(d_scratch);
+                    size_t off = 0;
+                    auto * d_q32 = reinterpret_cast<float *>(base + off); off += q32_b;
+                    auto * d_k32 = reinterpret_cast<float *>(base + off); off += k32_b;
+                    auto * d_s32 = reinterpret_cast<float *>(base + off); off += s32_b;
+                    auto * d_p32 = reinterpret_cast<float *>(base + off); off += p32_b;
+                    auto * d_m   = reinterpret_cast<float *>(base + off); off += ml_b;
+                    auto * d_l   = reinterpret_cast<float *>(base + off);
+
+                    const float * q_ptr = d_q576 + static_cast<size_t>(t0) * n_heads * 576;
+                    float *       o_ptr = d_out  + static_cast<size_t>(t0) * n_heads * 512;
+                    const int32_t * p_ptr = d_pos + t0;
+
+                    const int64_t nq = static_cast<int64_t>(M) * 576;
+                    mla_scale_cast_kernel<float><<<(nq + 255) / 256, 256, 0, stream>>>(q_ptr, d_q32, nq, scale);
+                    mla_init_flash_state_kernel<<<(M + 255) / 256, 256, 0, stream>>>(d_m, d_l, M);
+
+                    for (int k0 = 0; k0 < kv_len_max; k0 += K_TILE) {
+                        const int kc = (k0 + K_TILE < kv_len_max) ? K_TILE : (kv_len_max - k0);
+                        if (kv_is_q8_0) {
+                            mla_dequant_kv576_tile_kernel<true, float><<<kc, 256, 0, stream>>>(d_kv_cache, d_k32, k0, kc);
+                        } else {
+                            mla_dequant_kv576_tile_kernel<false, float><<<kc, 256, 0, stream>>>(d_kv_cache, d_k32, k0, kc);
+                        }
+
+                        cublasSgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                                    kc, M, 576,
+                                    &one,  d_k32, 576,
+                                    d_q32, 576,
+                                    &zero, d_s32, kc);
+
+                        mla_flash_online_softmax_rescale_kernel<float><<<M, 128, 0, stream>>>(
+                            d_s32, d_p32, p_ptr, d_m, d_l, o_ptr, n_heads, k0, kc);
+
+                        cublasSgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                                    512, M, kc,
+                                    &one, d_k32, 576,
+                                    d_p32, kc,
+                                    &one, o_ptr, 512);
+                    }
+
+                    mla_flash_finalize_out_kernel<<<M, 128, 0, stream>>>(o_ptr, d_l, M);
+                }
+                return;
+            }
         }
     }
 
     // Multi-Head-Shared Split-K Decode (Coalesced LDG.128 Q8_0 dp4a + Tile-Softmax!)
-    if (kv_is_q8_0) {
-        if (n_heads <= 16) {
-            constexpr int S = 128;
-            const size_t n_slots = static_cast<size_t>(T) * n_heads * S;
-            float * pm = static_cast<float *>(d_scratch);
-            float * pl = pm + n_slots;
-            float * po = pl + n_slots;
-            if (T == 2) {
-                constexpr int H_PER_BLK = 8;
-                mla_mqa_d576_q8_dp4a_decode_t2_kernel<S><<<dim3((n_heads + H_PER_BLK - 1) / H_PER_BLK, S), dim3(32, 16), 0, stream>>>(
-                    d_q576, d_kv_cache, d_pos, pm, pl, po, n_heads, scale);
+    // Slice T if needed so part_m/part_l/part_o never exceed scratch_bytes!
+    const int S_eff = (kv_is_q8_0 && n_heads <= 16) ? 128 : 64;
+    const size_t bytes_per_t = static_cast<size_t>(n_heads) * S_eff * (512 + 2) * sizeof(float);
+    const int max_t_slice = (scratch_bytes >= bytes_per_t && bytes_per_t > 0)
+        ? std::max(1, static_cast<int>(scratch_bytes / bytes_per_t))
+        : T;
+
+    for (int t0 = 0; t0 < T; t0 += max_t_slice) {
+        const int tc = std::min(max_t_slice, T - t0);
+        const float *   q_sub = d_q576 + static_cast<size_t>(t0) * n_heads * 576;
+        const int32_t * p_sub = d_pos  + t0;
+        float *         o_sub = d_out  + static_cast<size_t>(t0) * n_heads * 512;
+
+        if (kv_is_q8_0) {
+            if (n_heads <= 16) {
+                constexpr int S = 128;
+                const size_t n_slots = static_cast<size_t>(tc) * n_heads * S;
+                float * pm = static_cast<float *>(d_scratch);
+                float * pl = pm + n_slots;
+                float * po = pl + n_slots;
+                if (tc == 2) {
+                    constexpr int H_PER_BLK = 8;
+                    mla_mqa_d576_q8_dp4a_decode_t2_kernel<S><<<dim3((n_heads + H_PER_BLK - 1) / H_PER_BLK, S), dim3(32, 16), 0, stream>>>(
+                        q_sub, d_kv_cache, p_sub, pm, pl, po, n_heads, scale);
+                } else {
+                    constexpr int H_PER_BLK = 16;
+                    mla_mqa_d576_q8_dp4a_decode_kernel<S, H_PER_BLK><<<dim3((n_heads + H_PER_BLK - 1) / H_PER_BLK, S, tc), dim3(32, H_PER_BLK), 0, stream>>>(
+                        q_sub, d_kv_cache, p_sub, pm, pl, po, n_heads, scale);
+                }
+                mla_mqa_d512_reduce_fast_kernel<S><<<dim3(n_heads, tc), 128, 0, stream>>>(pm, pl, po, o_sub, n_heads);
             } else {
-                constexpr int H_PER_BLK = 16;
-                mla_mqa_d576_q8_dp4a_decode_kernel<S, H_PER_BLK><<<dim3((n_heads + H_PER_BLK - 1) / H_PER_BLK, S, T), dim3(32, H_PER_BLK), 0, stream>>>(
-                    d_q576, d_kv_cache, d_pos, pm, pl, po, n_heads, scale);
+                constexpr int S = 64;
+                const size_t n_slots = static_cast<size_t>(tc) * n_heads * S;
+                float * pm = static_cast<float *>(d_scratch);
+                float * pl = pm + n_slots;
+                float * po = pl + n_slots;
+                if (tc == 2) {
+                    constexpr int H_PER_BLK = 8;
+                    mla_mqa_d576_q8_dp4a_decode_t2_kernel<S><<<dim3((n_heads + H_PER_BLK - 1) / H_PER_BLK, S), dim3(32, 16), 0, stream>>>(
+                        q_sub, d_kv_cache, p_sub, pm, pl, po, n_heads, scale);
+                } else {
+                    constexpr int H_PER_BLK = 16;
+                    mla_mqa_d576_q8_dp4a_decode_kernel<S, H_PER_BLK><<<dim3((n_heads + H_PER_BLK - 1) / H_PER_BLK, S, tc), dim3(32, H_PER_BLK), 0, stream>>>(
+                        q_sub, d_kv_cache, p_sub, pm, pl, po, n_heads, scale);
+                }
+                mla_mqa_d512_reduce_fast_kernel<S><<<dim3(n_heads, tc), 128, 0, stream>>>(pm, pl, po, o_sub, n_heads);
             }
-            mla_mqa_d512_reduce_fast_kernel<S><<<dim3(n_heads, T), 128, 0, stream>>>(pm, pl, po, d_out, n_heads);
-        } else {
-            constexpr int S = 64;
-            const size_t n_slots = static_cast<size_t>(T) * n_heads * S;
-            float * pm = static_cast<float *>(d_scratch);
-            float * pl = pm + n_slots;
-            float * po = pl + n_slots;
-            if (T == 2) {
-                constexpr int H_PER_BLK = 8;
-                mla_mqa_d576_q8_dp4a_decode_t2_kernel<S><<<dim3((n_heads + H_PER_BLK - 1) / H_PER_BLK, S), dim3(32, 16), 0, stream>>>(
-                    d_q576, d_kv_cache, d_pos, pm, pl, po, n_heads, scale);
-            } else {
-                constexpr int H_PER_BLK = 16;
-                mla_mqa_d576_q8_dp4a_decode_kernel<S, H_PER_BLK><<<dim3((n_heads + H_PER_BLK - 1) / H_PER_BLK, S, T), dim3(32, H_PER_BLK), 0, stream>>>(
-                    d_q576, d_kv_cache, d_pos, pm, pl, po, n_heads, scale);
-            }
-            mla_mqa_d512_reduce_fast_kernel<S><<<dim3(n_heads, T), 128, 0, stream>>>(pm, pl, po, d_out, n_heads);
+            continue;
         }
-        return;
+        constexpr int S = 64;
+        const size_t n_slots = static_cast<size_t>(tc) * n_heads * S;
+        float * pm = static_cast<float *>(d_scratch);
+        float * pl = pm + n_slots;
+        float * po = pl + n_slots;
+        if (tc == 2) {
+            constexpr int H_PER_BLK = 8;
+            dim3 grid((n_heads + H_PER_BLK - 1) / H_PER_BLK, S);
+            dim3 block(32, 16);
+            mla_mqa_d576_decode_shared_t2_kernel<false, S><<<grid, block, 0, stream>>>(
+                q_sub, d_kv_cache, p_sub, pm, pl, po, n_heads, scale);
+        } else {
+            constexpr int H_PER_BLK = 16;
+            dim3 grid((n_heads + H_PER_BLK - 1) / H_PER_BLK, S, tc);
+            dim3 block(32, H_PER_BLK);
+            mla_mqa_d576_decode_shared_kernel<false, S, H_PER_BLK><<<grid, block, 0, stream>>>(
+                q_sub, d_kv_cache, p_sub, pm, pl, po, n_heads, scale);
+        }
+        mla_mqa_d512_reduce_strided_kernel<S><<<dim3(n_heads, tc), 32, 0, stream>>>(pm, pl, po, o_sub, n_heads);
     }
-    constexpr int S = 64;
-    const size_t n_slots = static_cast<size_t>(T) * n_heads * S;
-    float * pm = static_cast<float *>(d_scratch);
-    float * pl = pm + n_slots;
-    float * po = pl + n_slots;
-    if (T == 2) {
-        constexpr int H_PER_BLK = 8;
-        dim3 grid((n_heads + H_PER_BLK - 1) / H_PER_BLK, S);
-        dim3 block(32, 16);
-        mla_mqa_d576_decode_shared_t2_kernel<false, S><<<grid, block, 0, stream>>>(
-            d_q576, d_kv_cache, d_pos, pm, pl, po, n_heads, scale);
-    } else {
-        constexpr int H_PER_BLK = 16;
-        dim3 grid((n_heads + H_PER_BLK - 1) / H_PER_BLK, S, T);
-        dim3 block(32, H_PER_BLK);
-        mla_mqa_d576_decode_shared_kernel<false, S, H_PER_BLK><<<grid, block, 0, stream>>>(
-            d_q576, d_kv_cache, d_pos, pm, pl, po, n_heads, scale);
-    }
-    mla_mqa_d512_reduce_strided_kernel<S><<<dim3(n_heads, T), 32, 0, stream>>>(pm, pl, po, d_out, n_heads);
 }
 
 void launch_mla_head_sigmoid_gate(

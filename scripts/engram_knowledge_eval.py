@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Held-out deterministic technical/factual knowledge QA benchmark for measuring Engram value.
 
-NEVER trained on. Evaluates any OpenAI-compatible server (`llama-server`) on 60 exact-match
-Linux man-page, POSIX, Python stdlib, HTTP/RFC, networking, and Git plumbing questions so we can
-quantify the 8.19B Engram's factual recall lift directly alongside ling-test v2.
+Evaluates any OpenAI-compatible server (`rookery-server`) on 60 exact-match Linux man-page,
+POSIX, Python stdlib, HTTP/RFC, networking, and Git plumbing questions to measure factual
+recall delta with and without Engram sidecar grafting.
 """
 
 from __future__ import annotations

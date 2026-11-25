@@ -1,13 +1,17 @@
 #include "core/device.h"
+#include "cpu/bailingmoe3_cpu.h"
 #include "engram/engram_sidecar.h"
 #include "gguf/reader.h"
 #include "gguf/sharded.h"
+#ifdef ROOKERY_ENABLE_CUDA
 #include "models/bailingmoe3.h"
+#include "models/gemma4.h"
 #include "models/glm5_next.h"
 #include "models/inkling2_loop.h"
 #include "models/maxwell_moe.h"
 #include "models/qwen35_moe.h"
 #include "models/qwen4exp.h"
+#endif
 #include "sampler/sampler.h"
 #include "server/chat_template.h"
 #include "tokenizer/bpe.h"
@@ -103,125 +107,231 @@ static size_t find_earliest_stop(const std::string & s, const std::vector<std::s
     return best;
 }
 
-// Unified runtime interface over MaxwellMoeModel, Glm5NextModel, Inkling2LoopModel, Qwen35MoeModel, and upcoming Qwen3.8!
+// Unified runtime interface over GPU models and CPU backends.
 struct ServerEngine {
     std::string arch;
+#ifdef ROOKERY_ENABLE_CUDA
     std::unique_ptr<rookery::MaxwellMoeModel>   maxwell;
     std::unique_ptr<rookery::Glm5NextModel>     glm5;
     std::unique_ptr<rookery::Inkling2LoopModel> inkling2;
     std::unique_ptr<rookery::Qwen35MoeModel>    qwen35;
     std::unique_ptr<rookery::Qwen4ExpModel>     qwen4;
     std::unique_ptr<rookery::BailingMoe3Model>  bailing3;
+    std::unique_ptr<rookery::Gemma4Model>       gemma4;
+#endif
+    std::unique_ptr<rookery::cpu::BailingMoe3CpuModel> bailing3_cpu;
 
-    bool is_glm5()     const { return glm5 != nullptr; }
-    bool is_inkling2() const { return inkling2 != nullptr; }
-    bool is_qwen35()   const { return qwen35 != nullptr; }
-    bool is_qwen4()    const { return qwen4 != nullptr; }
-    bool is_bailing3() const { return bailing3 != nullptr; }
+    bool is_glm5() const {
+#ifdef ROOKERY_ENABLE_CUDA
+        return glm5 != nullptr;
+#else
+        return false;
+#endif
+    }
+    bool is_inkling2() const {
+#ifdef ROOKERY_ENABLE_CUDA
+        return inkling2 != nullptr;
+#else
+        return false;
+#endif
+    }
+    bool is_qwen35() const {
+#ifdef ROOKERY_ENABLE_CUDA
+        return qwen35 != nullptr;
+#else
+        return false;
+#endif
+    }
+    bool is_qwen4() const {
+#ifdef ROOKERY_ENABLE_CUDA
+        return qwen4 != nullptr;
+#else
+        return false;
+#endif
+    }
+    bool is_bailing3() const {
+        if (bailing3_cpu != nullptr) return true;
+#ifdef ROOKERY_ENABLE_CUDA
+        return bailing3 != nullptr;
+#else
+        return false;
+#endif
+    }
+    bool is_gemma4() const {
+#ifdef ROOKERY_ENABLE_CUDA
+        return gemma4 != nullptr;
+#else
+        return false;
+#endif
+    }
     bool has_state_checkpoints() const { return is_glm5() || is_inkling2() || is_qwen35() || is_qwen4() || is_bailing3(); }
 
     int max_ctx() const {
+        if (bailing3_cpu) return bailing3_cpu->config().max_ctx;
+#ifdef ROOKERY_ENABLE_CUDA
         if (glm5)     return glm5->config().max_ctx;
         if (inkling2) return inkling2->config().max_ctx;
         if (qwen35)   return qwen35->config().max_ctx;
         if (qwen4)    return qwen4->config().max_ctx;
         if (bailing3) return bailing3->config().max_ctx;
+        if (gemma4)   return gemma4->config().max_ctx;
         return maxwell->config().max_ctx;
+#else
+        return 0;
+#endif
     }
     int n_embd() const {
+        if (bailing3_cpu) return bailing3_cpu->config().n_embd;
+#ifdef ROOKERY_ENABLE_CUDA
         if (glm5)     return glm5->config().n_embd;
         if (inkling2) return inkling2->config().n_embd;
         if (qwen35)   return qwen35->config().n_embd;
         if (qwen4)    return qwen4->config().n_embd;
         if (bailing3) return bailing3->config().n_embd;
+        if (gemma4)   return gemma4->config().n_embd;
         return maxwell->config().n_embd;
+#else
+        return 0;
+#endif
     }
     int hc_mult() const {
+        if (bailing3_cpu) return 1;
+#ifdef ROOKERY_ENABLE_CUDA
         if (glm5)     return glm5->config().hc_mult;
         if (qwen4)    return qwen4->config().hc_mult;
-        if (inkling2 || qwen35 || bailing3) return 1;
+        if (inkling2 || qwen35 || bailing3 || gemma4) return 1;
         return maxwell->config().hc_mult;
+#else
+        return 1;
+#endif
     }
     size_t prefill_chunk() const {
+        if (bailing3_cpu) return 256;
+#ifdef ROOKERY_ENABLE_CUDA
         if (glm5 || inkling2) return 256;
         if (bailing3 && bailing3->config().n_expert >= 256) return 1024;
+#endif
         return 512;
     }
     bool has_mtp() const {
+        if (bailing3_cpu) return bailing3_cpu->has_mtp();
+#ifdef ROOKERY_ENABLE_CUDA
         if (glm5)     return glm5->has_mtp();
-        if (inkling2 || qwen4) return false;
+        if (inkling2 || qwen4 || gemma4) return false;
         if (qwen35)   return qwen35->has_mtp();
         if (bailing3) return bailing3->has_mtp();
         return maxwell->has_mtp();
+#else
+        return false;
+#endif
     }
 
     std::vector<int> layer_devices() const {
+        if (bailing3_cpu) return bailing3_cpu->layer_devices();
+#ifdef ROOKERY_ENABLE_CUDA
         if (glm5)     return glm5->layer_devices();
         if (inkling2) return inkling2->layer_devices();
         if (qwen35)   return qwen35->layer_devices();
         if (qwen4)    return qwen4->layer_devices();
         if (bailing3) return bailing3->layer_devices();
+        if (gemma4)   return gemma4->layer_devices();
         return maxwell->layer_devices();
+#else
+        return {};
+#endif
     }
     void set_layer_hook(rookery::LayerHook * h) {
+        if (bailing3_cpu) { bailing3_cpu->set_layer_hook(h); return; }
+#ifdef ROOKERY_ENABLE_CUDA
         if (glm5)          glm5->set_layer_hook(h);
         else if (inkling2) inkling2->set_layer_hook(h);
         else if (qwen35)   qwen35->set_layer_hook(h);
         else if (qwen4)    qwen4->set_layer_hook(h);
         else if (bailing3) bailing3->set_layer_hook(h);
+        else if (gemma4)   gemma4->set_layer_hook(h);
         else               maxwell->set_layer_hook(h);
+#endif
     }
     void warmup_decode_graphs() {
+        if (bailing3_cpu) { bailing3_cpu->warmup_decode_graphs(); return; }
+#ifdef ROOKERY_ENABLE_CUDA
         if (glm5)          glm5->warmup_decode_graphs();
         else if (inkling2) inkling2->warmup_decode_graphs();
         else if (qwen35)   qwen35->warmup_decode_graphs();
         else if (qwen4)    qwen4->warmup_decode_graphs();
         else if (bailing3) bailing3->warmup_decode_graphs();
+        else if (gemma4)   gemma4->warmup_decode_graphs();
         else               maxwell->warmup_decode_graphs();
+#endif
     }
     void reset_state() {
+        if (bailing3_cpu) { bailing3_cpu->reset_state(); return; }
+#ifdef ROOKERY_ENABLE_CUDA
         if (glm5)          glm5->reset_state();
         else if (inkling2) inkling2->reset_state();
         else if (qwen35)   qwen35->reset_state();
         else if (qwen4)    qwen4->reset_state();
         else if (bailing3) bailing3->reset_state();
+        else if (gemma4)   gemma4->reset_state();
+#endif
     }
     void forward(const std::vector<int32_t> & t, const std::vector<int32_t> & p, std::vector<float> & l) {
+        if (bailing3_cpu) { bailing3_cpu->forward(t, p, l); return; }
+#ifdef ROOKERY_ENABLE_CUDA
         if (glm5)          glm5->forward(t, p, l);
         else if (inkling2) inkling2->forward(t, p, l);
         else if (qwen35)   qwen35->forward(t, p, l);
         else if (qwen4)    qwen4->forward(t, p, l);
         else if (bailing3) bailing3->forward(t, p, l);
+        else if (gemma4)   gemma4->forward(t, p, l);
         else               maxwell->forward(t, p, l);
+#endif
     }
     int32_t forward_decode_greedy(int32_t t, int32_t p) {
+        if (bailing3_cpu) return bailing3_cpu->forward_decode_greedy(t, p);
+#ifdef ROOKERY_ENABLE_CUDA
         if (glm5)     return glm5->forward_decode_greedy(t, p);
         if (inkling2) return inkling2->forward_decode_greedy(t, p);
         if (qwen35)   return qwen35->forward_decode_greedy(t, p);
         if (qwen4)    return qwen4->forward_decode_greedy(t, p);
         if (bailing3) return bailing3->forward_decode_greedy(t, p);
+        if (gemma4)   return gemma4->forward_decode_greedy(t, p);
         return maxwell->forward_decode_greedy(t, p);
+#else
+        return 0;
+#endif
     }
     void forward_decode_logits(int32_t t, int32_t p, std::vector<float> & l) {
+        if (bailing3_cpu) { bailing3_cpu->forward_decode_logits(t, p, l); return; }
+#ifdef ROOKERY_ENABLE_CUDA
         if (glm5)          glm5->forward_decode_logits(t, p, l);
         else if (inkling2) inkling2->forward_decode_logits(t, p, l);
         else if (qwen35)   qwen35->forward_decode_logits(t, p, l);
         else if (qwen4)    qwen4->forward_decode_logits(t, p, l);
         else if (bailing3) bailing3->forward_decode_logits(t, p, l);
+        else if (gemma4)   gemma4->forward_decode_logits(t, p, l);
         else               maxwell->forward_decode_logits(t, p, l);
+#endif
     }
     int32_t mtp_prefill_chunk(const std::vector<int32_t> & nt, const std::vector<int32_t> & p) {
+#ifdef ROOKERY_ENABLE_CUDA
         if (glm5)     return glm5->mtp_prefill_chunk(nt, p);
         if (qwen35)   return qwen35->mtp_prefill_chunk(nt, p);
         if (bailing3) return bailing3->mtp_prefill_chunk(nt, p);
         return maxwell->mtp_prefill_chunk(nt, p);
+#else
+        (void) nt; (void) p; return 0;
+#endif
     }
     std::vector<int32_t> cached_tokens;
+#ifdef ROOKERY_ENABLE_CUDA
     std::vector<rookery::Glm5NextModel::KdaCheckpoint>      kda_checkpoints;
     std::vector<rookery::Inkling2LoopModel::ConvCheckpoint> conv_checkpoints;
     std::vector<rookery::Qwen35MoeModel::GdnCheckpoint>     gdn_checkpoints;
     std::vector<rookery::Qwen4ExpModel::StateCheckpoint>    qwen4_checkpoints;
     std::vector<rookery::BailingMoe3Model::KdaCheckpoint>   bailing3_checkpoints;
+#endif
+    std::vector<rookery::cpu::BailingMoe3CpuModel::KdaCheckpoint> bailing3_cpu_checkpoints;
     size_t  mtp_kv_valid_len  = 0;
     int32_t mtp_last_next_tok = -1;
     bool    has_cached_engram_params = false;
@@ -229,6 +339,7 @@ struct ServerEngine {
     int     engram_seq_id            = 0;
 
     void prune_state_checkpoints_after(int pos) {
+#ifdef ROOKERY_ENABLE_CUDA
         kda_checkpoints.erase(
             std::remove_if(kda_checkpoints.begin(), kda_checkpoints.end(),
                            [pos](const auto & cp) { return cp.pos > pos; }),
@@ -249,10 +360,35 @@ struct ServerEngine {
             std::remove_if(bailing3_checkpoints.begin(), bailing3_checkpoints.end(),
                            [pos](const auto & cp) { return cp.pos > pos; }),
             bailing3_checkpoints.end());
+#endif
+        bailing3_cpu_checkpoints.erase(
+            std::remove_if(bailing3_cpu_checkpoints.begin(), bailing3_cpu_checkpoints.end(),
+                           [pos](const auto & cp) { return cp.pos > pos; }),
+            bailing3_cpu_checkpoints.end());
     }
 
     void save_state_checkpoint(int pos) {
         if (pos <= 0) return;
+        if (bailing3_cpu) {
+            for (auto & cp : bailing3_cpu_checkpoints) {
+                if (cp.pos == pos) { bailing3_cpu->save_kda_checkpoint(cp, pos); return; }
+            }
+            if (bailing3_cpu_checkpoints.size() >= 32) {
+                size_t drop_idx = 0; int min_gap = INT32_MAX;
+                for (size_t i = 1; i + 1 < bailing3_cpu_checkpoints.size(); ++i) {
+                    int gap = bailing3_cpu_checkpoints[i + 1].pos - bailing3_cpu_checkpoints[i - 1].pos;
+                    if (gap < min_gap) { min_gap = gap; drop_idx = i; }
+                }
+                bailing3_cpu_checkpoints.erase(bailing3_cpu_checkpoints.begin() + static_cast<ptrdiff_t>(drop_idx));
+            }
+            rookery::cpu::BailingMoe3CpuModel::KdaCheckpoint cp;
+            bailing3_cpu->save_kda_checkpoint(cp, pos);
+            auto it = std::lower_bound(bailing3_cpu_checkpoints.begin(), bailing3_cpu_checkpoints.end(), pos,
+                                       [](const auto & a, int p) { return a.pos < p; });
+            bailing3_cpu_checkpoints.insert(it, std::move(cp));
+            return;
+        }
+#ifdef ROOKERY_ENABLE_CUDA
         if (glm5) {
             for (auto & cp : kda_checkpoints) {
                 if (cp.pos == pos) { glm5->save_kda_checkpoint(cp, pos); return; }
@@ -339,38 +475,57 @@ struct ServerEngine {
                                        [](const auto & a, int p) { return a.pos < p; });
             bailing3_checkpoints.insert(it, std::move(cp));
         }
+#endif
     }
 
     bool supports_sample_mtp() const {
+#ifdef ROOKERY_ENABLE_CUDA
         return (glm5 && glm5->has_mtp()) || (qwen35 && qwen35->has_mtp()) || (bailing3 && bailing3->has_mtp());
+#else
+        return false;
+#endif
     }
 
     void mtp_prefill_chunk_logits(const std::vector<int32_t> & nt, const std::vector<int32_t> & p, std::vector<float> & l) {
+#ifdef ROOKERY_ENABLE_CUDA
         if (glm5)        glm5->mtp_prefill_chunk_logits(nt, p, l);
         else if (qwen35) qwen35->mtp_prefill_chunk_logits(nt, p, l);
         else             bailing3->mtp_prefill_chunk_logits(nt, p, l);
+#else
+        (void) nt; (void) p; (void) l;
+#endif
     }
 
     void decode_mtp_greedy_step(int32_t & ct, int32_t & dt, int32_t & cp,
                                 std::vector<int32_t> & out, rookery::MtpStats & st) {
+#ifdef ROOKERY_ENABLE_CUDA
         if (glm5)          glm5->decode_mtp_greedy_step(ct, dt, cp, out, st);
         else if (qwen35)   qwen35->decode_mtp_greedy_step(ct, dt, cp, out, st);
         else if (bailing3) bailing3->decode_mtp_greedy_step(ct, dt, cp, out, st);
         else               maxwell->decode_mtp_greedy_step(ct, dt, cp, out, st);
+#else
+        (void) ct; (void) dt; (void) cp; (void) out; (void) st;
+#endif
     }
 
     void decode_mtp_sample_step(int32_t & ct, int32_t & dt, rookery::Sampler::SparseDist & dq,
                                 int32_t & cp, rookery::Sampler & sampler,
                                 std::vector<int32_t> & out, rookery::MtpStats & st) {
+#ifdef ROOKERY_ENABLE_CUDA
         if (glm5)        glm5->decode_mtp_sample_step(ct, dt, dq, cp, sampler, out, st);
         else if (qwen35) qwen35->decode_mtp_sample_step(ct, dt, dq, cp, sampler, out, st);
         else             bailing3->decode_mtp_sample_step(ct, dt, dq, cp, sampler, out, st);
+#else
+        (void) ct; (void) dt; (void) dq; (void) cp; (void) sampler; (void) out; (void) st;
+#endif
     }
 
     void rollback_mtp_1tok() {
+#ifdef ROOKERY_ENABLE_CUDA
         if (glm5)          glm5->rollback_kda_states();
         else if (qwen35)   qwen35->rollback_gdn_states();
         else if (bailing3) bailing3->rollback_kda_states();
+#endif
     }
 };
 
@@ -437,7 +592,22 @@ static GenResult run_generation(
     }
 
     size_t reuse_pos = 0;
-    if (engine.is_glm5()) {
+    if (engine.bailing3_cpu) {
+        const rookery::cpu::BailingMoe3CpuModel::KdaCheckpoint * best_cp = nullptr;
+        for (const auto & cp : engine.bailing3_cpu_checkpoints) {
+            if (cp.pos > 0 && static_cast<size_t>(cp.pos) <= max_reuse) best_cp = &cp;
+        }
+        if (best_cp != nullptr) {
+            engine.bailing3_cpu->restore_kda_checkpoint(*best_cp);
+            reuse_pos = static_cast<size_t>(best_cp->pos);
+        } else {
+            engine.reset_state();
+            reuse_pos = 0;
+        }
+        engine.prune_state_checkpoints_after(static_cast<int>(reuse_pos));
+    }
+#ifdef ROOKERY_ENABLE_CUDA
+    else if (engine.is_glm5()) {
         const rookery::Glm5NextModel::KdaCheckpoint * best_cp = nullptr;
         for (const auto & cp : engine.kda_checkpoints) {
             if (cp.pos > 0 && static_cast<size_t>(cp.pos) <= max_reuse) best_cp = &cp;
@@ -507,7 +677,9 @@ static GenResult run_generation(
             reuse_pos = 0;
         }
         engine.prune_state_checkpoints_after(static_cast<int>(reuse_pos));
-    } else {
+    }
+#endif
+    else {
         reuse_pos = max_reuse;
     }
 
@@ -706,7 +878,9 @@ int main(int argc, char ** argv) {
     int                  max_ctx       = 32768;
     rookery::KvCacheType kv_type       = rookery::KvCacheType::Q8_0;
     bool                 kv_type_k_set = false;
-    bool        use_mtp = true;
+    bool        use_mtp   = true;
+    int         n_threads = 0;
+    bool        force_cpu = false;
     std::vector<int>   gpu_ids;
     std::vector<float> tensor_split;
     rookery::SamplingParams default_sampling;
@@ -724,6 +898,8 @@ int main(int argc, char ** argv) {
         else if (a == "--port")                   port = std::atoi(next().c_str());
         else if (a == "--alias")                  alias = next();
         else if (a == "-c" || a == "--ctx-size")  max_ctx = std::atoi(next().c_str());
+        else if (a == "-t" || a == "--threads")   n_threads = std::atoi(next().c_str());
+        else if (a == "--cpu")                    force_cpu = true;
         else if (a == "--tensor-split" || a == "-ts") tensor_split = parse_csv_floats(next());
         else if (a == "--gpus")                   gpu_ids = parse_csv_ints(next());
         else if (a == "--cache-type-k" || a == "-ctk") {
@@ -929,9 +1105,11 @@ int main(int argc, char ** argv) {
                     ? rookery::render_inkling2_chat_prompt(j.at("messages"), tools, enable_thinking, reasoning_effort)
                     : (engine.is_bailing3()
                         ? rookery::render_bailing3_chat_prompt(j.at("messages"), tools, enable_thinking)
-                        : ((engine.is_qwen35() || engine.is_qwen4())
-                            ? rookery::render_qwen3_chat_prompt(j.at("messages"), tools, enable_thinking)
-                            : rookery::render_maxwell_chat_prompt(j.at("messages"), tools, enable_thinking))));
+                        : (engine.is_gemma4()
+                            ? rookery::render_gemma4_chat_prompt(j.at("messages"), enable_thinking)
+                            : ((engine.is_qwen35() || engine.is_qwen4())
+                                ? rookery::render_qwen3_chat_prompt(j.at("messages"), tools, enable_thinking)
+                                : rookery::render_maxwell_chat_prompt(j.at("messages"), tools, enable_thinking)))));
             const auto prompt_ids = tokenizer.encode(prompt_str, tokenizer.add_bos_default(), true);
             const auto now_s = std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count();
@@ -939,6 +1117,7 @@ int main(int argc, char ** argv) {
             auto parse_out = [&](const std::string & raw, bool in_think) {
                 if (engine.is_glm5() || engine.is_bailing3()) return rookery::parse_glm5_output(raw, in_think);
                 if (engine.is_inkling2()) return rookery::parse_inkling2_output(in_think ? raw : ("<|content_text|>" + raw));
+                if (engine.is_gemma4())   return rookery::parse_gemma4_output(raw, in_think);
                 return rookery::parse_maxwell_output(raw, in_think);
             };
 
@@ -1122,13 +1301,15 @@ int main(int argc, char ** argv) {
                                     }
                                 }
                                 if (in_think) {
-                                    size_t end_t = pending.find("</think>");
+                                    const char * end_tag = engine.is_gemma4() ? "<channel|>" : "</think>";
+                                    const size_t end_len = engine.is_gemma4() ? 10 : 8;
+                                    size_t end_t = pending.find(end_tag);
                                     size_t tc_t  = pending.find("<tool_call>");
                                     const size_t hold = std::max<size_t>(11, max_stop_len);
                                     if (end_t != std::string::npos && (tc_t == std::string::npos || end_t < tc_t)) {
                                         std::string r = pending.substr(0, end_t);
                                         if (!r.empty() && !send_chunk({{"reasoning_content", r}}, nullptr)) return false;
-                                        pending.erase(0, end_t + 8);
+                                        pending.erase(0, end_t + end_len);
                                         if (!engine.is_glm5() && !engine.is_bailing3()) {
                                             while (!pending.empty() && pending.front() == '\n') pending.erase(pending.begin());
                                         }
@@ -1258,6 +1439,8 @@ int main(int argc, char ** argv) {
     }
 
     const bool kv_q8 = (kv_type != rookery::KvCacheType::F16);
+    const bool use_cpu_backend = force_cpu || gpu_ids.empty();
+#ifdef ROOKERY_ENABLE_CUDA
     if (engine.arch == "glm5-next" || engine.arch == "glm5next") {
         tokenizer.add_stop_token("<|user|>");
         tokenizer.add_stop_token("<|observation|>");
@@ -1280,14 +1463,35 @@ int main(int argc, char ** argv) {
     } else if (engine.arch == "bailingmoe3") {
         tokenizer.add_stop_token("<|role_end|>");
         tokenizer.add_stop_token("<|endoftext|>");
-        engine.bailing3 = std::make_unique<rookery::BailingMoe3Model>();
-        engine.bailing3->load(model_path, gpu_ids, tensor_split, max_ctx, kv_q8, use_mtp);
+        if (use_cpu_backend) {
+            engine.bailing3_cpu = std::make_unique<rookery::cpu::BailingMoe3CpuModel>();
+            engine.bailing3_cpu->load(model_path, max_ctx, kv_q8, n_threads);
+        } else {
+            engine.bailing3 = std::make_unique<rookery::BailingMoe3Model>();
+            engine.bailing3->load(model_path, gpu_ids, tensor_split, max_ctx, kv_q8, use_mtp);
+        }
+    } else if (engine.arch == "gemma4") {
+        tokenizer.add_stop_token("<turn|>");
+        tokenizer.add_stop_token("<eos>");
+        engine.gemma4 = std::make_unique<rookery::Gemma4Model>();
+        engine.gemma4->load(model_path, gpu_ids, tensor_split, max_ctx, kv_q8);
     } else if (engine.arch == "maxwell-moe") {
         engine.maxwell = std::make_unique<rookery::MaxwellMoeModel>();
         engine.maxwell->load(model_path, gpu_ids, tensor_split, max_ctx, kv_type, use_mtp);
     } else {
         throw std::runtime_error("Unsupported model architecture: " + engine.arch);
     }
+#else
+    (void) use_cpu_backend;
+    if (engine.arch == "bailingmoe3") {
+        tokenizer.add_stop_token("<|role_end|>");
+        tokenizer.add_stop_token("<|endoftext|>");
+        engine.bailing3_cpu = std::make_unique<rookery::cpu::BailingMoe3CpuModel>();
+        engine.bailing3_cpu->load(model_path, max_ctx, kv_q8, n_threads);
+    } else {
+        throw std::runtime_error("CPU-only build currently supports bailingmoe3; unsupported architecture: " + engine.arch);
+    }
+#endif
 
     if (!engram_path.empty()) {
         const float eff_scale = (engram_scale >= 0.0f) ? engram_scale : (engram_adapter_path.empty() ? 0.0f : 1.0f);

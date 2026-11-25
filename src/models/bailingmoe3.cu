@@ -561,23 +561,25 @@ void BailingMoe3Model::run_gpu_segment(size_t gi, int T, bool run_argmax, bool s
         if (L.is_kda) {
             mark(ms_kda_proj, [&]() {
                 if (T < 16) {
-                    launch_quantize_q8_1(rt.d_x_norm, rt.d_scratch, cfg_.n_embd, T, rt.stream);
                     const DeviceTensor * ws[6] = {&L.wq, &L.wk, &L.wv, &L.ssm_f_a, &L.ssm_beta, &L.ssm_g_a};
                     float * ys[6] = {rt.d_kda_q, rt.d_kda_k, rt.d_kda_v, rt.d_kda_g, rt.d_kda_beta, rt.d_kda_gate};
-                    const DeviceTensor * preq_ws[6];
-                    float * preq_ys[6];
-                    int n_preq = 0;
-                    for (int i = 0; i < 6; ++i) {
-                        if (ws[i]->dtype == DType::Q8_0 || is_kquant_dtype(ws[i]->dtype)) {
-                            preq_ws[n_preq] = ws[i];
-                            preq_ys[n_preq] = ys[i];
-                            ++n_preq;
-                        } else {
-                            launch_linear(rt.cublas, *ws[i], rt.d_x_norm, ys[i], T, rt.d_scratch, rt.scratch_bytes, rt.stream);
+                    if (!try_launch_linear_multi_sm60_h2(ws, ys, 6, rt.d_x_norm, T, rt.d_scratch, rt.scratch_bytes, rt.stream)) {
+                        launch_quantize_q8_1(rt.d_x_norm, rt.d_scratch, cfg_.n_embd, T, rt.stream);
+                        const DeviceTensor * preq_ws[6];
+                        float * preq_ys[6];
+                        int n_preq = 0;
+                        for (int i = 0; i < 6; ++i) {
+                            if (ws[i]->dtype == DType::Q8_0 || is_kquant_dtype(ws[i]->dtype)) {
+                                preq_ws[n_preq] = ws[i];
+                                preq_ys[n_preq] = ys[i];
+                                ++n_preq;
+                            } else {
+                                launch_linear(rt.cublas, *ws[i], rt.d_x_norm, ys[i], T, rt.d_scratch, rt.scratch_bytes, rt.stream);
+                            }
                         }
-                    }
-                    if (n_preq > 0) {
-                        launch_linear_multi_prequant(preq_ws, preq_ys, n_preq, rt.d_scratch, T, rt.stream);
+                        if (n_preq > 0) {
+                            launch_linear_multi_prequant(preq_ws, preq_ys, n_preq, rt.d_scratch, T, rt.stream);
+                        }
                     }
                 } else {
                     linear_preq(L.wq,       rt.d_x_norm, rt.d_kda_q);
@@ -622,14 +624,28 @@ void BailingMoe3Model::run_gpu_segment(size_t gi, int T, bool run_argmax, bool s
             });
         } else {
             mark(ms_mla_proj, [&]() {
-                if (T < 16) launch_quantize_q8_1(rt.d_x_norm, rt.d_scratch, cfg_.n_embd, T, rt.stream);
-                if (cfg_.q_lora_rank > 0) {
-                    linear_preq(L.wq_a, rt.d_x_norm, rt.d_mla_qr);
+                const DeviceTensor * mla_ws[3] = {
+                    (cfg_.q_lora_rank > 0) ? &L.wq_a : &L.wq,
+                    &L.wkv_a_mqa,
+                    &L.attn_gate
+                };
+                float * mla_ys[3] = {
+                    (cfg_.q_lora_rank > 0) ? rt.d_mla_qr : rt.d_mla_qall,
+                    rt.d_mla_kvall,
+                    rt.d_mla_gate
+                };
+                if (T < 16 && try_launch_linear_multi_sm60_h2(mla_ws, mla_ys, 3, rt.d_x_norm, T, rt.d_scratch, rt.scratch_bytes, rt.stream)) {
+                    // fused sm_60 half2 MLA input projections
                 } else {
-                    linear_preq(L.wq,   rt.d_x_norm, rt.d_mla_qall);
+                    if (T < 16) launch_quantize_q8_1(rt.d_x_norm, rt.d_scratch, cfg_.n_embd, T, rt.stream);
+                    if (cfg_.q_lora_rank > 0) {
+                        linear_preq(L.wq_a, rt.d_x_norm, rt.d_mla_qr);
+                    } else {
+                        linear_preq(L.wq,   rt.d_x_norm, rt.d_mla_qall);
+                    }
+                    linear_preq(L.wkv_a_mqa, rt.d_x_norm, rt.d_mla_kvall);
+                    linear_preq(L.attn_gate, rt.d_x_norm, rt.d_mla_gate);
                 }
-                linear_preq(L.wkv_a_mqa, rt.d_x_norm, rt.d_mla_kvall);
-                linear_preq(L.attn_gate, rt.d_x_norm, rt.d_mla_gate);
                 if (cfg_.q_lora_rank > 0) {
                     launch_rmsnorm(rt.d_mla_qr, static_cast<const float *>(L.attn_q_a_norm.ptr), rt.d_mla_qr, cfg_.q_lora_rank, T, cfg_.rms_eps, rt.stream);
                     launch_linear(rt.cublas, L.wq_b, rt.d_mla_qr, rt.d_mla_qall, T, rt.d_scratch, rt.scratch_bytes, rt.stream);

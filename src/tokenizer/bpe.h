@@ -40,6 +40,7 @@ private:
     std::vector<std::string> pretokenize_maxwell(const std::string & text) const;
     std::vector<std::string> pretokenize_llama3(const std::string & text) const;
     void bpe_encode_piece(const std::string & piece, std::vector<int32_t> & out) const;
+    void bpe_encode_spm_segment(const std::string & seg, std::vector<int32_t> & out) const;
 
     std::vector<std::string>                id_to_token_;
     std::vector<std::string>                decoded_tokens_;
@@ -58,7 +59,7 @@ private:
     bool    add_bos_default_ = true;
     int     max_digits_ = 3;
     bool    use_llama3_pre_ = false;
-    bool    is_spm_bpe_ = false;
+    bool    use_spm_bpe_ = false;
 };
 
 } // namespace rookery

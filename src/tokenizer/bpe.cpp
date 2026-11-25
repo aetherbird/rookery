@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <limits>
 #include <stdexcept>
 
@@ -99,9 +100,9 @@ void BpeTokenizer::load(const GgufFile & gguf) {
     eot_id_          = static_cast<int32_t>(gguf.get_u64("tokenizer.ggml.eot_token_id", 200001));
     add_bos_default_ = gguf.get_bool("tokenizer.ggml.add_bos_token", true);
     const std::string tok_model = gguf.get_str("tokenizer.ggml.model", "");
-    const std::string pre = gguf.get_str("tokenizer.ggml.pre", "");
-    is_spm_bpe_ = (tok_model == "gemma4" || tok_model == "spm" || tok_model == "llama");
-    max_digits_ = (pre == "qwen35" || pre == "qwen2" || pre == "bailingmoe" || pre == "bailingmoe2") ? 1 : 3;
+    const std::string pre       = gguf.get_str("tokenizer.ggml.pre", "");
+    use_spm_bpe_    = (tok_model == "gemma4" || pre == "gemma4" || tok_model == "spm" || tok_model == "llama");
+    max_digits_     = (pre == "qwen35" || pre == "qwen2" || pre == "bailingmoe" || pre == "bailingmoe2") ? 1 : 3;
     use_llama3_pre_ = (pre == "qwen35" || pre == "qwen2" || pre == "glm4" || pre == "glm5" ||
                        pre == "llama3" || pre == "llama-bpe" || pre == "bailingmoe" || pre == "bailingmoe2");
 
@@ -156,30 +157,30 @@ void BpeTokenizer::load(const GgufFile & gguf) {
             continue;
         }
         const std::string & tok = id_to_token_[i];
-        if (is_spm_bpe_) {
-            if (token_types_[i] == 6 && tok.size() == 6 && tok[0] == '<' && tok[1] == '0' && tok[2] == 'x' && tok[5] == '>') {
-                auto hexv = [](char c) -> int {
+        if (use_spm_bpe_) {
+            // SentencePiece-style BPE (Gemma 4 / SPM): byte tokens <0xXX> (type 6) and U+2581 ('▁') -> ASCII space
+            if (token_types_[i] == 6 && tok.size() == 6 && tok.compare(0, 3, "<0x") == 0 && tok[5] == '>') {
+                auto hex_nib = [](char c) -> int {
                     if (c >= '0' && c <= '9') return c - '0';
-                    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
-                    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
-                    return 0;
+                    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                    return -1;
                 };
-                char b = static_cast<char>((hexv(tok[3]) << 4) | hexv(tok[4]));
-                decoded_tokens_[i] = std::string(1, b);
-                continue;
+                int hi = hex_nib(tok[3]), lo = hex_nib(tok[4]);
+                if (hi >= 0 && lo >= 0) {
+                    decoded_tokens_[i].assign(1, static_cast<char>((hi << 4) | lo));
+                    continue;
+                }
             }
             std::string out;
             out.reserve(tok.size());
+            static const std::string kSpmSpace = "\xE2\x96\x81";
             for (size_t pos = 0; pos < tok.size();) {
-                if (pos + 2 < tok.size() &&
-                    static_cast<uint8_t>(tok[pos]) == 0xE2 &&
-                    static_cast<uint8_t>(tok[pos + 1]) == 0x96 &&
-                    static_cast<uint8_t>(tok[pos + 2]) == 0x81) {
+                if (pos + 3 <= tok.size() && tok.compare(pos, 3, kSpmSpace) == 0) {
                     out.push_back(' ');
                     pos += 3;
                 } else {
-                    out.push_back(tok[pos]);
-                    ++pos;
+                    out.push_back(tok[pos++]);
                 }
             }
             decoded_tokens_[i] = std::move(out);
@@ -435,34 +436,8 @@ void BpeTokenizer::bpe_encode_piece(const std::string & piece, std::vector<int32
 
     std::vector<std::string> syms;
     syms.reserve(piece.size());
-    if (is_spm_bpe_) {
-        static const char kHex[] = "0123456789ABCDEF";
-        for (size_t pos = 0; pos < piece.size();) {
-            if (piece[pos] == ' ') {
-                syms.emplace_back("\xE2\x96\x81");
-                ++pos;
-                continue;
-            }
-            uint32_t cp = 0; size_t len = 0;
-            decode_utf8_at(piece, pos, cp, len);
-            std::string ch = piece.substr(pos, len);
-            if (token_to_id_.find(ch) != token_to_id_.end()) {
-                syms.push_back(std::move(ch));
-            } else {
-                for (size_t k = 0; k < len; ++k) {
-                    uint8_t b = static_cast<uint8_t>(piece[pos + k]);
-                    std::string hex = "<0x00>";
-                    hex[3] = kHex[b >> 4];
-                    hex[4] = kHex[b & 0xF];
-                    syms.push_back(std::move(hex));
-                }
-            }
-            pos += len;
-        }
-    } else {
-        for (unsigned char b : piece) {
-            syms.push_back(byte_to_unicode_[b]);
-        }
+    for (unsigned char b : piece) {
+        syms.push_back(byte_to_unicode_[b]);
     }
 
     while (syms.size() > 1) {
@@ -491,11 +466,89 @@ void BpeTokenizer::bpe_encode_piece(const std::string & piece, std::vector<int32
     }
 }
 
+void BpeTokenizer::bpe_encode_spm_segment(const std::string & seg, std::vector<int32_t> & out) const {
+    if (seg.empty()) return;
+    static const std::string kSpmSpace = "\xE2\x96\x81";
+
+    // Split on newline runs: "[^\n]+|[\n]+"
+    size_t i = 0;
+    while (i < seg.size()) {
+        const bool is_nl = (seg[i] == '\n');
+        size_t j = i + 1;
+        while (j < seg.size() && (seg[j] == '\n') == is_nl) ++j;
+        std::string piece = seg.substr(i, j - i);
+        i = j;
+
+        if (is_nl) {
+            auto it = token_to_id_.find(piece);
+            if (it != token_to_id_.end()) {
+                out.push_back(it->second);
+                continue;
+            }
+        }
+
+        // Escape ASCII spaces to U+2581 ('▁') and split into UTF-8 codepoints
+        std::vector<std::string> syms;
+        syms.reserve(piece.size());
+        for (size_t pos = 0; pos < piece.size();) {
+            if (piece[pos] == ' ') {
+                syms.push_back(kSpmSpace);
+                ++pos;
+            } else {
+                uint32_t cp = 0; size_t len = 0;
+                decode_utf8_at(piece, pos, cp, len);
+                syms.push_back(piece.substr(pos, len));
+                pos += len;
+            }
+        }
+
+        while (syms.size() > 1) {
+            int32_t best_rank = std::numeric_limits<int32_t>::max();
+            size_t  best_idx  = std::string::npos;
+            for (size_t k = 0; k + 1 < syms.size(); ++k) {
+                std::string pair = syms[k] + " " + syms[k + 1];
+                auto it = merge_ranks_.find(pair);
+                if (it != merge_ranks_.end() && it->second < best_rank) {
+                    best_rank = it->second;
+                    best_idx  = k;
+                }
+            }
+            if (best_idx == std::string::npos) break;
+            syms[best_idx] += syms[best_idx + 1];
+            syms.erase(syms.begin() + static_cast<ptrdiff_t>(best_idx + 1));
+        }
+
+        for (const auto & s : syms) {
+            auto it = token_to_id_.find(s);
+            if (it != token_to_id_.end()) {
+                out.push_back(it->second);
+            } else {
+                // Byte fallback <0xXX>
+                for (unsigned char b : s) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "<0x%02X>", static_cast<unsigned>(b));
+                    auto bit = token_to_id_.find(buf);
+                    if (bit != token_to_id_.end()) out.push_back(bit->second);
+                }
+            }
+        }
+    }
+}
+
 std::vector<int32_t> BpeTokenizer::encode(const std::string & text, bool add_bos, bool parse_special) const {
     std::vector<int32_t> out;
     if (add_bos && add_bos_default_) {
         out.push_back(bos_id_);
     }
+
+    auto encode_seg = [&](const std::string & seg) {
+        if (use_spm_bpe_) {
+            bpe_encode_spm_segment(seg, out);
+        } else {
+            const auto pcs = use_llama3_pre_ ? pretokenize_llama3(seg) : pretokenize_maxwell(seg);
+            for (const auto & p : pcs) bpe_encode_piece(p, out);
+        }
+    };
 
     size_t pos = 0;
     size_t chunk_start = 0;
@@ -515,9 +568,7 @@ std::vector<int32_t> BpeTokenizer::encode(const std::string & text, bool add_bos
 
         if (matched_id >= 0) {
             if (pos > chunk_start) {
-                const std::string seg = text.substr(chunk_start, pos - chunk_start);
-                const auto pcs = use_llama3_pre_ ? pretokenize_llama3(seg) : pretokenize_maxwell(seg);
-                for (const auto & p : pcs) bpe_encode_piece(p, out);
+                encode_seg(text.substr(chunk_start, pos - chunk_start));
             }
             out.push_back(matched_id);
             pos += matched_len;
@@ -528,9 +579,7 @@ std::vector<int32_t> BpeTokenizer::encode(const std::string & text, bool add_bos
     }
 
     if (chunk_start < text.size()) {
-        const std::string seg = text.substr(chunk_start);
-        const auto pcs = use_llama3_pre_ ? pretokenize_llama3(seg) : pretokenize_maxwell(seg);
-        for (const auto & p : pcs) bpe_encode_piece(p, out);
+        encode_seg(text.substr(chunk_start));
     }
     return out;
 }

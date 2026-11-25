@@ -7,7 +7,7 @@ Modes:
   1. `flapling-fp8`:
      Packs a 2-layer FP8 E4M3FN NGRAM_HASH table (e.g. flapling-22b 8.19B FP8, ~7.64 GiB)
      together with its BPE tokenizer & compressed token_map into a single standalone GGUF
-     with `per_layer_token_embd.weight` stored directly as GGML F8_E4M3 (type 40, zero requant!).
+     with `per_layer_token_embd.weight` stored directly as GGML F8_E4M3 (type 43, zero requant).
 
   2. `gemma4-ple`:
      Extracts `per_layer_token_embd.weight` (Q6_K or F16/BF16, [n_layers * ple_dim, vocab_size])
