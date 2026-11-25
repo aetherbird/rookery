@@ -801,7 +801,7 @@ void Inkling2LoopModel::run_layer(DevRuntime & rt, int il, int ip, int T, int & 
                             T, cfg_.n_expert_used, cfg_.situ_beta, cfg_.situ_linear_beta, st);
     launch_inkling2_shortconv(rt.d_moe_raw, static_cast<const float *>(L.ffn_post_conv.ptr),
                               nullptr, conv_ffn_[il], rt.d_cur, T, H, 0, st, rt.d_cur);
-    if (hook_ != nullptr) {
+    if (hook_ != nullptr && ip != cfg_.n_phys - 1) {
         hook_->on_post_layer(ip, rt.device, rt.d_cur, T, H, 1, st);
     }
 }
@@ -871,10 +871,13 @@ void Inkling2LoopModel::run_postlude_and_head(int T, bool run_argmax, int kv_len
         run_layer(rt, ip, ip, T, n_blocks, false, kv_len_max);
     }
 
-    // Output depth mix + RMSNorm on postlude GPU (in asym mode, lm_head runs on GPU0 via run_head_only!)
+    // Output depth mix + optional final-layer hook (post-depth-mix, directly before output_norm -> lm_head!)
     launch_inkling2_depth_mix(rt.d_block_ptrs, n_blocks, rt.d_cur,
                               static_cast<const float *>(output_res_query_.ptr),
                               rt.d_mixed3, H, 1, T, cfg_.rms_eps, rt.stream);
+    if (hook_ != nullptr) {
+        hook_->on_post_layer(cfg_.n_phys - 1, rt.device, rt.d_mixed3, T, H, 1, rt.stream);
+    }
     launch_rmsnorm(rt.d_mixed3 + static_cast<size_t>(T - 1) * H,
                    static_cast<const float *>(output_norm_.ptr),
                    rt.d_x_norm, H, 1, cfg_.rms_eps, rt.stream);

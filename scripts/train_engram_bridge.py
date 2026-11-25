@@ -291,6 +291,7 @@ def maxwell_head_logits(
     lm_head: torch.Tensor,
     rms_eps: float = 1e-6,
     hc_eps: float = 1e-6,
+    logit_softcap: float = 0.0,
 ) -> torch.Tensor:
     B, hc, D = h_hc.shape
     if hc_fn is not None:
@@ -304,6 +305,8 @@ def maxwell_head_logits(
     inv_rms = torch.rsqrt(mixed.pow(2).mean(dim=-1, keepdim=True) + rms_eps)
     x_norm = mixed * inv_rms * out_norm
     logits = F.linear(x_norm.to(lm_head.dtype), lm_head).float()
+    if logit_softcap > 0.0:
+        logits = logit_softcap * torch.tanh(logits / logit_softcap)
     return logits
 
 
@@ -434,6 +437,7 @@ def evaluate(
     W_K_norm=None,
     batch_size=256,
     shuffled=False,
+    logit_softcap=0.0,
 ):
     bridge.eval()
     hc_fn, hc_scale, hc_base, out_norm, lm_head = head_tensors
@@ -451,14 +455,14 @@ def evaluate(
         eb = torch.from_numpy(e_val[eb_idx]).to(device=device, dtype=torch.float32) - mu_e_t
         yb = torch.from_numpy(y_val[i:j]).to(device=device, dtype=torch.long)
 
-        base_logits = maxwell_head_logits(hb, hc_fn, hc_scale, hc_base, out_norm, lm_head)
+        base_logits = maxwell_head_logits(hb, hc_fn, hc_scale, hc_base, out_norm, lm_head, logit_softcap=logit_softcap)
         tot_base_nll += F.cross_entropy(base_logits, yb, reduction="sum").item()
         base_hit1 += (base_logits.argmax(dim=-1) == yb).sum().item()
 
         ev = F.linear(eb, W_V_norm) if W_V_norm is not None else eb
         ek = F.linear(eb, W_K_norm) if W_K_norm is not None else ev
         h_out = bridge(hb, ev, ek)
-        logits = maxwell_head_logits(h_out, hc_fn, hc_scale, hc_base, out_norm, lm_head)
+        logits = maxwell_head_logits(h_out, hc_fn, hc_scale, hc_base, out_norm, lm_head, logit_softcap=logit_softcap)
         tot_nll += F.cross_entropy(logits, yb, reduction="sum").item()
         hit1 += (logits.argmax(dim=-1) == yb).sum().item()
 
@@ -503,7 +507,9 @@ def main():
     ap.add_argument("--host-arch", default="maxwell-moe")
     ap.add_argument("--host-n-layers", type=int, default=45)
     ap.add_argument("--delta-clip", type=float, default=0.15)
+    ap.add_argument("--logit-softcap", type=float, default=-1.0, help="Optional final logit softcap (default: auto 30.0 for inkling2_loop, 0 otherwise)")
     args = ap.parse_args()
+    logit_softcap = args.logit_softcap if args.logit_softcap >= 0.0 else (30.0 if args.host_arch in ("inkling2_loop", "inkling2") else 0.0)
 
     t0 = time.time()
     device = torch.device("cuda:0")
@@ -571,7 +577,7 @@ def main():
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, total_steps), eta_min=args.lr * 0.05)
 
     b_nll, b_ppl, b_t1, r_nll, r_ppl, r_t1 = evaluate(
-        bridge, h_va, e_va, y_va, mu_e_t, head_tensors, W_V_norm, W_K_norm
+        bridge, h_va, e_va, y_va, mu_e_t, head_tensors, W_V_norm, W_K_norm, logit_softcap=logit_softcap
     )
     print(f"[Epoch 0] val BASE: NLL={b_nll:.5f} PPL={b_ppl:.3f} top1={b_t1:.2f}% | init PPL={r_ppl:.3f}", flush=True)
 
@@ -585,7 +591,7 @@ def main():
                 j = min(sub_n, i + 256)
                 hb = torch.from_numpy(h_tr[i:j]).to(device=device, dtype=torch.float32)
                 yb = torch.from_numpy(y_tr[i:j]).to(device=device, dtype=torch.long)
-                bl = maxwell_head_logits(hb, hc_fn, hc_scale, hc_base, out_norm, lm_head)
+                bl = maxwell_head_logits(hb, hc_fn, hc_scale, hc_base, out_norm, lm_head, logit_softcap=logit_softcap)
                 for ti, tval in enumerate(taus):
                     nll_sums[ti] += F.cross_entropy(bl / tval, yb, reduction="sum").item()
         best_ti = int(np.argmin(nll_sums))
@@ -617,14 +623,14 @@ def main():
             yb = torch.from_numpy(y_tr[idx]).to(device=device, dtype=torch.long)
 
             with torch.no_grad():
-                base_logits = maxwell_head_logits(hb, hc_fn, hc_scale, hc_base, out_norm, lm_head)
+                base_logits = maxwell_head_logits(hb, hc_fn, hc_scale, hc_base, out_norm, lm_head, logit_softcap=logit_softcap)
                 base_logp = F.log_softmax(base_logits / train_tau, dim=-1)
                 base_p = base_logp.exp()
                 ev = F.linear(eb, W_V_norm) if W_V_norm is not None else eb
                 ek = F.linear(eb, W_K_norm) if W_K_norm is not None else ev
 
             h_out, rel_norm, _ = bridge(hb, ev, ek, return_stats=True)
-            logits = maxwell_head_logits(h_out, hc_fn, hc_scale, hc_base, out_norm, lm_head)
+            logits = maxwell_head_logits(h_out, hc_fn, hc_scale, hc_base, out_norm, lm_head, logit_softcap=logit_softcap)
             logp = F.log_softmax(logits / train_tau, dim=-1)
 
             ce = F.nll_loss(logp, yb)
@@ -635,7 +641,7 @@ def main():
             if args.shuf_kl_beta > 0.0 and eb.shape[0] > 1:
                 perm = torch.roll(torch.arange(eb.shape[0], device=device), shifts=1)
                 h_shuf = bridge(hb, ev[perm], ek[perm])
-                shuf_logits = maxwell_head_logits(h_shuf, hc_fn, hc_scale, hc_base, out_norm, lm_head)
+                shuf_logits = maxwell_head_logits(h_shuf, hc_fn, hc_scale, hc_base, out_norm, lm_head, logit_softcap=logit_softcap)
                 shuf_logp = F.log_softmax(shuf_logits / train_tau, dim=-1)
                 skl = (base_p * (base_logp - shuf_logp)).sum(dim=-1).mean()
                 loss = loss + args.shuf_kl_beta * skl
@@ -657,10 +663,10 @@ def main():
             steps += 1
 
         _, _, _, r_nll, r_ppl, r_t1 = evaluate(
-            bridge, h_va, e_va, y_va, mu_e_t, head_tensors, W_V_norm, W_K_norm, shuffled=False
+            bridge, h_va, e_va, y_va, mu_e_t, head_tensors, W_V_norm, W_K_norm, shuffled=False, logit_softcap=logit_softcap
         )
         _, _, _, s_nll, s_ppl, s_t1 = evaluate(
-            bridge, h_va, e_va, y_va, mu_e_t, head_tensors, W_V_norm, W_K_norm, shuffled=True
+            bridge, h_va, e_va, y_va, mu_e_t, head_tensors, W_V_norm, W_K_norm, shuffled=True, logit_softcap=logit_softcap
         )
         print(
             f"[Epoch {ep:2d}] tr_CE={tr_ce_sum/steps:.4f} tr_KL={tr_kl_sum/steps:.4f} "
