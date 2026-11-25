@@ -497,7 +497,7 @@ void Qwen35MoeModel::run_gpu_segment(size_t gi, int T, bool run_argmax, bool sav
                                          rt.d_sub_out, rt.d_scratch, rt.scratch_bytes,
                                          T, cfg_.n_expert_used, st);
         launch_add_inplace(rt.d_cur, rt.d_sub_out, static_cast<int64_t>(T) * H, st);
-        if (hook_ != nullptr) {
+        if (hook_ != nullptr && hook_->hooks_layer(il)) {
             hook_->on_post_layer(il, rt.device, rt.d_cur, T, H, 1, st);
         }
     }

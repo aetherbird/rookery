@@ -58,6 +58,7 @@ private:
     bool    add_bos_default_ = true;
     int     max_digits_ = 3;
     bool    use_llama3_pre_ = false;
+    bool    is_spm_bpe_ = false;
 };
 
 } // namespace rookery

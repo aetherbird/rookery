@@ -58,11 +58,15 @@ inline bool is_ws_char(char c) {
     return c == ' ' || c == '\t' || c == '\n' || c == '\r';
 }
 
+} // namespace
+
 // Find the LATEST BPE pre-tokenizer-safe cut offset in [min_cut, max_cut] so encoding text[cut:]
 // produces exact suffix token IDs identical to encoding full text[0:].
 // Scanning backwards keeps the active tail as short as possible for incremental caching!
-// Returns 0 if no safe boundary exists in [min_cut, max_cut].
-size_t find_latest_safe_bpe_cut(const std::string & text, size_t min_cut, size_t max_cut) {
+// If no whitespace/newline boundary exists and the uncommitted tail exceeds `max_uncommitted` bytes
+// (e.g. long CJK runs, base64, minified JSON), falls back to the latest valid UTF-8 codepoint boundary
+// so memory & retokenization stay strictly O(1) bounded.
+size_t EngramSidecar::find_safe_bpe_cut(const std::string & text, size_t min_cut, size_t max_cut, size_t max_uncommitted) {
     if (min_cut == 0 || min_cut > max_cut || max_cut >= text.size()) return 0;
 
     // Pass 1: clean start-of-line right after '\n' (not followed by whitespace)
@@ -79,10 +83,20 @@ size_t find_latest_safe_bpe_cut(const std::string & text, size_t min_cut, size_t
         }
         if (p == min_cut) break;
     }
+    // Pass 3 (bounded-tail fallback for space-less text): if uncommitted suffix exceeds max_uncommitted bytes,
+    // cut at the latest valid UTF-8 codepoint boundary (not a continuation byte 10xxxxxx).
+    const size_t committed_bytes = min_cut - 1;
+    if (max_uncommitted > 0 && text.size() > committed_bytes + max_uncommitted) {
+        for (size_t p = max_cut; p >= min_cut; --p) {
+            const unsigned char b = static_cast<unsigned char>(text[p]);
+            if ((b & 0xC0u) != 0x80u) {
+                return p;
+            }
+            if (p == min_cut) break;
+        }
+    }
     return 0;
 }
-
-} // namespace
 
 EngramAdapterManifest validate_rkad_v3_manifest(
     const std::string & manifest_json,
@@ -191,6 +205,7 @@ void EngramSidecar::free_gpu_buffers() noexcept {
         freep(hk.d_hmean);
         if (hk.h_engram_pin) cudaFreeHost(hk.h_engram_pin);
         if (hk.h_params_pin) cudaFreeHost(hk.h_params_pin);
+        if (hk.h2d_stream)   cudaStreamDestroy(hk.h2d_stream);
         if (hk.ev_start) cudaEventDestroy(hk.ev_start);
         if (hk.ev_stop)  cudaEventDestroy(hk.ev_stop);
     }
@@ -244,6 +259,7 @@ void EngramSidecar::init(const std::string & engram_path,
         }
         hk.d_hmean = dev_alloc<float>(hk.device, static_cast<size_t>(max_batch_) * d_host_);
         cuda_ok(cudaSetDevice(hk.device), "engram memset setDevice");
+        cuda_ok(cudaStreamCreateWithFlags(&hk.h2d_stream, cudaStreamNonBlocking), "engram h2d stream");
         cuda_ok(cudaEventCreate(&hk.ev_start), "engram event start");
         cuda_ok(cudaEventCreate(&hk.ev_stop),  "engram event stop");
         cuda_ok(cudaMemset(hk.d_engram_in, 0, static_cast<size_t>(max_batch_) * d_eng * sizeof(float)), "engram memset");
@@ -612,23 +628,33 @@ void EngramSidecar::advance_seq_state(EngramSeqState & st,
 
     // Advance boundary-anchored commit cursor: keep a 48-byte safety guard behind rolling_text.size(),
     // and commit everything strictly up to the LATEST pre-tokenizer-safe BPE cut <= end - 48!
+    // If space-less text exceeds kMaxUncommittedTail bytes without a whitespace cut, commit up to the
+    // latest provider token boundary <= max_c so memory & retokenization remain strictly O(1) bounded.
     constexpr size_t kCommitGuard = 48;
+    constexpr size_t kMaxUncommittedTail = 1024;
     if (st.rolling_text.size() > committed_bytes + kCommitGuard + 16) {
         const size_t min_c = committed_bytes + 1;
         const size_t max_c = st.rolling_text.size() - kCommitGuard;
-        const size_t cut = find_latest_safe_bpe_cut(st.rolling_text, min_c, max_c);
+        const size_t cut = find_safe_bpe_cut(st.rolling_text, min_c, max_c, kMaxUncommittedTail);
+        int commit_k = -1;
         if (cut > committed_bytes) {
-            // Only commit if BPE tokenization landed cleanly on exact byte offset `cut`
-            int commit_k = -1;
             for (int k = 0; k < n_tail; ++k) {
                 if (tail_ends[k] == cut) { commit_k = k; break; }
                 if (tail_ends[k] > cut) break;
             }
-            if (commit_k >= 0) {
-                for (int k = 0; k <= commit_k; ++k) {
-                    st.committed_src_tokens.push_back(tail_src[k]);
-                    st.committed_src_ends.push_back(tail_ends[k]);
+            // Fallback when bounded-tail UTF-8 cut landed inside a multi-char space-less BPE token:
+            // commit up to the latest complete source token ending <= cut.
+            if (commit_k < 0 && st.rolling_text.size() > committed_bytes + kMaxUncommittedTail) {
+                for (int k = 0; k < n_tail; ++k) {
+                    if (tail_ends[k] <= cut) commit_k = k;
+                    else break;
                 }
+            }
+        }
+        if (commit_k >= 0) {
+            for (int k = 0; k <= commit_k; ++k) {
+                st.committed_src_tokens.push_back(tail_src[k]);
+                st.committed_src_ends.push_back(tail_ends[k]);
             }
         }
     }
@@ -833,7 +859,8 @@ void EngramSidecar::prepare_step(const std::vector<int32_t> & host_tokens,
         // Skip table gather if all tokens have tok_scale == 0 and no dump is active (still upload zeroed params so GPU early-exits!)
         if (any_active || dump_fp_ != nullptr) {
             table_.gather_dequant_f32(scratch_hook_rows_[hi].data(), scratch_hook_valid_[hi].data(), T, hk.h_engram_pin);
-            if (!hk.h_mu_e.empty()) {
+            // Never subtract mu_E when dumping calibration vectors (prevents double-centering!)
+            if (!hk.h_mu_e.empty() && dump_fp_ == nullptr && ce_fp_ == nullptr) {
                 const float * mu = hk.h_mu_e.data();
                 for (int t = 0; t < T; ++t) {
                     float * dst = hk.h_engram_pin + static_cast<size_t>(t) * d_eng;
@@ -845,7 +872,9 @@ void EngramSidecar::prepare_step(const std::vector<int32_t> & host_tokens,
 
     const auto tp3 = std::chrono::steady_clock::now();
 
-    // 3. Upload fixed-address params & Engram inputs to each active hook's GPU
+    // 3. Upload fixed-address params & Engram inputs on each hook's dedicated non-blocking H2D stream,
+    //    then explicitly synchronize H2D completion before returning so ANY host compute stream
+    //    (blocking, cudaStreamNonBlocking, or CUDA Graph replay) sees coherent buffers!
     for (size_t hi = 0; hi < hooks_.size(); ++hi) {
         auto & hk = hooks_[hi];
         if (hk.scale == 0.0f && dump_fp_ == nullptr) continue;
@@ -856,14 +885,20 @@ void EngramSidecar::prepare_step(const std::vector<int32_t> & host_tokens,
         cuda_ok(cudaSetDevice(hk.device), "engram upload setDevice");
         cuda_ok(cudaMemcpyAsync(hk.d_params, hk.h_params_pin,
                                 static_cast<size_t>(T) * sizeof(EngramRuntimeParams),
-                                cudaMemcpyHostToDevice, nullptr),
+                                cudaMemcpyHostToDevice, hk.h2d_stream),
                 "engram params H2D");
         if (any_active || dump_fp_ != nullptr) {
             cuda_ok(cudaMemcpyAsync(hk.d_engram_in, hk.h_engram_pin,
                                     static_cast<size_t>(T) * d_eng * sizeof(float),
-                                    cudaMemcpyHostToDevice, nullptr),
+                                    cudaMemcpyHostToDevice, hk.h2d_stream),
                     "engram H2D copy");
         }
+    }
+    for (size_t hi = 0; hi < hooks_.size(); ++hi) {
+        auto & hk = hooks_[hi];
+        if (hk.scale == 0.0f && dump_fp_ == nullptr) continue;
+        cuda_ok(cudaSetDevice(hk.device), "engram sync setDevice");
+        cuda_ok(cudaStreamSynchronize(hk.h2d_stream), "engram h2d sync");
     }
 
     const auto tp4 = std::chrono::steady_clock::now();
@@ -944,14 +979,20 @@ void EngramSidecar::prepare_batch_step(const std::vector<int> & seq_ids,
         cuda_ok(cudaSetDevice(hk.device), "engram batch upload setDevice");
         cuda_ok(cudaMemcpyAsync(hk.d_params, hk.h_params_pin,
                                 static_cast<size_t>(T) * sizeof(EngramRuntimeParams),
-                                cudaMemcpyHostToDevice, nullptr),
+                                cudaMemcpyHostToDevice, hk.h2d_stream),
                 "engram batch params H2D");
         if (any_active) {
             cuda_ok(cudaMemcpyAsync(hk.d_engram_in, hk.h_engram_pin,
                                     static_cast<size_t>(T) * d_eng * sizeof(float),
-                                    cudaMemcpyHostToDevice, nullptr),
+                                    cudaMemcpyHostToDevice, hk.h2d_stream),
                     "engram batch H2D");
         }
+    }
+    for (size_t hi = 0; hi < hooks_.size(); ++hi) {
+        auto & hk = hooks_[hi];
+        if (hk.scale == 0.0f) continue;
+        cuda_ok(cudaSetDevice(hk.device), "engram batch sync setDevice");
+        cuda_ok(cudaStreamSynchronize(hk.h2d_stream), "engram batch h2d sync");
     }
 
     const auto tp3 = std::chrono::steady_clock::now();

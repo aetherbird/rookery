@@ -94,6 +94,9 @@ struct EngramHookSpec {
     float *               d_key        = nullptr; // [max_batch, d_host] (if gated)
     float *               d_hmean      = nullptr; // [max_batch, d_host] (for calibration dumps)
 
+    // Dedicated non-blocking H2D stream (explicit sync in prepare_step/prepare_batch_step — zero reliance on legacy default stream)
+    cudaStream_t h2d_stream = nullptr;
+
     // Optional CUDA events for stage-by-stage GPU hook profiling (only when gpu_profile_ == true, non-graph)
     cudaEvent_t ev_start = nullptr;
     cudaEvent_t ev_stop  = nullptr;
@@ -198,6 +201,11 @@ public:
 
     void release_sequence(int seq_id) { seq_states_.erase(seq_id); }
     void clear_all_sequences() { seq_states_.clear(); }
+    size_t active_sequences() const { return seq_states_.size(); }
+
+    // Boundary-anchored BPE cut helper (exposed for property-based unit tests).
+    // Falls back to a valid UTF-8 codepoint boundary when space-less runs exceed `max_uncommitted` bytes.
+    static size_t find_safe_bpe_cut(const std::string & text, size_t min_cut, size_t max_cut, size_t max_uncommitted = 1024);
 
     void set_gpu_profiling(bool enable) { gpu_profile_ = enable; }
     void reset_profile() { prof_ = EngramProfileStats{}; }

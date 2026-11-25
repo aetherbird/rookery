@@ -270,7 +270,11 @@ void EngramTable::hash_tokens(int engram_layer_idx,
             const int idx = start_idx + i;
             int32_t tok = (idx >= 0 && idx < static_cast<int>(seq_tokens.size())) ? seq_tokens[idx] : 0;
             uint64_t row = static_cast<uint64_t>(std::max<int32_t>(0, tok)) * cfg_.n_layers + engram_layer_idx;
-            if (row >= cfg_.total_rows) row %= cfg_.total_rows;
+            if (shuffle_salt_ != 0 && cfg_.total_rows > 0) {
+                row = ((row ^ shuffle_salt_) * 11400714819323198485ULL) % cfg_.total_rows;
+            } else if (row >= cfg_.total_rows) {
+                row %= cfg_.total_rows;
+            }
             out_row_ids[i] = static_cast<int32_t>(row);
             out_valid[i]   = 1.0f;
         }

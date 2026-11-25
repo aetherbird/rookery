@@ -226,6 +226,7 @@ struct ServerEngine {
     int32_t mtp_last_next_tok = -1;
     bool    has_cached_engram_params = false;
     rookery::EngramRuntimeParams cached_engram_params{};
+    int     engram_seq_id            = 0;
 
     void prune_state_checkpoints_after(int pos) {
         kda_checkpoints.erase(
@@ -513,6 +514,15 @@ static GenResult run_generation(
     gr.reused_tokens    = reuse_pos;
     gr.prefilled_tokens = prompt_ids.size() - reuse_pos;
 
+    // Sequence-state lifecycle for EngramSidecar: release evicted sequence state on cold start
+    // (reuse_pos == 0) and assign a fresh seq_id; on prefix-cache reuse keep the active seq_id
+    // (prepare_step rolls back EngramSeqState cleanly to reuse_pos).
+    if (engram && reuse_pos == 0) {
+        engram->release_sequence(engine.engram_seq_id);
+        engine.engram_seq_id += 1;
+    }
+    const int cur_engram_seq_id = engine.engram_seq_id;
+
     std::vector<int32_t> pos(prompt_ids.size());
     std::iota(pos.begin(), pos.end(), 0);
 
@@ -526,7 +536,7 @@ static GenResult run_generation(
                                 prompt_ids.begin() + static_cast<ptrdiff_t>(off + len));
         std::vector<int32_t> pp(pos.begin() + static_cast<ptrdiff_t>(off),
                                 pos.begin() + static_cast<ptrdiff_t>(off + len));
-        if (engram) engram->prepare_step(pt, static_cast<int>(off), engram_params, 0);
+        if (engram) engram->prepare_step(pt, static_cast<int>(off), engram_params, cur_engram_seq_id);
         engine.forward(pt, pp, logits);
         if (run_mtp && off + len < prompt_ids.size()) {
             std::vector<int32_t> next_t(len);
@@ -603,7 +613,7 @@ static GenResult run_generation(
                     engine.save_state_checkpoint(cur_pos);
                     if (gr.tokens.size() >= next_gen_ckpt) next_gen_ckpt = gr.tokens.size() + 128;
                 }
-                if (engram) engram->prepare_step({cur_tok, draft}, cur_pos, engram_params, 0);
+                if (engram) engram->prepare_step({cur_tok, draft}, cur_pos, engram_params, cur_engram_seq_id);
                 const int32_t old_cur   = cur_tok;
                 const int32_t old_draft = draft;
                 const int32_t old_pos   = cur_pos;
@@ -638,7 +648,7 @@ static GenResult run_generation(
             }
         } else if (keep_going) {
             while (static_cast<int>(gr.tokens.size()) < max_tokens && cur_pos + 1 < engine.max_ctx()) {
-                if (engram) engram->prepare_step({cur_tok}, cur_pos, engram_params, 0);
+                if (engram) engram->prepare_step({cur_tok}, cur_pos, engram_params, cur_engram_seq_id);
                 const int32_t fed_tok = cur_tok;
                 if (sampler.is_greedy()) {
                     cur_tok = engine.forward_decode_greedy(cur_tok, cur_pos++);

@@ -98,7 +98,9 @@ void BpeTokenizer::load(const GgufFile & gguf) {
     eos_id_          = static_cast<int32_t>(gguf.get_u64("tokenizer.ggml.eos_token_id", 2));
     eot_id_          = static_cast<int32_t>(gguf.get_u64("tokenizer.ggml.eot_token_id", 200001));
     add_bos_default_ = gguf.get_bool("tokenizer.ggml.add_bos_token", true);
+    const std::string tok_model = gguf.get_str("tokenizer.ggml.model", "");
     const std::string pre = gguf.get_str("tokenizer.ggml.pre", "");
+    is_spm_bpe_ = (tok_model == "gemma4" || tok_model == "spm" || tok_model == "llama");
     max_digits_ = (pre == "qwen35" || pre == "qwen2" || pre == "bailingmoe" || pre == "bailingmoe2") ? 1 : 3;
     use_llama3_pre_ = (pre == "qwen35" || pre == "qwen2" || pre == "glm4" || pre == "glm5" ||
                        pre == "llama3" || pre == "llama-bpe" || pre == "bailingmoe" || pre == "bailingmoe2");
@@ -154,6 +156,35 @@ void BpeTokenizer::load(const GgufFile & gguf) {
             continue;
         }
         const std::string & tok = id_to_token_[i];
+        if (is_spm_bpe_) {
+            if (token_types_[i] == 6 && tok.size() == 6 && tok[0] == '<' && tok[1] == '0' && tok[2] == 'x' && tok[5] == '>') {
+                auto hexv = [](char c) -> int {
+                    if (c >= '0' && c <= '9') return c - '0';
+                    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+                    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+                    return 0;
+                };
+                char b = static_cast<char>((hexv(tok[3]) << 4) | hexv(tok[4]));
+                decoded_tokens_[i] = std::string(1, b);
+                continue;
+            }
+            std::string out;
+            out.reserve(tok.size());
+            for (size_t pos = 0; pos < tok.size();) {
+                if (pos + 2 < tok.size() &&
+                    static_cast<uint8_t>(tok[pos]) == 0xE2 &&
+                    static_cast<uint8_t>(tok[pos + 1]) == 0x96 &&
+                    static_cast<uint8_t>(tok[pos + 2]) == 0x81) {
+                    out.push_back(' ');
+                    pos += 3;
+                } else {
+                    out.push_back(tok[pos]);
+                    ++pos;
+                }
+            }
+            decoded_tokens_[i] = std::move(out);
+            continue;
+        }
         std::string out;
         out.reserve(tok.size());
         for (size_t pos = 0; pos < tok.size();) {
@@ -404,8 +435,34 @@ void BpeTokenizer::bpe_encode_piece(const std::string & piece, std::vector<int32
 
     std::vector<std::string> syms;
     syms.reserve(piece.size());
-    for (unsigned char b : piece) {
-        syms.push_back(byte_to_unicode_[b]);
+    if (is_spm_bpe_) {
+        static const char kHex[] = "0123456789ABCDEF";
+        for (size_t pos = 0; pos < piece.size();) {
+            if (piece[pos] == ' ') {
+                syms.emplace_back("\xE2\x96\x81");
+                ++pos;
+                continue;
+            }
+            uint32_t cp = 0; size_t len = 0;
+            decode_utf8_at(piece, pos, cp, len);
+            std::string ch = piece.substr(pos, len);
+            if (token_to_id_.find(ch) != token_to_id_.end()) {
+                syms.push_back(std::move(ch));
+            } else {
+                for (size_t k = 0; k < len; ++k) {
+                    uint8_t b = static_cast<uint8_t>(piece[pos + k]);
+                    std::string hex = "<0x00>";
+                    hex[3] = kHex[b >> 4];
+                    hex[4] = kHex[b & 0xF];
+                    syms.push_back(std::move(hex));
+                }
+            }
+            pos += len;
+        }
+    } else {
+        for (unsigned char b : piece) {
+            syms.push_back(byte_to_unicode_[b]);
+        }
     }
 
     while (syms.size() > 1) {

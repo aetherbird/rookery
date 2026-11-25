@@ -99,7 +99,7 @@ static void test_engram_rkad_v3_contract() {
     bad_arch_cfg.arch = "hy_v4_flash";
     expect_throw([&]() { rookery::validate_rkad_v3_manifest(valid_json, bad_arch_cfg, "maxwell-moe", 45, 2048, 4); }, "provider_arch");
 
-    // 3. Per-sequence rollback_to preserves exact byte ends and safely rewinds committed cursor
+    // 3. Per-sequence rollback_to across every position + divergent continuation
     rookery::EngramSeqState st;
     st.rolling_text = "hello world foo bar";
     st.host_byte_ends = {5, 11, 15, 19};
@@ -112,7 +112,69 @@ static void test_engram_rkad_v3_contract() {
     st.rollback_to(0);
     assert(st.rolling_text.empty());
 
-    std::printf("[PASS] RKAD v3 manifest contract & EngramSeqState unit tests\n");
+    // 4. Property-based tests for find_safe_bpe_cut:
+    //    (a) Normal whitespace & newline boundaries
+    {
+        const std::string s = "first line\nsecond line third";
+        const size_t cut = rookery::EngramSidecar::find_safe_bpe_cut(s, 1, s.size() - 5, 1024);
+        assert(cut > 0 && (s[cut] == ' ' || s[cut - 1] == '\n'));
+    }
+    //    (b) Space-less base64 / minified JSON bounded-tail fallback
+    {
+        const std::string b64(2500, 'A');
+        const size_t cut_short = rookery::EngramSidecar::find_safe_bpe_cut(b64.substr(0, 500), 1, 450, 1024);
+        assert(cut_short == 0); // below max_uncommitted: waits for real boundary
+        const size_t cut_long = rookery::EngramSidecar::find_safe_bpe_cut(b64, 1, 2400, 1024);
+        assert(cut_long == 2400); // exceeds max_uncommitted: bounds uncommitted tail!
+    }
+    //    (c) Multi-byte UTF-8 space-less CJK & emoji: cut must NEVER land on a continuation byte (10xxxxxx)
+    {
+        std::string cjk;
+        for (int i = 0; i < 600; ++i) cjk += "\xe4\xbd\xa0\xe5\xa5\xbd\xf0\x9f\x9a\x80"; // 10 bytes per repeat = 6000 B
+        for (size_t max_c = 1500; max_c < 1530; ++max_c) {
+            const size_t cut = rookery::EngramSidecar::find_safe_bpe_cut(cjk, 1, max_c, 1024);
+            assert(cut >= 1 && cut <= max_c);
+            const unsigned char b = static_cast<unsigned char>(cjk[cut]);
+            assert((b & 0xC0u) != 0x80u); // guaranteed valid UTF-8 codepoint boundary!
+        }
+    }
+    //    (d) Arbitrary-position rollback on long multi-byte stream
+    {
+        rookery::EngramSeqState s2;
+        std::string txt;
+        std::vector<size_t> ends;
+        for (int i = 0; i < 200; ++i) {
+            txt += "tok" + std::to_string(i) + " ";
+            ends.push_back(txt.size());
+        }
+        for (int rp = 0; rp <= 200; rp += 17) {
+            s2.rolling_text = txt;
+            s2.host_byte_ends = ends;
+            s2.committed_src_tokens = {1, 2, 3, 4, 5};
+            s2.committed_src_ends   = {10, 50, 100, 300, 600};
+            s2.rollback_to(rp);
+            assert(static_cast<int>(s2.host_byte_ends.size()) == rp);
+            if (rp == 0) {
+                assert(s2.rolling_text.empty());
+                assert(s2.committed_src_tokens.empty());
+            } else {
+                assert(s2.rolling_text.size() == ends[rp - 1]);
+                if (!s2.committed_src_ends.empty()) {
+                    assert(s2.committed_src_ends.back() + 64 <= s2.rolling_text.size());
+                }
+            }
+        }
+    }
+    //    (e) release_sequence / clear_all_sequences lifecycle
+    {
+        rookery::EngramSidecar sc;
+        assert(sc.active_sequences() == 0);
+        sc.release_sequence(42);
+        sc.clear_all_sequences();
+        assert(sc.active_sequences() == 0);
+    }
+
+    std::printf("[PASS] RKAD v3 manifest contract, BPE cut bounds & EngramSeqState unit tests\n");
 }
 
 static void test_kv_cache_types() {

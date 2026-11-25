@@ -238,6 +238,7 @@ def cmd_align_exporter(args):
         "z_space_id": args.z_space_id,
         "d_z": d_z,
         "provider_arch": args.provider_arch,
+        "provider_mode": args.provider_mode,
         "provider_fingerprint": args.provider_fp,
         "src_engram_layer": info["src_layer"],
         "d_engram": d_eng,
@@ -467,7 +468,7 @@ def cmd_compose(args):
     manifest = {
         "schema": "rookery.engram.adapter.v3",
         "provider_arch": ex_meta["provider_arch"],
-        "provider_mode": "ngram_hash",
+        "provider_mode": ex_meta.get("provider_mode", "ngram_hash"),
         "provider_fingerprint": ex_meta["provider_fingerprint"],
         "host_arch": im_meta["host_arch"],
         "host_n_layers": im_meta["host_n_layers"],
@@ -558,7 +559,7 @@ def cmd_compose_multi(args):
     manifest = {
         "schema": "rookery.engram.adapter.v3",
         "provider_arch": ex_meta["provider_arch"],
-        "provider_mode": "ngram_hash",
+        "provider_mode": ex_meta.get("provider_mode", "ngram_hash"),
         "provider_fingerprint": ex_meta["provider_fingerprint"],
         "host_arch": im0_meta["host_arch"],
         "host_n_layers": im0_meta["host_n_layers"],
@@ -637,6 +638,7 @@ def main():
     p2.add_argument("--z-probe", required=True)
     p2.add_argument("--z-space-id", default="engram-z-v1")
     p2.add_argument("--provider-arch", required=True)
+    p2.add_argument("--provider-mode", default="ngram_hash")
     p2.add_argument("--provider-fp", required=True)
     p2.add_argument("--out", required=True)
     p2.add_argument("--device", default="cuda:0")

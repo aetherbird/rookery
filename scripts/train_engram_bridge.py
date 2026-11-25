@@ -260,25 +260,50 @@ def load_maxwell_head(safetensors_dir: str, device: torch.device):
 
 
 def load_gguf_tail_head(gguf_path: str, device: torch.device):
-    """Load frozen tail from GGUF for both hc=1 models (output_norm + output) and Maxwell hc=4 models!"""
-    # Check if Maxwell hc_head tensors exist in GGUF
+    """Load frozen tail from GGUF (single or multi-shard) for:
+      - Maxwell hc=4 models (output_hc_fn/scale/base + output_norm + output)
+      - Standard hc=1 models (output_norm + output)
+      - Post-output-hc-mix models with no separate output_norm (e.g. qwen4exp: output only)
+    """
+    import glob, re
+    shards = [gguf_path]
+    m = re.match(r"^(.*)-(\d{5})-of-(\d{5})\.gguf$", gguf_path)
+    if m:
+        cand = sorted(glob.glob(f"{m.group(1)}-*-of-{m.group(3)}.gguf"))
+        if cand:
+            shards = cand
+
+    def find_tensor(name: str):
+        for sp in shards:
+            try:
+                return load_gguf_tensors(sp, [name])[name]
+            except KeyError:
+                continue
+        raise KeyError(f"Tensor '{name}' not found across {len(shards)} shard(s) of {gguf_path}")
+
+    lm_head = find_tensor("output.weight").to(device=device, dtype=torch.float16)
     try:
-        tmap = load_gguf_tensors(
-            gguf_path,
-            ["output_hc_fn.weight", "output_hc_scale.weight", "output_hc_base.weight", "output_norm.weight", "output.weight"],
-        )
-        hc_fn = tmap["output_hc_fn.weight"].to(device=device, dtype=torch.float32)
+        out_norm = find_tensor("output_norm.weight").to(device=device, dtype=torch.float32)
+    except KeyError:
+        out_norm = None
+
+    try:
+        hc_fn = find_tensor("output_hc_fn.weight").to(device=device, dtype=torch.float32)
         if hc_fn.shape[0] != 4 and hc_fn.shape[1] == 4:
             hc_fn = hc_fn.t().contiguous()
-        hc_scale = tmap["output_hc_scale.weight"].to(device=device, dtype=torch.float32).reshape(-1)[0]
-        hc_base = tmap["output_hc_base.weight"].to(device=device, dtype=torch.float32).reshape(4)
-        out_norm = tmap["output_norm.weight"].to(device=device, dtype=torch.float32)
-        lm_head = tmap["output.weight"].to(device=device, dtype=torch.float16)
+        hc_scale = find_tensor("output_hc_scale.weight").to(device=device, dtype=torch.float32).reshape(-1)[0]
+        hc_base = find_tensor("output_hc_base.weight").to(device=device, dtype=torch.float32).reshape(4)
         return hc_fn, hc_scale, hc_base, out_norm, lm_head
     except KeyError:
-        tmap = load_gguf_tensors(gguf_path, ["output_norm.weight", "output.weight"])
-        out_norm = tmap["output_norm.weight"].to(device=device, dtype=torch.float32)
-        lm_head = tmap["output.weight"].to(device=device, dtype=torch.float16)
+        pass
+
+    # Check if Qwen4Exp output_hc_mix tensors exist (output_hc_norm + output_hc_down + output_hc_up, no output_norm)
+    try:
+        q_norm = find_tensor("output_hc_norm.weight").to(device=device, dtype=torch.float32)
+        q_down = find_tensor("output_hc_down.weight").to(device=device, dtype=torch.float32)
+        q_up = find_tensor("output_hc_up.weight").to(device=device, dtype=torch.float32)
+        return ("qwen4exp", q_norm, q_down, q_up), None, None, None, lm_head
+    except KeyError:
         return None, None, None, out_norm, lm_head
 
 
@@ -294,16 +319,29 @@ def maxwell_head_logits(
     logit_softcap: float = 0.0,
 ) -> torch.Tensor:
     B, hc, D = h_hc.shape
-    if hc_fn is not None:
-        flat = h_hc.reshape(B, hc * D)
-        inv_flat = torch.rsqrt(flat.pow(2).mean(dim=-1, keepdim=True) + rms_eps)
-        mixes = F.linear(flat * inv_flat, hc_fn)
-        pre = torch.sigmoid(mixes * hc_scale + hc_base) + hc_eps
-        mixed = (pre.unsqueeze(-1) * h_hc).sum(dim=1)
+    if isinstance(hc_fn, tuple) and hc_fn[0] == "qwen4exp":
+        _, q_norm, q_down, q_up = hc_fn
+        inv = torch.rsqrt(h_hc.pow(2).mean(dim=-1, keepdim=True) + rms_eps)
+        w = q_norm.reshape(1, hc, D) if q_norm.numel() == hc * D else q_norm.reshape(1, 1, D)
+        xn = h_hc * inv * w
+        lo = F.silu(F.linear(xn.reshape(B, hc * D), q_down) * (1.0 / float(hc)))
+        gate = F.linear(lo, q_up).reshape(B, hc, D)
+        mixed = (xn * torch.sigmoid(gate)).mean(dim=1)
+        x_norm = mixed
     else:
-        mixed = h_hc.mean(dim=1)
-    inv_rms = torch.rsqrt(mixed.pow(2).mean(dim=-1, keepdim=True) + rms_eps)
-    x_norm = mixed * inv_rms * out_norm
+        if hc_fn is not None:
+            flat = h_hc.reshape(B, hc * D)
+            inv_flat = torch.rsqrt(flat.pow(2).mean(dim=-1, keepdim=True) + rms_eps)
+            mixes = F.linear(flat * inv_flat, hc_fn)
+            pre = torch.sigmoid(mixes * hc_scale + hc_base) + hc_eps
+            mixed = (pre.unsqueeze(-1) * h_hc).sum(dim=1)
+        else:
+            mixed = h_hc.mean(dim=1)
+        if out_norm is not None:
+            inv_rms = torch.rsqrt(mixed.pow(2).mean(dim=-1, keepdim=True) + rms_eps)
+            x_norm = mixed * inv_rms * out_norm
+        else:
+            x_norm = mixed
     logits = F.linear(x_norm.to(lm_head.dtype), lm_head).float()
     if logit_softcap > 0.0:
         logits = logit_softcap * torch.tanh(logits / logit_softcap)
@@ -441,7 +479,7 @@ def evaluate(
 ):
     bridge.eval()
     hc_fn, hc_scale, hc_base, out_norm, lm_head = head_tensors
-    device = out_norm.device
+    device = lm_head.device
     N = h_val.shape[0]
     perm = torch.randperm(N, generator=torch.Generator().manual_seed(1337)) if shuffled else None
     tot_nll = 0.0

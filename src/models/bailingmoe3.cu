@@ -692,7 +692,8 @@ void BailingMoe3Model::run_gpu_segment(size_t gi, int T, bool run_argmax, bool s
             });
         }
 
-        if (hook_ == nullptr && il + 1 < rt.layer_end) {
+        const bool layer_hooked = (hook_ != nullptr && hook_->hooks_layer(il));
+        if (!layer_hooked && il + 1 < rt.layer_end) {
             mark(ms_norm, [&]() {
                 launch_add_rmsnorm(rt.d_cur, rt.d_sub_out, static_cast<const float *>(layers_[il + 1].attn_norm.ptr),
                                    rt.d_x_norm, cfg_.n_embd, T, cfg_.rms_eps, rt.stream);
@@ -702,7 +703,7 @@ void BailingMoe3Model::run_gpu_segment(size_t gi, int T, bool run_argmax, bool s
             mark(ms_norm, [&]() {
                 launch_add_inplace(rt.d_cur, rt.d_sub_out, static_cast<int64_t>(T) * cfg_.n_embd, rt.stream);
             });
-            if (hook_ != nullptr) {
+            if (layer_hooked) {
                 hook_->on_post_layer(il, rt.device, rt.d_cur, T, cfg_.n_embd, 1, rt.stream);
             }
         }

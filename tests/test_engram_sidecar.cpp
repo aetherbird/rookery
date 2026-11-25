@@ -4,6 +4,7 @@
 #include "models/inkling2_loop.h"
 #include "models/maxwell_moe.h"
 #include "models/qwen35_moe.h"
+#include "models/qwen4exp.h"
 #include "tokenizer/bpe.h"
 
 #include <algorithm>
@@ -22,6 +23,7 @@ struct HostEvalModel {
     std::string arch;
     std::unique_ptr<rookery::MaxwellMoeModel>   maxwell;
     std::unique_ptr<rookery::Qwen35MoeModel>    qwen35;
+    std::unique_ptr<rookery::Qwen4ExpModel>     qwen4exp;
     std::unique_ptr<rookery::Inkling2LoopModel> inkling2;
     std::unique_ptr<rookery::BailingMoe3Model>  bailing3;
 
@@ -31,6 +33,9 @@ struct HostEvalModel {
         if (arch == "qwen35moe") {
             qwen35 = std::make_unique<rookery::Qwen35MoeModel>();
             qwen35->load(path, gpus, split, max_ctx, true, false);
+        } else if (arch == "qwen4exp") {
+            qwen4exp = std::make_unique<rookery::Qwen4ExpModel>();
+            qwen4exp->load(path, gpus, split, max_ctx, true);
         } else if (arch == "inkling2_loop" || arch == "inkling2") {
             inkling2 = std::make_unique<rookery::Inkling2LoopModel>();
             inkling2->load(path, gpus, max_ctx, rookery::KvCacheType::Q8_0);
@@ -44,54 +49,67 @@ struct HostEvalModel {
     }
     int n_embd() const {
         if (qwen35) return qwen35->config().n_embd;
+        if (qwen4exp) return qwen4exp->config().n_embd;
         if (inkling2) return inkling2->config().n_embd;
         if (bailing3) return bailing3->config().n_embd;
         return maxwell->config().n_embd;
     }
-    int hc_mult() const { return (qwen35 || inkling2 || bailing3) ? 1 : maxwell->config().hc_mult; }
+    int hc_mult() const {
+        if (qwen4exp) return qwen4exp->config().hc_mult;
+        if (qwen35 || inkling2 || bailing3) return 1;
+        return maxwell->config().hc_mult;
+    }
     std::vector<int> layer_devices() const {
         if (qwen35) return qwen35->layer_devices();
+        if (qwen4exp) return qwen4exp->layer_devices();
         if (inkling2) return inkling2->layer_devices();
         if (bailing3) return bailing3->layer_devices();
         return maxwell->layer_devices();
     }
     void set_layer_hook(rookery::LayerHook * h) {
         if (qwen35) qwen35->set_layer_hook(h);
+        else if (qwen4exp) qwen4exp->set_layer_hook(h);
         else if (inkling2) inkling2->set_layer_hook(h);
         else if (bailing3) bailing3->set_layer_hook(h);
         else maxwell->set_layer_hook(h);
     }
     void set_use_cuda_graphs(bool en) {
         if (qwen35) qwen35->set_use_cuda_graphs(en);
+        else if (qwen4exp) qwen4exp->set_use_cuda_graphs(en);
         else if (inkling2) inkling2->set_use_cuda_graphs(en);
         else if (bailing3) bailing3->set_use_cuda_graphs(en);
         else maxwell->set_use_cuda_graphs(en);
     }
     void warmup_decode_graphs() {
         if (qwen35) qwen35->warmup_decode_graphs();
+        else if (qwen4exp) qwen4exp->warmup_decode_graphs();
         else if (inkling2) inkling2->warmup_decode_graphs();
         else if (bailing3) bailing3->warmup_decode_graphs();
         else maxwell->warmup_decode_graphs();
     }
     void reset_state() {
         if (qwen35) qwen35->reset_state();
+        else if (qwen4exp) qwen4exp->reset_state();
         else if (inkling2) inkling2->reset_state();
         else if (bailing3) bailing3->reset_state();
     }
     void forward(const std::vector<int32_t> & t, const std::vector<int32_t> & p, std::vector<float> & l) {
         if (qwen35) qwen35->forward(t, p, l);
+        else if (qwen4exp) qwen4exp->forward(t, p, l);
         else if (inkling2) inkling2->forward(t, p, l);
         else if (bailing3) bailing3->forward(t, p, l);
         else maxwell->forward(t, p, l);
     }
     int32_t forward_decode_greedy(int32_t t, int32_t p) {
         if (qwen35) return qwen35->forward_decode_greedy(t, p);
+        if (qwen4exp) return qwen4exp->forward_decode_greedy(t, p);
         if (inkling2) return inkling2->forward_decode_greedy(t, p);
         if (bailing3) return bailing3->forward_decode_greedy(t, p);
         return maxwell->forward_decode_greedy(t, p);
     }
     void forward_decode_logits(int32_t t, int32_t p, std::vector<float> & l) {
         if (qwen35) qwen35->forward_decode_logits(t, p, l);
+        else if (qwen4exp) qwen4exp->forward_decode_logits(t, p, l);
         else if (inkling2) inkling2->forward_decode_logits(t, p, l);
         else if (bailing3) bailing3->forward_decode_logits(t, p, l);
         else maxwell->forward_decode_logits(t, p, l);
@@ -195,9 +213,10 @@ int main(int argc, char ** argv) {
     std::string adapter_path;
     std::string inspect_adapter_path;
     std::string dump_path;
+    std::string dump_probe_path;
     std::string dump_ce_path;
     std::string corpus_path;
-    std::string eval_path;
+    std::vector<std::string> eval_paths;
     std::string factual_path;
     std::vector<int>   gpus = {0, 1};
     std::vector<float> split = {24.0f, 32.0f};
@@ -228,13 +247,14 @@ int main(int argc, char ** argv) {
         else if (a == "--scale-sweep")              scale_sweep = parse_csv_floats(next());
         else if (a == "--engram-layers")            engram_layers = parse_csv_ints(next());
         else if (a == "--dump-pairs")               dump_path = next();
+        else if (a == "--dump-table-probe")         dump_probe_path = next();
         else if (a == "--dump-tail-ce")             dump_ce_path = next();
         else if (a == "--ce-layer")                 ce_layer = std::atoi(next().c_str());
         else if (a == "--ce-src-layer")             ce_src_layer = std::atoi(next().c_str());
         else if (a == "--doc-ctx")                  doc_ctx = std::atoi(next().c_str());
         else if (a == "--dump-delta")               dump_delta = true;
         else if (a == "--corpus")                   corpus_path = next();
-        else if (a == "--eval-ppl")                 eval_path = next();
+        else if (a == "--eval-ppl")                 eval_paths.push_back(next());
         else if (a == "--eval-factual")             factual_path = next();
         else if (a == "--max-tokens")               max_toks = std::atoi(next().c_str());
         else if (a == "--eval-tokens")              eval_toks = std::atoi(next().c_str());
@@ -356,6 +376,130 @@ int main(int argc, char ** argv) {
         std::printf("Exact N-gram hash match:  %d / %d (%.2f%%)\n", hash_ok, hash_tot, 100.0 * hash_ok / std::max(1, hash_tot));
         std::printf("Result: %s\n", pass ? "PASS (100% exact)" : "FAIL");
         return pass ? 0 : 1;
+    }
+
+    // 0b. Fast CPU-only table probe dump for provider-only engram-z-v3 Exporter alignment (0 VRAM!)
+    if (!dump_probe_path.empty()) {
+        if (model_path.empty()) {
+            std::fprintf(stderr, "--dump-table-probe requires -m <ref_tokenizer.gguf>\n");
+            return 1;
+        }
+        rookery::BpeTokenizer host_tok;
+        {
+            auto gguf = rookery::GgufFile::open(model_path);
+            host_tok.load(gguf);
+        }
+        rookery::EngramTable tbl;
+        tbl.open(engram_path);
+        std::string text = corpus_path.empty() ? "The capital of France is Paris." : read_text_file(corpus_path);
+        auto ids = host_tok.encode(text, true, false);
+        if (static_cast<int>(ids.size()) > max_toks) ids.resize(max_toks);
+
+        const int n_tok = static_cast<int>(ids.size());
+        const int n_eng = std::max(1, tbl.cfg().n_layers);
+        const int d_eng = tbl.cfg().engram_dim();
+        const int n_cols = tbl.cfg().n_cols;
+        const int n_hooks = engram_layers.empty() ? 1 : static_cast<int>(engram_layers.size());
+
+        FILE * fp = std::fopen(dump_probe_path.c_str(), "wb");
+        if (!fp) throw std::runtime_error("Cannot open dump_probe_path: " + dump_probe_path);
+        const char magic[4] = {'R', 'K', 'P', 'R'};
+        uint32_t hdr[4] = {1u, static_cast<uint32_t>(n_hooks), static_cast<uint32_t>(d_eng), 1u};
+        uint64_t total_rec = static_cast<uint64_t>(n_hooks) * n_tok;
+        std::fwrite(magic, 1, 4, fp);
+        std::fwrite(hdr, sizeof(uint32_t), 4, fp);
+        std::fwrite(&total_rec, sizeof(uint64_t), 1, fp);
+        for (int hi = 0; hi < n_hooks; ++hi) {
+            int32_t pair[2] = {engram_layers.empty() ? 0 : engram_layers[hi], std::min(hi, n_eng - 1)};
+            std::fwrite(pair, sizeof(int32_t), 2, fp);
+        }
+
+        // Exact causal tokenization + alignment using EngramSidecar's production commit cache
+        rookery::EngramSidecar sc_helper;
+        std::vector<int> dummy_devs(4, 0);
+        sc_helper.init(engram_path, &host_tok, dummy_devs, 1, 1, 512, "", 0.0f, {0});
+        // Run exact token-by-token causal lookup via chunked 256-token steps (matching --dump-pairs!)
+        rookery::EngramSeqState st;
+        std::vector<int32_t> row_ids(static_cast<size_t>(n_tok) * n_cols);
+        std::vector<float>   val_mask(static_cast<size_t>(n_tok) * n_cols);
+        std::vector<int32_t> s_ids;
+        std::vector<float>   s_val;
+        std::string rolling;
+        std::vector<size_t> host_ends;
+        host_ends.reserve(n_tok);
+        std::vector<int32_t> comm_toks;
+        std::vector<size_t>  comm_ends;
+        const int n_ctx_need = std::max(1, tbl.cfg().ngram_size - 1);
+
+        // Compute aligned source tokens in 256-token chunks (identical to Mode A --dump-pairs!)
+        std::vector<std::vector<int32_t>> per_hook_rows(n_hooks, std::vector<int32_t>(static_cast<size_t>(n_tok) * n_cols));
+        std::vector<std::vector<float>>   per_hook_vals(n_hooks, std::vector<float>(static_cast<size_t>(n_tok) * n_cols));
+        const int chunk = 256;
+        for (int off = 0; off < n_tok; off += chunk) {
+            const int len = std::min(chunk, n_tok - off);
+            for (int i = 0; i < len; ++i) {
+                rolling.append(host_tok.decode_token(ids[off + i]));
+                host_ends.push_back(rolling.size());
+            }
+            const size_t comm_b = comm_ends.empty() ? 0 : comm_ends.back();
+            const std::string tail_text = (comm_b > 0) ? rolling.substr(comm_b) : rolling;
+            const auto tail_src = tbl.has_tokenizer() ? tbl.tokenizer().encode(tail_text, false, false)
+                                                      : std::vector<int32_t>(ids.begin() + off, ids.begin() + off + len);
+            const int n_tail = static_cast<int>(tail_src.size());
+            std::vector<size_t> tail_ends(n_tail);
+            size_t cb = comm_b;
+            for (int j = 0; j < n_tail; ++j) {
+                cb += tbl.has_tokenizer() ? tbl.tokenizer().token_byte_len(tail_src[j]) : 1;
+                tail_ends[j] = cb;
+            }
+            const int n_comm = static_cast<int>(comm_toks.size());
+            const int pfx = std::min(n_comm, n_ctx_need);
+            std::vector<int32_t> src_win;
+            src_win.reserve(pfx + n_tail);
+            for (int k = n_comm - pfx; k < n_comm; ++k) src_win.push_back(comm_toks[k]);
+            for (int j = 0; j < n_tail; ++j) src_win.push_back(tail_src[j]);
+
+            int j = 0;
+            for (int i = 0; i < len; ++i) {
+                const size_t tb = host_ends[off + i];
+                while (j + 1 < n_tail && tail_ends[j] < tb) ++j;
+                const int ap = (n_tail > 0) ? (pfx + j) : std::max(0, pfx - 1);
+                for (int hi = 0; hi < n_hooks; ++hi) {
+                    const int src_l = std::min(hi, n_eng - 1);
+                    tbl.hash_tokens(src_l, src_win, ap, 1, s_ids, s_val);
+                    std::memcpy(per_hook_rows[hi].data() + static_cast<size_t>(off + i) * n_cols, s_ids.data(), n_cols * sizeof(int32_t));
+                    std::memcpy(per_hook_vals[hi].data() + static_cast<size_t>(off + i) * n_cols, s_val.data(), n_cols * sizeof(float));
+                }
+            }
+            if (tbl.has_tokenizer() && rolling.size() > comm_b + 64) {
+                const size_t cut = rookery::EngramSidecar::find_safe_bpe_cut(rolling, comm_b + 1, rolling.size() - 48, 1024);
+                int ck = -1;
+                for (int k = 0; k < n_tail; ++k) {
+                    if (tail_ends[k] == cut) { ck = k; break; }
+                    if (tail_ends[k] > cut) break;
+                }
+                if (ck >= 0) {
+                    for (int k = 0; k <= ck; ++k) {
+                        comm_toks.push_back(tail_src[k]);
+                        comm_ends.push_back(tail_ends[k]);
+                    }
+                }
+            }
+        }
+
+        std::vector<float> e_buf(static_cast<size_t>(n_tok) * d_eng);
+        std::vector<float> h_dummy(n_tok, 0.0f);
+        for (int hi = 0; hi < n_hooks; ++hi) {
+            tbl.gather_dequant_f32(per_hook_rows[hi].data(), per_hook_vals[hi].data(), n_tok, e_buf.data());
+            const int32_t rh[2] = {hi, n_tok};
+            std::fwrite(rh, sizeof(int32_t), 2, fp);
+            std::fwrite(e_buf.data(), sizeof(float), e_buf.size(), fp);
+            std::fwrite(h_dummy.data(), sizeof(float), h_dummy.size(), fp);
+        }
+        std::fclose(fp);
+        std::printf("[CPU Table Probe] Wrote %s (%d hooks x %d toks x d_eng=%d, 0 VRAM)\n",
+                    dump_probe_path.c_str(), n_hooks, n_tok, d_eng);
+        return 0;
     }
 
     // 1. Fast standalone EngramTable lookup & latency test
@@ -591,11 +735,12 @@ int main(int argc, char ** argv) {
                             s, ctl.nll, ctl.ppl, ctl.q1, ctl.tok1, ctl.tok5, ctl.ppl - res.ppl);
             }
         }
-        return 0;
+        if (eval_paths.empty()) return 0;
     }
 
     // Mode B: Held-Out Perplexity & Top-1/Top-5 Accuracy Sweep (4-way: Base, Disabled, Real, Shuffled!)
-    if (!eval_path.empty()) {
+    if (!eval_paths.empty()) {
+        for (const std::string & eval_path : eval_paths) {
         std::string text = read_text_file(eval_path);
         auto ids = host_tok.encode(text, true, false);
         if (static_cast<int>(ids.size()) > eval_toks + 1) ids.resize(eval_toks + 1);
@@ -637,6 +782,7 @@ int main(int argc, char ** argv) {
                 std::printf("  [SHUFFLED] global_scale=%6.3f | NLL=%.5f | PPL=%7.3f | top1=%5.2f%% | top5=%5.2f%% (shuf-real=%+.4f)\n",
                             s, ctl.nll, ctl.ppl, ctl.top1, ctl.top5, ctl.ppl - res.ppl);
             }
+        }
         }
         return 0;
     }

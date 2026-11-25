@@ -801,7 +801,7 @@ void Inkling2LoopModel::run_layer(DevRuntime & rt, int il, int ip, int T, int & 
                             T, cfg_.n_expert_used, cfg_.situ_beta, cfg_.situ_linear_beta, st);
     launch_inkling2_shortconv(rt.d_moe_raw, static_cast<const float *>(L.ffn_post_conv.ptr),
                               nullptr, conv_ffn_[il], rt.d_cur, T, H, 0, st, rt.d_cur);
-    if (hook_ != nullptr && ip != cfg_.n_phys - 1) {
+    if (hook_ != nullptr && ip != cfg_.n_phys - 1 && hook_->hooks_layer(ip)) {
         hook_->on_post_layer(ip, rt.device, rt.d_cur, T, H, 1, st);
     }
 }
@@ -875,7 +875,7 @@ void Inkling2LoopModel::run_postlude_and_head(int T, bool run_argmax, int kv_len
     launch_inkling2_depth_mix(rt.d_block_ptrs, n_blocks, rt.d_cur,
                               static_cast<const float *>(output_res_query_.ptr),
                               rt.d_mixed3, H, 1, T, cfg_.rms_eps, rt.stream);
-    if (hook_ != nullptr) {
+    if (hook_ != nullptr && hook_->hooks_layer(cfg_.n_phys - 1)) {
         hook_->on_post_layer(cfg_.n_phys - 1, rt.device, rt.d_mixed3, T, H, 1, rt.stream);
     }
     launch_rmsnorm(rt.d_mixed3 + static_cast<size_t>(T - 1) * H,

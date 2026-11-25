@@ -635,7 +635,7 @@ void Glm5NextModel::run_gpu_segment(size_t gi, int T, bool run_argmax, bool save
             launch_hc_post(rt.d_sub_out, rt.d_inpL_alt, rt.d_post, rt.d_comb, rt.d_inpL, cfg_.n_embd, T, rt.stream);
         });
 
-        if (hook_ != nullptr) {
+        if (hook_ != nullptr && hook_->hooks_layer(il)) {
             hook_->on_post_layer(il, rt.device, rt.d_inpL, T, cfg_.n_embd, cfg_.hc_mult, rt.stream);
         }
     }
