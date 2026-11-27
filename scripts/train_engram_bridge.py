@@ -217,12 +217,14 @@ def load_provider_engram_kv(
     tensor_name: str = "",
     hc_provider: int = 4,
     device: torch.device = torch.device("cuda:0"),
+    max_cols: int = 0,
 ):
     """
     Load provider's native pre-trained Engram projection (e.g. DeepSeek-V4.1-Flash `blk.1.engram_kv.weight`).
     Layout in DeepSeek-V4.1-Flash: [ (hc + 1) * d_prov, d_eng ], where:
       - rows [0 : hc * d_prov] = K_0..K_{hc-1} (averaged across streams -> W_K_prov [d_prov, d_eng])
       - rows [hc * d_prov : (hc + 1) * d_prov] = V (W_V_prov [d_prov, d_eng])
+    Optional `max_cols` slices leading columns [:, :max_cols] (e.g. 4096 for 2+3-gram sub-tables like flapling-8B).
     """
     if not tensor_name:
         blk = 1 if src_layer == 0 else 14
@@ -232,6 +234,9 @@ def load_provider_engram_kv(
     if n_rows % (hc_provider + 1) != 0:
         raise ValueError(f"Unexpected {tensor_name} shape {tuple(kv.shape)} for hc_provider={hc_provider}")
     d_prov = n_rows // (hc_provider + 1)
+    if max_cols > 0 and max_cols < d_eng:
+        kv = kv[:, :max_cols]
+        d_eng = max_cols
     W_K = kv[: hc_provider * d_prov].reshape(hc_provider, d_prov, d_eng).mean(dim=0).to(device=device, dtype=torch.float32)
     W_V = kv[hc_provider * d_prov :].contiguous().to(device=device, dtype=torch.float32)
     return W_V, W_K, tensor_name
@@ -281,7 +286,10 @@ def load_gguf_tail_head(gguf_path: str, device: torch.device):
                 continue
         raise KeyError(f"Tensor '{name}' not found across {len(shards)} shard(s) of {gguf_path}")
 
-    lm_head = find_tensor("output.weight").to(device=device, dtype=torch.float16)
+    try:
+        lm_head = find_tensor("output.weight").to(device=device, dtype=torch.float16)
+    except KeyError:
+        lm_head = find_tensor("token_embd.weight").to(device=device, dtype=torch.float16)
     try:
         out_norm = find_tensor("output_norm.weight").to(device=device, dtype=torch.float32)
     except KeyError:
@@ -351,13 +359,23 @@ def maxwell_head_logits(
 class RookeryGatedBridge(nn.Module):
     """Exact PyTorch replica of rookery's engram_gated_inject_kernel (RKAD v2/v3 has_gate=1)."""
 
-    def __init__(self, d_in: int, d_host: int, hc: int, rank: int, init_scale: float = 0.05, dropout: float = 0.0):
+    def __init__(
+        self,
+        d_in: int,
+        d_host: int,
+        hc: int,
+        rank: int,
+        init_scale: float = 0.05,
+        dropout: float = 0.0,
+        gate_bias: float = 0.0,
+    ):
         super().__init__()
         self.d_eng = d_in
         self.d_host = d_host
         self.hc = hc
         self.rank = rank
         self.fixed_scale = init_scale
+        self.gate_bias = float(gate_bias)
         self.drop = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
 
         self.A_v = nn.Parameter(torch.randn(rank, d_in) * (1.0 / math.sqrt(d_in)))
@@ -385,7 +403,7 @@ class RookeryGatedBridge(nn.Module):
         scaled = dot / math.sqrt(float(self.d_host))
         mag = torch.sqrt(torch.clamp(scaled.abs(), min=1e-6))
         sgn = torch.where(scaled >= 0.0, torch.ones_like(scaled), -torch.ones_like(scaled))
-        g = torch.sigmoid(sgn * mag) * self.fixed_scale
+        g = torch.sigmoid(sgn * mag + self.gate_bias) * self.fixed_scale
         delta = g.unsqueeze(-1) * v.unsqueeze(1)
         out = h_hc + delta
         if return_stats:
@@ -522,6 +540,7 @@ def main():
     ap.add_argument("--engram-kv-gguf", default="", help="Optional provider GGUF shard with blk.<L>.engram_kv.weight for pre-decoded semantic folding")
     ap.add_argument("--engram-kv-tensor", default="", help="Explicit tensor name in --engram-kv-gguf (default: auto blk.1/blk.14.engram_kv.weight)")
     ap.add_argument("--engram-kv-hc", type=int, default=4, help="Provider hc_mult for splitting engram_kv into [K_0..K_{hc-1}, V]")
+    ap.add_argument("--pca-dim", type=int, default=0, help="Optional unsupervised whitened PCA projection dim (folded algebraically into RKAD v3)")
     ap.add_argument("--no-center", action="store_true", help="Do not subtract corpus mean mu_e (keeps e=0 -> delta=0 exact, eliminates phantom -mu_e bias on unseen/shuffled rows)")
     ap.add_argument("--out", required=True, help="Output RKAD v2/v3 path")
     ap.add_argument("--src-layer", type=int, default=0, help="Engram source layer index in RKCE (0 or 1)")
@@ -541,13 +560,17 @@ def main():
     ap.add_argument("--max-val", type=int, default=40000)
     ap.add_argument("--rkad-v3", action="store_true")
     ap.add_argument("--provider-arch", default="deepseek41")
+    ap.add_argument("--provider-mode", default="ngram_hash")
     ap.add_argument("--provider-fingerprint", default="")
     ap.add_argument("--host-arch", default="maxwell-moe")
     ap.add_argument("--host-n-layers", type=int, default=45)
     ap.add_argument("--delta-clip", type=float, default=0.15)
+    ap.add_argument("--gate-bias", type=float, default=0.0, help="Additive gate logit bias (negative = closed by default)")
+    ap.add_argument("--surprisal-alpha", type=float, default=0.0, help="Dual surprisal weighting strength (0 = uniform)")
+    ap.add_argument("--surprisal-thresh", type=float, default=1.5, help="Base NLL threshold separating confident vs uncertain tokens")
     ap.add_argument("--logit-softcap", type=float, default=-1.0, help="Optional final logit softcap (default: auto 30.0 for inkling2_loop, 0 otherwise)")
     args = ap.parse_args()
-    logit_softcap = args.logit_softcap if args.logit_softcap >= 0.0 else (30.0 if args.host_arch in ("inkling2_loop", "inkling2") else 0.0)
+    logit_softcap = args.logit_softcap if args.logit_softcap >= 0.0 else (30.0 if args.host_arch in ("inkling2_loop", "inkling2", "gemma4") else 0.0)
 
     t0 = time.time()
     device = torch.device("cuda:0")
@@ -556,17 +579,30 @@ def main():
     h_all, e_all, y_all, meta = load_rkce(args.rkce, args.src_layer)
     N = h_all.shape[0]
     n_val = min(args.max_val, max(256, int(N * args.val_frac)))
-    n_tr = N - n_val
+    # Interleaved 1024-token block split so train and val share identical domain mixture (no tail-domain shift!)
+    blk_sz = 1024
+    n_blks = (N + blk_sz - 1) // blk_sz
+    n_val_blks = max(1, min(n_blks // 3, int(round(n_val / blk_sz))))
+    val_step = max(2, n_blks // n_val_blks)
+    val_mask = np.zeros(N, dtype=bool)
+    for b in range(val_step - 1, n_blks, val_step):
+        val_mask[b * blk_sz : min(N, (b + 1) * blk_sz)] = True
+    if val_mask.sum() > args.max_val:
+        idx_on = np.where(val_mask)[0]
+        val_mask[idx_on[args.max_val :]] = False
+    tr_mask = ~val_mask
+    n_tr = int(tr_mask.sum())
+    n_val = int(val_mask.sum())
     export_src = args.export_src_layer if args.export_src_layer >= 0 else args.src_layer
     print(
-        f"Loaded {args.rkce}: N={N:,} valid tokens (train={n_tr:,}, val={n_val:,}), "
+        f"Loaded {args.rkce}: N={N:,} valid tokens (train={n_tr:,}, val={n_val:,} interleaved), "
         f"src_layer={args.src_layer} (export={export_src}), target_layer={meta['target_layer']}, "
         f"d_eng={meta['d_eng']}, hc={meta['hc']}, d_host={meta['d_host']}",
         flush=True,
     )
 
-    h_tr, e_tr, y_tr = h_all[:n_tr], e_all[:n_tr], y_all[:n_tr]
-    h_va, e_va, y_va = h_all[n_tr:], e_all[n_tr:], y_all[n_tr:]
+    h_tr, e_tr, y_tr = h_all[tr_mask], e_all[tr_mask], y_all[tr_mask]
+    h_va, e_va, y_va = h_all[val_mask], e_all[val_mask], y_all[val_mask]
 
     # Optional training-set mean centering vector mu_E (use --no-center for exact e=0 -> delta=0 invariance)
     if args.no_center:
@@ -600,6 +636,30 @@ def main():
             f"pre-decoded rms_v={rms_v:.4f}, rms_k={rms_k:.4f} -> unit-RMS normalized for folding",
             flush=True,
         )
+    elif args.pca_dim > 0 and args.pca_dim < meta["d_eng"]:
+        with torch.no_grad():
+            step_p = max(1, n_tr // 32768)
+            X_sub = torch.from_numpy(e_tr[::step_p]).to(device=device, dtype=torch.float32) - mu_e_t
+            # Exact SVD / eigendecomposition of covariance in float32
+            cov = (X_sub.T @ X_sub) / float(X_sub.shape[0])
+            evals, evecs = torch.linalg.eigh(cov)
+            idx_desc = torch.argsort(evals, descending=True)
+            evals = evals[idx_desc]
+            evecs = evecs[:, idx_desc]
+            k = min(args.pca_dim, int((evals > 1e-7).sum().item()))
+            var_exp = evals[:k].sum().item() / evals.clamp(min=0.0).sum().item()
+            inv_std = torch.rsqrt(evals[:k].clamp(min=1e-5))
+            # Whitened PCA basis W_pca [k, d_eng] -> isotropic unit-RMS coordinates, folded into RKAD v3!
+            W_pca = (evecs[:, :k] * inv_std.unsqueeze(0)).T.contiguous()
+            W_V_norm = W_pca
+            W_K_norm = W_pca
+            d_bridge_in = k
+            kv_tag = f"_pca{k}"
+            print(
+                f"[DirectPCA] Fitted native whitened PCA ({k}x{meta['d_eng']}): "
+                f"explained_var={100.0*var_exp:.1f}% -> algebraic fold into RKAD v3",
+                flush=True,
+            )
 
     if args.safetensors_dir:
         head_tensors = load_maxwell_head(args.safetensors_dir, device)
@@ -609,7 +669,7 @@ def main():
         raise ValueError("Must specify either --safetensors-dir or --gguf")
     hc_fn, hc_scale, hc_base, out_norm, lm_head = head_tensors
 
-    bridge = RookeryGatedBridge(d_bridge_in, meta["d_host"], meta["hc"], args.rank, args.scale, args.dropout).to(device)
+    bridge = RookeryGatedBridge(d_bridge_in, meta["d_host"], meta["hc"], args.rank, args.scale, args.dropout, gate_bias=args.gate_bias).to(device)
     opt = torch.optim.AdamW(bridge.parameters(), lr=args.lr, weight_decay=args.wd)
     total_steps = args.epochs * ((n_tr + args.batch_size - 1) // args.batch_size)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, total_steps), eta_min=args.lr * 0.05)
@@ -664,15 +724,28 @@ def main():
                 base_logits = maxwell_head_logits(hb, hc_fn, hc_scale, hc_base, out_norm, lm_head, logit_softcap=logit_softcap)
                 base_logp = F.log_softmax(base_logits / train_tau, dim=-1)
                 base_p = base_logp.exp()
+                if args.surprisal_alpha > 0.0:
+                    base_nll = F.cross_entropy(base_logits, yb, reduction="none")
+                    u_tok = torch.sigmoid((base_nll - args.surprisal_thresh) / 0.5)
+                    ce_w = 1.0 + args.surprisal_alpha * u_tok
+                    ce_w = ce_w / ce_w.mean().clamp(min=1e-6)
+                    kl_w = 1.0 + args.surprisal_alpha * (1.0 - u_tok)
+                    kl_w = kl_w / kl_w.mean().clamp(min=1e-6)
+                else:
+                    ce_w = kl_w = None
                 ev = F.linear(eb, W_V_norm) if W_V_norm is not None else eb
                 ek = F.linear(eb, W_K_norm) if W_K_norm is not None else ev
 
-            h_out, rel_norm, _ = bridge(hb, ev, ek, return_stats=True)
+            h_out, rel_norm, mean_g = bridge(hb, ev, ek, return_stats=True)
             logits = maxwell_head_logits(h_out, hc_fn, hc_scale, hc_base, out_norm, lm_head, logit_softcap=logit_softcap)
             logp = F.log_softmax(logits / train_tau, dim=-1)
 
-            ce = F.nll_loss(logp, yb)
-            kl = (base_p * (base_logp - logp)).sum(dim=-1).mean()
+            if ce_w is not None:
+                ce = (F.nll_loss(logp, yb, reduction="none") * ce_w).mean()
+                kl = ((base_p * (base_logp - logp)).sum(dim=-1) * kl_w).mean()
+            else:
+                ce = F.nll_loss(logp, yb)
+                kl = (base_p * (base_logp - logp)).sum(dim=-1).mean()
             loss = ce + args.kl_beta * kl
 
             skl_val = 0.0
@@ -735,13 +808,14 @@ def main():
         manifest = {
             "schema": "rookery.engram.adapter.v3",
             "provider_arch": args.provider_arch,
-            "provider_mode": "ngram_hash",
+            "provider_mode": args.provider_mode,
             "provider_fingerprint": args.provider_fingerprint,
             "host_arch": args.host_arch,
             "host_n_layers": args.host_n_layers,
             "host_d_embd": meta["d_host"],
             "host_hc_mult": meta["hc"],
-            "calibration": f"level3_ce_kl_N{n_tr}_drop{args.dropout}{kv_tag}{'_nc' if args.no_center else ''}",
+            "default_gate_bias": float(args.gate_bias),
+            "calibration": f"level3_ce_kl_N{n_tr}_drop{args.dropout}_gb{args.gate_bias:g}_sa{args.surprisal_alpha:g}{kv_tag}{'_nc' if args.no_center else ''}",
         }
         write_rkad_v3(
             args.out,

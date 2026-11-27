@@ -51,7 +51,7 @@ CpuTensor BailingMoe3CpuModel::bind_tensor(const std::string & name, bool requir
 
 void BailingMoe3CpuModel::load(const std::string & gguf_path,
                                int max_ctx,
-                               bool kv_q8_0,
+                               KvCacheType kv_type,
                                int n_threads) {
     const auto t0 = std::chrono::steady_clock::now();
     pool_.init(n_threads);
@@ -91,7 +91,8 @@ void BailingMoe3CpuModel::load(const std::string & gguf_path,
     if (cfg_.expert_weights_scale == 0.0f) cfg_.expert_weights_scale = 1.0f;
     cfg_.rms_eps              = static_cast<float>(sg_.get_f64(pfx + "attention.layer_norm_rms_epsilon", 1e-6));
     cfg_.max_ctx              = max_ctx;
-    cfg_.kv_q8_0              = kv_q8_0;
+    cfg_.kv_type              = kv_type;
+    cfg_.kv_q8_0              = (kv_type != KvCacheType::F16);
 
     cfg_.head_count_kv      = read_num_arr<int>(sg_, pfx + "attention.head_count_kv", cfg_.n_blocks, 0);
     cfg_.swiglu_clamp_exp   = read_num_arr<float>(sg_, pfx + "swiglu_clamp_exp", cfg_.n_blocks, 0.0f);
@@ -113,6 +114,7 @@ void BailingMoe3CpuModel::load(const std::string & gguf_path,
     kda_conv_v_.resize(static_cast<size_t>(cfg_.n_layers));
     kda_state_.resize(static_cast<size_t>(cfg_.n_layers));
     mla_kv_q8_.resize(static_cast<size_t>(cfg_.n_layers));
+    mla_kv_q4_.resize(static_cast<size_t>(cfg_.n_layers));
     mla_kv_f16_.resize(static_cast<size_t>(cfg_.n_layers));
 
     const int d_inner = cfg_.n_head * cfg_.kda_head_dim;
@@ -161,9 +163,12 @@ void BailingMoe3CpuModel::load(const std::string & gguf_path,
             L.attn_gate      = bind_tensor(p + "attn_gate.weight");
             L.wo             = bind_tensor(p + "attn_output.weight");
 
-            if (kv_q8_0) {
+            if (kv_type == KvCacheType::Q8_0) {
                 mla_kv_q8_[il].resize(static_cast<size_t>(cfg_.max_ctx));
                 kv_bytes_total += static_cast<size_t>(cfg_.max_ctx) * sizeof(CpuMlaKv576Q8Pos);
+            } else if (kv_type == KvCacheType::Q4_0) {
+                mla_kv_q4_[il].resize(static_cast<size_t>(cfg_.max_ctx));
+                kv_bytes_total += static_cast<size_t>(cfg_.max_ctx) * sizeof(CpuMlaKv576Q4Pos);
             } else {
                 mla_kv_f16_[il].resize(static_cast<size_t>(cfg_.max_ctx) * 576);
                 kv_bytes_total += static_cast<size_t>(cfg_.max_ctx) * 576 * sizeof(uint16_t);
@@ -196,7 +201,7 @@ void BailingMoe3CpuModel::load(const std::string & gguf_path,
                 cfg_.n_layers, cfg_.n_dense_lead, cfg_.n_layers - cfg_.n_dense_lead,
                 cfg_.n_expert_used, cfg_.n_expert, cfg_.n_group_used, cfg_.n_expert_groups,
                 cfg_.n_embd, cfg_.n_head, cfg_.q_lora_rank,
-                cfg_.max_ctx, kv_q8_0 ? "Q8_0" : "F16",
+                cfg_.max_ctx, kv_cache_type_name(cfg_.kv_type),
                 static_cast<double>(kv_bytes_total) / (1024.0 * 1024.0),
                 static_cast<double>(sg_.total_bytes()) / (1024.0 * 1024.0 * 1024.0),
                 pool_.num_threads(),
@@ -288,6 +293,26 @@ void BailingMoe3CpuModel::run_forward(const int32_t * tokens, const int32_t * po
     const float kda_scale = 1.0f / std::sqrt(static_cast<float>(cfg_.kda_head_dim));
     const float mla_scale = 1.0f / std::sqrt(static_cast<float>(cfg_.qk_head_dim_mla));
 
+    auto dt_needs_q8 = [](DType dt) -> bool {
+#if defined(__aarch64__) && defined(__ARM_FEATURE_DOTPROD)
+        return dt == DType::Q8_0 || dt == DType::Q5_0 || dt == DType::Q4_0;
+#else
+        return dt == DType::Q8_0;
+#endif
+    };
+    auto dt_needs_q8k = [](DType dt) -> bool {
+#if defined(__aarch64__) && defined(__ARM_FEATURE_DOTPROD)
+        return dt == DType::Q6_K || dt == DType::Q4_K || dt == DType::Q5_K;
+#else
+        return dt == DType::Q6_K;
+#endif
+    };
+#if defined(__AVX2__) && defined(__FMA__) && !defined(__AVX512VNNI__)
+    const bool use_direct = (T < 12);
+#else
+    const bool use_direct = true;
+#endif
+
     const bool prof = (std::getenv("ROOKERY_PROFILE") != nullptr);
     double ms_kda_proj = 0, ms_kda_conv = 0, ms_kda_rec = 0, ms_kda_out = 0;
     double ms_mla_proj = 0, ms_mla_prep = 0, ms_mla_attn = 0, ms_mla_out = 0;
@@ -315,11 +340,10 @@ void BailingMoe3CpuModel::run_forward(const int32_t * tokens, const int32_t * po
 
         if (L.is_kda) {
             mark(ms_kda_proj, [&]() {
-                const bool use_direct = (T < 12);
-                const bool need_q8  = use_direct && (L.wq.dtype == DType::Q8_0 || L.wk.dtype == DType::Q8_0 || L.wv.dtype == DType::Q8_0 ||
-                                                     L.ssm_f_a.dtype == DType::Q8_0 || L.ssm_beta.dtype == DType::Q8_0 || L.ssm_g_a.dtype == DType::Q8_0);
-                const bool need_q8k = use_direct && (L.wq.dtype == DType::Q6_K || L.wk.dtype == DType::Q6_K || L.wv.dtype == DType::Q6_K ||
-                                                     L.ssm_f_a.dtype == DType::Q6_K || L.ssm_beta.dtype == DType::Q6_K || L.ssm_g_a.dtype == DType::Q6_K);
+                const bool need_q8  = use_direct && (dt_needs_q8(L.wq.dtype) || dt_needs_q8(L.wk.dtype) || dt_needs_q8(L.wv.dtype) ||
+                                                     dt_needs_q8(L.ssm_f_a.dtype) || dt_needs_q8(L.ssm_beta.dtype) || dt_needs_q8(L.ssm_g_a.dtype));
+                const bool need_q8k = use_direct && (dt_needs_q8k(L.wq.dtype) || dt_needs_q8k(L.wk.dtype) || dt_needs_q8k(L.wv.dtype) ||
+                                                     dt_needs_q8k(L.ssm_f_a.dtype) || dt_needs_q8k(L.ssm_beta.dtype) || dt_needs_q8k(L.ssm_g_a.dtype));
                 if (need_q8)  quantize_rows_q8_0(pool_, x_norm_.data(), x_q8_.data(),  T, cfg_.n_embd);
                 if (need_q8k) quantize_rows_q8_k(pool_, x_norm_.data(), x_q8k_.data(), T, cfg_.n_embd);
 
@@ -367,8 +391,8 @@ void BailingMoe3CpuModel::run_forward(const int32_t * tokens, const int32_t * po
             mark(ms_mla_proj, [&]() {
                 const CpuTensor & wq_first = (cfg_.q_lora_rank > 0) ? L.wq_a : L.wq;
                 float * q_first_out        = (cfg_.q_lora_rank > 0) ? mla_qr_.data() : mla_qall_.data();
-                const bool need_q8  = (wq_first.dtype == DType::Q8_0 || L.wkv_a_mqa.dtype == DType::Q8_0 || L.attn_gate.dtype == DType::Q8_0);
-                const bool need_q8k = (wq_first.dtype == DType::Q6_K || L.wkv_a_mqa.dtype == DType::Q6_K || L.attn_gate.dtype == DType::Q6_K);
+                const bool need_q8  = use_direct && (dt_needs_q8(wq_first.dtype) || dt_needs_q8(L.wkv_a_mqa.dtype) || dt_needs_q8(L.attn_gate.dtype));
+                const bool need_q8k = use_direct && (dt_needs_q8k(wq_first.dtype) || dt_needs_q8k(L.wkv_a_mqa.dtype) || dt_needs_q8k(L.attn_gate.dtype));
                 if (need_q8)  quantize_rows_q8_0(pool_, x_norm_.data(), x_q8_.data(),  T, cfg_.n_embd);
                 if (need_q8k) quantize_rows_q8_k(pool_, x_norm_.data(), x_q8k_.data(), T, cfg_.n_embd);
 
@@ -384,20 +408,21 @@ void BailingMoe3CpuModel::run_forward(const int32_t * tokens, const int32_t * po
                 }
             });
 
-            void * kv_ptr = cfg_.kv_q8_0 ? static_cast<void *>(mla_kv_q8_[il].data())
-                                         : static_cast<void *>(mla_kv_f16_[il].data());
+            void * kv_ptr = (cfg_.kv_type == KvCacheType::Q8_0) ? static_cast<void *>(mla_kv_q8_[il].data())
+                          : (cfg_.kv_type == KvCacheType::Q4_0) ? static_cast<void *>(mla_kv_q4_[il].data())
+                                                                : static_cast<void *>(mla_kv_f16_[il].data());
             mark(ms_mla_prep, [&]() {
                 mla_rope_split_q(mla_qall_.data(), positions, mla_qnope_.data(), mla_qpe_.data(),
                                  T, cfg_.n_head, qk_nope, cfg_.rope_dim, cfg_.rope_freq_base);
                 mla_kv_norm_rope_write_576(mla_kvall_.data(), static_cast<const float *>(L.attn_kv_a_norm.ptr),
-                                           positions, kv_ptr, cfg_.kv_q8_0,
+                                           positions, kv_ptr, cfg_.kv_type,
                                            T, cfg_.rms_eps, cfg_.rope_freq_base);
                 batched_head_proj(pool_, L.wk_b, mla_qnope_.data(), mla_qabs_.data(), T);
                 mla_concat_q576(mla_qabs_.data(), mla_qpe_.data(), mla_q576_.data(), T, cfg_.n_head);
             });
 
             mark(ms_mla_attn, [&]() {
-                mla_attn_d576_v512(pool_, mla_q576_.data(), kv_ptr, cfg_.kv_q8_0,
+                mla_attn_d576_v512(pool_, mla_q576_.data(), kv_ptr, cfg_.kv_type,
                                    positions, mla_olat_.data(), T, cfg_.n_head, mla_scale);
             });
 
@@ -414,14 +439,22 @@ void BailingMoe3CpuModel::run_forward(const int32_t * tokens, const int32_t * po
 
         if (il < cfg_.n_dense_lead) {
             mark(ms_dense, [&]() {
-                const bool need_q8  = (L.ffn_gate.dtype == DType::Q8_0 || L.ffn_up.dtype == DType::Q8_0);
-                const bool need_q8k = (L.ffn_gate.dtype == DType::Q6_K || L.ffn_up.dtype == DType::Q6_K);
+                const bool need_q8  = use_direct && (dt_needs_q8(L.ffn_gate.dtype) || dt_needs_q8(L.ffn_up.dtype));
+                const bool need_q8k = use_direct && (dt_needs_q8k(L.ffn_gate.dtype) || dt_needs_q8k(L.ffn_up.dtype));
                 if (need_q8)  quantize_rows_q8_0(pool_, x_norm_.data(), x_q8_.data(),  T, cfg_.n_embd);
                 if (need_q8k) quantize_rows_q8_k(pool_, x_norm_.data(), x_q8k_.data(), T, cfg_.n_embd);
-                const LinearSpec specs[2] = {{&L.ffn_gate, ffn_g_.data()}, {&L.ffn_up, ffn_u_.data()}};
-                linear_multi(pool_, specs, 2, x_norm_.data(), need_q8 ? x_q8_.data() : nullptr, need_q8k ? x_q8k_.data() : nullptr, T);
-                silu_mul(ffn_g_.data(), ffn_u_.data(), ffn_g_.data(), static_cast<size_t>(T) * cfg_.n_ff_dense);
-                linear(pool_, L.ffn_down, ffn_g_.data(), nullptr, nullptr, sub_out_.data(), T);
+                if (T == 1 && (cfg_.n_ff_dense % 256) == 0) {
+                    dense_ffn_swiglu_t1(pool_, L.ffn_gate, L.ffn_up, L.ffn_down,
+                                        x_norm_.data(),
+                                        need_q8 ? x_q8_.data() : nullptr,
+                                        need_q8k ? x_q8k_.data() : nullptr,
+                                        sub_out_.data());
+                } else {
+                    const LinearSpec specs[2] = {{&L.ffn_gate, ffn_g_.data()}, {&L.ffn_up, ffn_u_.data()}};
+                    linear_multi(pool_, specs, 2, x_norm_.data(), need_q8 ? x_q8_.data() : nullptr, need_q8k ? x_q8k_.data() : nullptr, T);
+                    silu_mul_mt(pool_, ffn_g_.data(), ffn_u_.data(), ffn_g_.data(), static_cast<size_t>(T) * cfg_.n_ff_dense);
+                    linear(pool_, L.ffn_down, ffn_g_.data(), nullptr, nullptr, sub_out_.data(), T);
+                }
             });
         } else {
             mark(ms_router, [&]() {
@@ -433,10 +466,10 @@ void BailingMoe3CpuModel::run_forward(const int32_t * tokens, const int32_t * po
                     cfg_.n_expert_groups, cfg_.n_group_used);
             });
             mark(ms_moe, [&]() {
-                const bool need_q8  = (L.ffn_gate_exps.dtype == DType::Q8_0 || L.ffn_up_exps.dtype == DType::Q8_0 ||
-                                       L.ffn_gate_shexp.dtype == DType::Q8_0 || L.ffn_up_shexp.dtype == DType::Q8_0);
-                const bool need_q8k = (L.ffn_gate_exps.dtype == DType::Q6_K || L.ffn_up_exps.dtype == DType::Q6_K ||
-                                       L.ffn_gate_shexp.dtype == DType::Q6_K || L.ffn_up_shexp.dtype == DType::Q6_K);
+                const bool need_q8  = (dt_needs_q8(L.ffn_gate_exps.dtype) || dt_needs_q8(L.ffn_up_exps.dtype) ||
+                                       dt_needs_q8(L.ffn_gate_shexp.dtype) || dt_needs_q8(L.ffn_up_shexp.dtype));
+                const bool need_q8k = (dt_needs_q8k(L.ffn_gate_exps.dtype) || dt_needs_q8k(L.ffn_up_exps.dtype) ||
+                                       dt_needs_q8k(L.ffn_gate_shexp.dtype) || dt_needs_q8k(L.ffn_up_shexp.dtype));
                 if (need_q8)  quantize_rows_q8_0(pool_, x_norm_.data(), x_q8_.data(),  T, cfg_.n_embd);
                 if (need_q8k) quantize_rows_q8_k(pool_, x_norm_.data(), x_q8k_.data(), T, cfg_.n_embd);
                 const float c_exp = (il < static_cast<int>(cfg_.swiglu_clamp_exp.size())) ? cfg_.swiglu_clamp_exp[il] : 0.0f;

@@ -242,6 +242,7 @@ int main(int argc, char ** argv) {
     int  chunk     = 128;
     int  n_threads = 0;
     bool kv_q8_0   = true;
+    rookery::KvCacheType kv_type = rookery::KvCacheType::Q8_0;
     bool no_graph  = false;
     bool use_mtp   = true;
 #ifdef ROOKERY_ENABLE_CUDA
@@ -262,18 +263,19 @@ int main(int argc, char ** argv) {
         else if (a == "--chunk")              chunk = std::atoi(next().c_str());
         else if (a == "-t" || a == "--threads") n_threads = std::atoi(next().c_str());
         else if (a == "--cpu")                use_cpu = true;
-        else if (a == "--kv-f16")             kv_q8_0 = false;
+        else if (a == "--kv-f16")             { kv_q8_0 = false; kv_type = rookery::KvCacheType::F16; }
+        else if (a == "--kv-q4")              { kv_q8_0 = true;  kv_type = rookery::KvCacheType::Q4_0; }
         else if (a == "--no-graph")           no_graph = true;
         else if (a == "--no-mtp")             use_mtp = false;
         else if (a == "--bench-pp")           bench_pp = parse_csv_ints(next());
         else if (a == "--bench-d")            bench_d = parse_csv_ints(next());
     }
     if (model_path.empty()) {
-        std::fprintf(stderr, "Usage: %s -m <bailingmoe3.gguf> [--cpu] [-t 4] [--gpus 0,...] [--split ...] [-c 8192] [-n 64] [--chunk 128] [--no-mtp] [--bench-pp 128,512] [--bench-d 0,4096] [-p prompt]\n", argv[0]);
+        std::fprintf(stderr, "Usage: %s -m <bailingmoe3.gguf> [--cpu] [-t 4] [--gpus 0,...] [--split ...] [-c 8192] [-n 64] [--chunk 128] [--kv-f16|--kv-q4] [--no-mtp] [--bench-pp 128,512] [--bench-d 0,4096] [-p prompt]\n", argv[0]);
         return 1;
     }
 
-    (void) gpus; (void) split; (void) no_graph; (void) use_mtp;
+    (void) gpus; (void) split; (void) no_graph; (void) use_mtp; (void) kv_q8_0;
 
     rookery::BpeTokenizer tok;
     {
@@ -283,7 +285,7 @@ int main(int argc, char ** argv) {
 
     if (use_cpu) {
         rookery::cpu::BailingMoe3CpuModel model;
-        model.load(model_path, max_ctx, kv_q8_0, n_threads);
+        model.load(model_path, max_ctx, kv_type, n_threads);
         if (!bench_pp.empty() || !bench_d.empty()) {
             run_bench_matrix_cpu(model, tok, bench_pp, bench_d, n_gen, static_cast<size_t>(chunk));
             return 0;

@@ -4242,6 +4242,13 @@ void launch_moe_ffn_kquant_with_shared(
         return;
     }
 
+    if (try_launch_moe_iq_pascal(
+            gate_exps, up_exps, down_exps, gate_shexp,
+            d_x, d_top_ids, d_top_w, d_out, d_scratch, scratch_bytes,
+            T, k_used, clamp_exp, stream)) {
+        return;
+    }
+
     const int K     = static_cast<int>(gate_exps.ne[0]);
     const int ff    = static_cast<int>(gate_exps.ne[1]);
     const int ff_sh = static_cast<int>(gate_shexp.ne[1]);

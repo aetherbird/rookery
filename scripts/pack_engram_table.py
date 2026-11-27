@@ -244,7 +244,7 @@ def pack_flapling_fp8(args):
 
     kv_list = [
         ("general.architecture", GGUF_TYPE_STRING, arch),
-        ("general.name", GGUF_TYPE_STRING, "flapling-22b-engram-8b-fp8"),
+        ("general.name", GGUF_TYPE_STRING, args.name),
         (f"{arch}.ple.layers", GGUF_TYPE_ARRAY, (GGUF_TYPE_INT32, layer_ids)),
         (f"{arch}.ple.ngram_size", GGUF_TYPE_UINT64, max_ngram),
         (f"{arch}.ple.heads_per_ngram", GGUF_TYPE_UINT64, heads_per_ngram),
@@ -261,23 +261,64 @@ def pack_flapling_fp8(args):
 
     tensor_list = [("per_layer_token_embd.weight", (head_dim, total_rows), GGML_TYPE_F8_E4M3, 0)]
 
+    lut = None
+    if args.apply_scales:
+        lut = np.zeros(256, dtype=np.float32)
+        for b in range(256):
+            s = -1.0 if (b & 0x80) else 1.0
+            e = (b >> 3) & 0xF
+            m = b & 0x7
+            if e == 0:
+                val = (m / 8.0) * (2.0 ** -6)
+            elif e == 15 and m == 7:
+                val = 0.0
+            else:
+                val = (1.0 + m / 8.0) * (2.0 ** (e - 7))
+            lut[b] = s * val
+
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "wb") as fout:
         write_gguf_header(fout, kv_list, tensor_list)
         chunk_bytes = 64 * 1024 * 1024
+        chunk_rows = 262_144
         total_written = 0
+        total_clipped = 0
+        total_elems = 0
         for lid in layer_ids:
             q_path = Path(args.tables_root) / f"target_l{lid}" / "table.fp8_e4m3.u8"
+            s_path = Path(args.tables_root) / f"target_l{lid}" / "table.scales.fp16"
             exp_bytes = layer_rows[lid] * head_dim
             assert q_path.stat().st_size == exp_bytes, f"{q_path} size mismatch"
-            with open(q_path, "rb") as fin:
-                while True:
-                    buf = fin.read(chunk_bytes)
-                    if not buf:
-                        break
-                    fout.write(buf)
-                    total_written += len(buf)
-            print(f"[pack] streamed target_l{lid} ({layer_rows[lid]:,} x {head_dim} F8_E4M3, {time.time()-t0:.1f}s)", flush=True)
+            if args.apply_scales:
+                assert s_path.exists() and s_path.stat().st_size == layer_rows[lid] * 2, f"{s_path} missing or size mismatch"
+                gain = float(args.scale_gain)
+                with open(q_path, "rb") as fq, open(s_path, "rb") as fs:
+                    rows_left = layer_rows[lid]
+                    while rows_left > 0:
+                        n = min(chunk_rows, rows_left)
+                        q_u8 = np.frombuffer(fq.read(n * head_dim), dtype=np.uint8).reshape(n, head_dim)
+                        sc = np.frombuffer(fs.read(n * 2), dtype=np.float16).astype(np.float32) * gain
+                        vals = lut[q_u8] * sc[:, None]
+                        total_clipped += int((np.abs(vals) > 448.0).sum())
+                        total_elems += vals.size
+                        out_u8 = f32_to_fp8_e4m3fn(vals)
+                        fout.write(out_u8.tobytes())
+                        total_written += n * head_dim
+                        rows_left -= n
+                print(
+                    f"[pack] scale-restored target_l{lid} ({layer_rows[lid]:,} x {head_dim} F8_E4M3, "
+                    f"gain={gain:g}, clipped={100.0*total_clipped/max(1,total_elems):.5f}%, {time.time()-t0:.1f}s)",
+                    flush=True,
+                )
+            else:
+                with open(q_path, "rb") as fin:
+                    while True:
+                        buf = fin.read(chunk_bytes)
+                        if not buf:
+                            break
+                        fout.write(buf)
+                        total_written += len(buf)
+                print(f"[pack] streamed target_l{lid} ({layer_rows[lid]:,} x {head_dim} F8_E4M3, {time.time()-t0:.1f}s)", flush=True)
         assert total_written == total_rows * head_dim
     print(f"[done] wrote {args.out} ({os.path.getsize(args.out)/1e9:.2f} GB) in {time.time()-t0:.1f}s")
 
@@ -344,6 +385,189 @@ def pack_gemma4_ple(args):
     print(f"[done] wrote {args.out} ({os.path.getsize(args.out)/1e9:.2f} GB) in {time.time()-t0:.1f}s")
 
 
+def pack_gemma4_ple_extend(args):
+    """Extend an existing FP8 Gemma-4 UNIGRAM_PLE GGUF with K evenly-spaced layers from a
+    BF16/F16/F32 safetensors PLE table (e.g. Gemma-4-31B activation-PCA harvest).
+    Preserves exact zero rows for unharvested tokens and scales non-zero slices to FP8 RMS=16.0.
+    """
+    t0 = time.time()
+    src_kvs, tensors, data_off = read_gguf_header(args.base_ple_gguf)
+    ti = tensors["per_layer_token_embd.weight"]
+    base_dim, n_vocab = int(ti["dims"][0]), int(ti["dims"][1])
+    assert ti["dtype"] == GGML_TYPE_F8_E4M3, f"Expected F8_E4M3 base PLE GGUF, got dtype={ti['dtype']}"
+
+    with open(args.extra_safetensors, "rb") as sf:
+        (hdr_len,) = struct.unpack("<Q", sf.read(8))
+        hdr = json.loads(sf.read(hdr_len).decode("utf-8"))
+        st_data_off = 8 + hdr_len
+    key = args.tensor_key
+    if key not in hdr:
+        raise KeyError(f"Tensor '{key}' not found in {args.extra_safetensors}: {list(hdr.keys())}")
+    meta = hdr[key]
+    st_shape = meta["shape"]
+    st_dtype = meta["dtype"]
+    st_off0, _ = meta["data_offsets"]
+    assert int(st_shape[0]) == n_vocab, f"Vocab mismatch: base={n_vocab} vs extra={st_shape[0]}"
+    extra_total_cols = int(st_shape[1])
+    ple_dim = int(args.ple_dim)
+    assert extra_total_cols % ple_dim == 0
+    n_extra_layers = extra_total_cols // ple_dim
+    k_layers = min(args.num_layers, n_extra_layers)
+    sel_layers = np.linspace(0, n_extra_layers - 1, k_layers).round().astype(int).tolist()
+    extra_out_dim = k_layers * ple_dim
+    total_out_dim = base_dim + extra_out_dim
+    print(
+        f"[gemma4-ple-extend] base={base_dim} + extra={extra_out_dim} ({k_layers}/{n_extra_layers}L "
+        f"{sel_layers} from {st_dtype}) -> out_dim={total_out_dim} x {n_vocab:,}",
+        flush=True,
+    )
+
+    kv_list = [
+        ("general.architecture", GGUF_TYPE_STRING, "gemma4"),
+        ("general.name", GGUF_TYPE_STRING, args.name),
+        ("gemma4.block_count", GGUF_TYPE_UINT64, 1),
+        ("gemma4.embedding_length_per_layer_input", GGUF_TYPE_UINT64, total_out_dim),
+        ("gemma4.ple.extra_selected_layers", GGUF_TYPE_ARRAY, (GGUF_TYPE_INT32, sel_layers)),
+    ]
+    if "gemma4.ple.selected_layers" in src_kvs:
+        vt, v = src_kvs["gemma4.ple.selected_layers"]
+        kv_list.append(("gemma4.ple.selected_layers", vt, v))
+    for k, (vt, v) in src_kvs.items():
+        if k.startswith("tokenizer.ggml.") and k != "tokenizer.chat_template":
+            kv_list.append((k, vt, v))
+
+    tensor_list = [("per_layer_token_embd.weight", (total_out_dim, n_vocab), GGML_TYPE_F8_E4M3, 0)]
+    elem_bytes = {"BF16": 2, "F16": 2, "F32": 4}[st_dtype]
+    row_bytes_extra = extra_total_cols * elem_bytes
+    chunk_rows = 4096
+
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+    with open(args.base_ple_gguf, "rb") as fbase, open(args.extra_safetensors, "rb") as fext, open(args.out, "wb") as fout:
+        write_gguf_header(fout, kv_list, tensor_list)
+        fbase.seek(data_off + ti["offset"])
+        fext.seek(st_data_off + st_off0)
+        nonzero_rows = 0
+        for start in range(0, n_vocab, chunk_rows):
+            n = min(chunk_rows, n_vocab - start)
+            base_u8 = np.frombuffer(fbase.read(n * base_dim), dtype=np.uint8).reshape(n, base_dim)
+            raw_ext = fext.read(n * row_bytes_extra)
+            if st_dtype == "BF16":
+                u32 = np.frombuffer(raw_ext, dtype=np.uint16).astype(np.uint32) << 16
+                f32 = u32.view(np.float32).reshape(n, extra_total_cols)
+            elif st_dtype == "F16":
+                f32 = np.frombuffer(raw_ext, dtype=np.float16).reshape(n, extra_total_cols).astype(np.float32)
+            else:
+                f32 = np.frombuffer(raw_ext, dtype=np.float32).reshape(n, extra_total_cols)
+
+            sub = f32.reshape(n, n_extra_layers, ple_dim)[:, sel_layers, :]  # [n, k_layers, ple_dim]
+            rms = np.sqrt(np.mean(sub * sub, axis=-1, keepdims=True))
+            nonzero_rows += int(np.sum(rms[:, 0, 0] > 1e-6))
+            sub_norm = np.where(rms > 1e-6, (sub / np.maximum(rms, 1e-6)) * 16.0, 0.0)
+            ext_u8 = f32_to_fp8_e4m3fn(sub_norm.reshape(n, extra_out_dim))
+            comb = np.concatenate([base_u8, ext_u8], axis=1)
+            fout.write(comb.tobytes())
+            if (start // chunk_rows) % 16 == 0 or start + n == n_vocab:
+                print(f"[gemma4-ple-extend] packed {start+n:,}/{n_vocab:,} rows ({time.time()-t0:.1f}s)", flush=True)
+
+    print(
+        f"[done] wrote {args.out} ({os.path.getsize(args.out)/1e9:.2f} GB, extra nonzero rows={nonzero_rows:,}/{n_vocab:,}) "
+        f"in {time.time()-t0:.1f}s"
+    )
+
+
+def pack_hf_ple(args):
+    """Pack a standalone FP8 UNIGRAM_PLE GGUF directly from a HuggingFace PLE safetensors
+    shard + tokenizer.json (e.g. KRAFTON/Raon-1-nano `model.per_layer_inputs.table`,
+    259,840 x 6144 BF16 -> 1.49 GiB F8_E4M3 mmap).
+    """
+    t0 = time.time()
+    tok_json = json.loads(Path(args.tokenizer_json).read_text(encoding="utf-8"))
+    vocab_map = tok_json["model"]["vocab"]
+    added_tokens = tok_json.get("added_tokens", [])
+    max_id = max(max(vocab_map.values()), max((int(a["id"]) for a in added_tokens), default=0))
+
+    with open(args.safetensors, "rb") as sf:
+        (hdr_len,) = struct.unpack("<Q", sf.read(8))
+        hdr = json.loads(sf.read(hdr_len).decode("utf-8"))
+        st_data_off = 8 + hdr_len
+    key = args.tensor_key
+    if key not in hdr:
+        raise KeyError(f"Tensor '{key}' not found in {args.safetensors}: {list(hdr.keys())}")
+    meta = hdr[key]
+    n_vocab, total_cols = int(meta["shape"][0]), int(meta["shape"][1])
+    st_dtype = meta["dtype"]
+    st_off0, _ = meta["data_offsets"]
+    assert n_vocab > max_id, f"Table rows {n_vocab} <= max tokenizer id {max_id}"
+
+    ple_dim = int(args.ple_dim)
+    assert total_cols % ple_dim == 0
+    n_src_layers = total_cols // ple_dim
+    k_layers = min(args.num_layers, n_src_layers) if args.num_layers > 0 else n_src_layers
+    sel_layers = np.linspace(0, n_src_layers - 1, k_layers).round().astype(int).tolist()
+    out_dim = k_layers * ple_dim
+
+    tokens = [f"<unused_{i}>" for i in range(n_vocab)]
+    token_types = [1] * n_vocab  # 1 = NORMAL, 3 = CONTROL/SPECIAL
+    for tok_str, tid in vocab_map.items():
+        tokens[int(tid)] = tok_str
+    for a in added_tokens:
+        tid = int(a["id"])
+        tokens[tid] = a["content"]
+        token_types[tid] = 3 if a.get("special", False) else 4
+
+    raw_merges = tok_json["model"].get("merges", [])
+    merges = [" ".join(m) if isinstance(m, list) else str(m) for m in raw_merges]
+
+    arch = args.arch
+    print(
+        f"[hf-ple] {args.safetensors} ({st_dtype} [{n_vocab:,}, {total_cols}] = {n_src_layers}L x {ple_dim}) "
+        f"-> {k_layers}L {sel_layers} -> out_dim={out_dim}, vocab={len(tokens):,}, merges={len(merges):,}",
+        flush=True,
+    )
+
+    kv_list = [
+        ("general.architecture", GGUF_TYPE_STRING, arch),
+        ("general.name", GGUF_TYPE_STRING, args.name),
+        (f"{arch}.block_count", GGUF_TYPE_UINT64, 1),
+        (f"{arch}.embedding_length_per_layer_input", GGUF_TYPE_UINT64, out_dim),
+        (f"{arch}.ple.selected_layers", GGUF_TYPE_ARRAY, (GGUF_TYPE_INT32, sel_layers)),
+        ("tokenizer.ggml.model", GGUF_TYPE_STRING, "gpt2"),
+        ("tokenizer.ggml.pre", GGUF_TYPE_STRING, args.tok_pre),
+        ("tokenizer.ggml.tokens", GGUF_TYPE_ARRAY, (GGUF_TYPE_STRING, tokens)),
+        ("tokenizer.ggml.token_type", GGUF_TYPE_ARRAY, (GGUF_TYPE_INT32, token_types)),
+        ("tokenizer.ggml.merges", GGUF_TYPE_ARRAY, (GGUF_TYPE_STRING, merges)),
+        ("tokenizer.ggml.add_bos_token", GGUF_TYPE_BOOL, False),
+    ]
+    tensor_list = [("per_layer_token_embd.weight", (out_dim, n_vocab), GGML_TYPE_F8_E4M3, 0)]
+    elem_bytes = {"BF16": 2, "F16": 2, "F32": 4}[st_dtype]
+    row_bytes = total_cols * elem_bytes
+    chunk_rows = 4096
+
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+    with open(args.safetensors, "rb") as fin, open(args.out, "wb") as fout:
+        write_gguf_header(fout, kv_list, tensor_list)
+        fin.seek(st_data_off + st_off0)
+        for start in range(0, n_vocab, chunk_rows):
+            n = min(chunk_rows, n_vocab - start)
+            raw = fin.read(n * row_bytes)
+            if st_dtype == "BF16":
+                u32 = np.frombuffer(raw, dtype=np.uint16).astype(np.uint32) << 16
+                f32 = u32.view(np.float32).reshape(n, total_cols)
+            elif st_dtype == "F16":
+                f32 = np.frombuffer(raw, dtype=np.float16).reshape(n, total_cols).astype(np.float32)
+            else:
+                f32 = np.frombuffer(raw, dtype=np.float32).reshape(n, total_cols)
+            sub = f32.reshape(n, n_src_layers, ple_dim)[:, sel_layers, :]
+            rms = np.sqrt(np.mean(sub * sub, axis=-1, keepdims=True))
+            sub_norm = np.where(rms > 1e-6, (sub / np.maximum(rms, 1e-6)) * 16.0, 0.0)
+            fp8 = f32_to_fp8_e4m3fn(sub_norm.reshape(n, out_dim))
+            fout.write(fp8.tobytes())
+            if (start // chunk_rows) % 16 == 0 or start + n == n_vocab:
+                print(f"[hf-ple] packed {start+n:,}/{n_vocab:,} rows ({time.time()-t0:.1f}s)", flush=True)
+
+    print(f"[done] wrote {args.out} ({os.path.getsize(args.out)/1e9:.2f} GB) in {time.time()-t0:.1f}s")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Pack compact Engram / PLE tables into standalone GGUFs")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -353,6 +577,9 @@ def main():
     p1.add_argument("--lookup", required=True)
     p1.add_argument("--tables-root", required=True)
     p1.add_argument("--tokenizer-gguf", required=True)
+    p1.add_argument("--apply-scales", action="store_true", help="Multiply table.fp8_e4m3.u8 by table.scales.fp16 * --scale-gain before packing")
+    p1.add_argument("--scale-gain", type=float, default=32.0, help="Global gain when --apply-scales is set (32.0 puts median |max|~32, p99~98, 0%% clipping)")
+    p1.add_argument("--name", default="flapling-22b-engram-8b-fp8")
     p1.add_argument("--out", required=True)
 
     p2 = sub.add_parser("gemma4-ple")
@@ -360,9 +587,33 @@ def main():
     p2.add_argument("--num-layers", type=int, default=16)
     p2.add_argument("--out", required=True)
 
+    p3 = sub.add_parser("gemma4-ple-extend")
+    p3.add_argument("--base-ple-gguf", required=True)
+    p3.add_argument("--extra-safetensors", required=True)
+    p3.add_argument("--tensor-key", default="model.language_model.embed_tokens_per_layer.weight")
+    p3.add_argument("--ple-dim", type=int, default=256)
+    p3.add_argument("--num-layers", type=int, default=16)
+    p3.add_argument("--name", default="gemma4-e4b-31bpca-ple-32L-fp8")
+    p3.add_argument("--out", required=True)
+
+    p4 = sub.add_parser("hf-ple")
+    p4.add_argument("--safetensors", required=True)
+    p4.add_argument("--tokenizer-json", required=True)
+    p4.add_argument("--tensor-key", default="model.per_layer_inputs.table")
+    p4.add_argument("--arch", default="raon1_nano")
+    p4.add_argument("--tok-pre", default="llama-bpe")
+    p4.add_argument("--ple-dim", type=int, default=256)
+    p4.add_argument("--num-layers", type=int, default=0, help="0 = keep all layers")
+    p4.add_argument("--name", default="raon1-nano-ple-24L-fp8")
+    p4.add_argument("--out", required=True)
+
     args = ap.parse_args()
     if args.cmd == "flapling-fp8":
         pack_flapling_fp8(args)
+    elif args.cmd == "gemma4-ple-extend":
+        pack_gemma4_ple_extend(args)
+    elif args.cmd == "hf-ple":
+        pack_hf_ple(args)
     else:
         pack_gemma4_ple(args)
 

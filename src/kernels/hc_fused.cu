@@ -496,6 +496,115 @@ __global__ void hc_post_flat_rmsnorm_mix_bf16_kernel(
     }
 }
 
+// Single-pass fused hc_post + hc_flat_rmsnorm_mix BF16 kernel for prefill (T >= 16, n_out <= 24).
+// Computes y0..y3 ONCE per 16-float4 chunk (24x less residual reads/ALU) and dots all n_out rows
+// concurrently via 24 half-warps (384 threads = 12 warps) with coalesced 128B BF16 loads.
+__global__ void hc_post_flat_rmsnorm_mix_bf16_singlepass_kernel(
+    const float *    __restrict__ sub,
+    const float *    __restrict__ residual,
+    const float *    __restrict__ post,
+    const float *    __restrict__ comb,
+    float *          __restrict__ out,
+    const uint16_t * __restrict__ hc_fn,
+    float *          __restrict__ mixes,
+    int n_embd, int n_out, float rms_eps) {
+
+    const int t      = blockIdx.x;
+    const int hw     = threadIdx.x >> 4; // 0..23
+    const int sl     = threadIdx.x & 15; // 0..15
+    const int n4     = n_embd >> 2;
+    const int hc_dim = n_embd * 4;
+
+    __shared__ float4 s_y[4][16];
+    __shared__ float  s_inv_rms;
+
+    const float * p = post + static_cast<size_t>(t) * 4;
+    const float * c = comb + static_cast<size_t>(t) * 16;
+    const float p0 = p[0], p1 = p[1], p2 = p[2], p3 = p[3];
+    const float c00 = c[0], c01 = c[4], c02 = c[8],  c03 = c[12];
+    const float c10 = c[1], c11 = c[5], c12 = c[9],  c13 = c[13];
+    const float c20 = c[2], c21 = c[6], c22 = c[10], c23 = c[14];
+    const float c30 = c[3], c31 = c[7], c32 = c[11], c33 = c[15];
+
+    const float4 * s_ptr = reinterpret_cast<const float4 *>(sub + static_cast<size_t>(t) * n_embd);
+    const float4 * r0 = reinterpret_cast<const float4 *>(residual + (static_cast<size_t>(t) * 4 + 0) * n_embd);
+    const float4 * r1 = reinterpret_cast<const float4 *>(residual + (static_cast<size_t>(t) * 4 + 1) * n_embd);
+    const float4 * r2 = reinterpret_cast<const float4 *>(residual + (static_cast<size_t>(t) * 4 + 2) * n_embd);
+    const float4 * r3 = reinterpret_cast<const float4 *>(residual + (static_cast<size_t>(t) * 4 + 3) * n_embd);
+
+    float4 * o0 = reinterpret_cast<float4 *>(out + (static_cast<size_t>(t) * 4 + 0) * n_embd);
+    float4 * o1 = reinterpret_cast<float4 *>(out + (static_cast<size_t>(t) * 4 + 1) * n_embd);
+    float4 * o2 = reinterpret_cast<float4 *>(out + (static_cast<size_t>(t) * 4 + 2) * n_embd);
+    float4 * o3 = reinterpret_cast<float4 *>(out + (static_cast<size_t>(t) * 4 + 3) * n_embd);
+
+    const int row = (hw < n_out) ? hw : 0;
+    const uint2 * w0_p = reinterpret_cast<const uint2 *>(hc_fn + static_cast<size_t>(row) * hc_dim + 0 * n_embd);
+    const uint2 * w1_p = reinterpret_cast<const uint2 *>(hc_fn + static_cast<size_t>(row) * hc_dim + 1 * n_embd);
+    const uint2 * w2_p = reinterpret_cast<const uint2 *>(hc_fn + static_cast<size_t>(row) * hc_dim + 2 * n_embd);
+    const uint2 * w3_p = reinterpret_cast<const uint2 *>(hc_fn + static_cast<size_t>(row) * hc_dim + 3 * n_embd);
+
+    auto dot_bf16_4 = [](const float4 & v, const uint2 & wp) -> float {
+        return __uint_as_float((wp.x & 0xffffu) << 16) * v.x
+             + __uint_as_float(wp.x & 0xffff0000u)     * v.y
+             + __uint_as_float((wp.y & 0xffffu) << 16) * v.z
+             + __uint_as_float(wp.y & 0xffff0000u)     * v.w;
+    };
+
+    float ss = 0.0f;
+    float dot = 0.0f;
+    for (int base = 0; base < n4; base += 16) {
+        const int i = base + sl;
+        if (hw == 0 && i < n4) {
+            const float4 sv = s_ptr[i];
+            const float4 v0 = r0[i], v1 = r1[i], v2 = r2[i], v3 = r3[i];
+            const float4 y0 = make_float4(
+                p0 * sv.x + c00 * v0.x + c01 * v1.x + c02 * v2.x + c03 * v3.x,
+                p0 * sv.y + c00 * v0.y + c01 * v1.y + c02 * v2.y + c03 * v3.y,
+                p0 * sv.z + c00 * v0.z + c01 * v1.z + c02 * v2.z + c03 * v3.z,
+                p0 * sv.w + c00 * v0.w + c01 * v1.w + c02 * v2.w + c03 * v3.w);
+            const float4 y1 = make_float4(
+                p1 * sv.x + c10 * v0.x + c11 * v1.x + c12 * v2.x + c13 * v3.x,
+                p1 * sv.y + c10 * v0.y + c11 * v1.y + c12 * v2.y + c13 * v3.y,
+                p1 * sv.z + c10 * v0.z + c11 * v1.z + c12 * v2.z + c13 * v3.z,
+                p1 * sv.w + c10 * v0.w + c11 * v1.w + c12 * v2.w + c13 * v3.w);
+            const float4 y2 = make_float4(
+                p2 * sv.x + c20 * v0.x + c21 * v1.x + c22 * v2.x + c23 * v3.x,
+                p2 * sv.y + c20 * v0.y + c21 * v1.y + c22 * v2.y + c23 * v3.y,
+                p2 * sv.z + c20 * v0.z + c21 * v1.z + c22 * v2.z + c23 * v3.z,
+                p2 * sv.w + c20 * v0.w + c21 * v1.w + c22 * v2.w + c23 * v3.w);
+            const float4 y3 = make_float4(
+                p3 * sv.x + c30 * v0.x + c31 * v1.x + c32 * v2.x + c33 * v3.x,
+                p3 * sv.y + c30 * v0.y + c31 * v1.y + c32 * v2.y + c33 * v3.y,
+                p3 * sv.z + c30 * v0.z + c31 * v1.z + c32 * v2.z + c33 * v3.z,
+                p3 * sv.w + c30 * v0.w + c31 * v1.w + c32 * v2.w + c33 * v3.w);
+            o0[i] = y0; o1[i] = y1; o2[i] = y2; o3[i] = y3;
+            s_y[0][sl] = y0; s_y[1][sl] = y1; s_y[2][sl] = y2; s_y[3][sl] = y3;
+            ss += y0.x * y0.x + y0.y * y0.y + y0.z * y0.z + y0.w * y0.w
+                + y1.x * y1.x + y1.y * y1.y + y1.z * y1.z + y1.w * y1.w
+                + y2.x * y2.x + y2.y * y2.y + y2.z * y2.z + y2.w * y2.w
+                + y3.x * y3.x + y3.y * y3.y + y3.z * y3.z + y3.w * y3.w;
+        }
+        __syncthreads();
+        if (hw < n_out && i < n4) {
+            dot += dot_bf16_4(s_y[0][sl], __ldg(&w0_p[i]))
+                 + dot_bf16_4(s_y[1][sl], __ldg(&w1_p[i]))
+                 + dot_bf16_4(s_y[2][sl], __ldg(&w2_p[i]))
+                 + dot_bf16_4(s_y[3][sl], __ldg(&w3_p[i]));
+        }
+        if (base + 16 < n4) __syncthreads();
+    }
+
+    #pragma unroll
+    for (int off = 8; off > 0; off >>= 1) {
+        dot += __shfl_down_sync(0xffffffffu, dot, off, 16);
+        ss  += __shfl_down_sync(0xffffffffu, ss,  off, 16);
+    }
+
+    if (hw == 0 && sl == 0) s_inv_rms = rsqrtf(ss / static_cast<float>(hc_dim) + rms_eps);
+    __syncthreads();
+    if (hw < n_out && sl == 0) mixes[static_cast<size_t>(t) * n_out + hw] = dot * s_inv_rms;
+}
+
 __global__ void hc_head_rmsnorm_kernel(
     const float * __restrict__ inpL,
     const float * __restrict__ mixes,
@@ -717,6 +826,12 @@ void launch_hc_post_flat_rmsnorm_mix(
     int n_embd, int n_out, int n_tokens, float rms_eps, cudaStream_t stream) {
 
     if (hc_fn.dtype == DType::BF16 && (n_embd & 3) == 0) {
+        if (n_tokens >= 16 && n_out > 0 && n_out <= 24) {
+            hc_post_flat_rmsnorm_mix_bf16_singlepass_kernel<<<n_tokens, 384, 0, stream>>>(
+                d_sub, d_residual, d_post, d_comb, d_out,
+                static_cast<const uint16_t *>(hc_fn.ptr), d_mixes, n_embd, n_out, rms_eps);
+            return;
+        }
         hc_post_flat_rmsnorm_mix_bf16_kernel<<<dim3(n_out, n_tokens), 256, 0, stream>>>(
             d_sub, d_residual, d_post, d_comb, d_out,
             static_cast<const uint16_t *>(hc_fn.ptr), d_mixes, n_embd, n_out, rms_eps);

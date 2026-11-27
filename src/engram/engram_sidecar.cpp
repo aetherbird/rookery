@@ -130,6 +130,7 @@ EngramAdapterManifest validate_rkad_v3_manifest(
     m.host_n_layers        = j.value("host_n_layers", 0);
     m.host_d_embd          = j.value("host_d_embd", 0);
     m.host_hc_mult         = j.value("host_hc_mult", 0);
+    m.default_gate_bias    = j.value("default_gate_bias", 0.0f);
     m.calibration          = j.value("calibration", "");
 
     if (m.schema.rfind("rookery.engram.adapter.v3", 0) != 0) {
@@ -242,6 +243,9 @@ void EngramSidecar::init(const std::string & engram_path,
 
     if (!adapter_path.empty()) {
         load_rkad_adapter(adapter_path, layer_to_device);
+        if (manifest_.default_gate_bias != 0.0f) {
+            default_params_.gate_bias = manifest_.default_gate_bias;
+        }
     } else {
         init_zero_shot_projection(layer_to_device, override_host_layers);
     }
@@ -277,8 +281,8 @@ void EngramSidecar::init(const std::string & engram_path,
     scratch_hook_rows_.resize(hooks_.size());
     scratch_hook_valid_.resize(hooks_.size());
 
-    std::printf("EngramSidecar attached: %zu hook(s), d_engram=%d -> d_host=%d, global_scale=%.4f, mode=%s (RKAD v%u%s)\n",
-                hooks_.size(), d_eng, d_host_, default_params_.scale,
+    std::printf("EngramSidecar attached: %zu hook(s), d_engram=%d -> d_host=%d, global_scale=%.4f, gate_bias=%.3f, mode=%s (RKAD v%u%s)\n",
+                hooks_.size(), d_eng, d_host_, default_params_.scale, default_params_.gate_bias,
                 adapter_path.empty() ? "zero-shot-ortho" : adapter_path.c_str(),
                 manifest_.format_version,
                 manifest_.calibration.empty() ? "" : (", " + manifest_.calibration).c_str());

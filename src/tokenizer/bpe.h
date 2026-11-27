@@ -34,11 +34,13 @@ public:
         return (id >= 0 && static_cast<size_t>(id) < token_types_.size()) ? token_types_[id] : 1;
     }
     size_t  vocab_size() const { return id_to_token_.size(); }
+    static std::vector<std::string> pretokenize_gpt4o(const std::string & text);
 
 private:
     void init_byte_tables();
     std::vector<std::string> pretokenize_maxwell(const std::string & text) const;
     std::vector<std::string> pretokenize_llama3(const std::string & text) const;
+    std::vector<std::string> pretokenize_raon(const std::string & text) const;
     void bpe_encode_piece(const std::string & piece, std::vector<int32_t> & out) const;
     void bpe_encode_spm_segment(const std::string & seg, std::vector<int32_t> & out) const;
 
@@ -58,8 +60,11 @@ private:
     int32_t eot_id_ = 200001;
     bool    add_bos_default_ = true;
     int     max_digits_ = 3;
+    bool    use_gpt4o_pre_ = false;
     bool    use_llama3_pre_ = false;
+    bool    use_raon_pre_ = false;
     bool    use_spm_bpe_ = false;
+    bool    ignore_merges_ = false;
 };
 
 } // namespace rookery

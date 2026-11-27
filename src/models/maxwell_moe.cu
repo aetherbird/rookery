@@ -669,7 +669,7 @@ void MaxwellMoeModel::run_gpu_segment(size_t gi, int T, bool run_argmax, bool lo
         p_add(p_wo, pt);
 
         // --- FFN sub-block: rt.d_inpL_alt -> rt.d_inpL ---
-        if (T <= 16 && L.hc_ffn_fn.dtype == DType::BF16) {
+        if (L.hc_ffn_fn.dtype == DType::BF16) {
             launch_hc_post_flat_rmsnorm_mix(
                 rt.d_sub_out, rt.d_inpL, rt.d_post, rt.d_comb, rt.d_inpL_alt,
                 L.hc_ffn_fn, rt.d_mixes, cfg_.n_embd, 24, T, cfg_.rms_eps, rt.stream);
@@ -732,7 +732,7 @@ void MaxwellMoeModel::run_gpu_segment(size_t gi, int T, bool run_argmax, bool lo
         }
 
         const bool layer_hooked = (hook_ != nullptr && hook_->hooks_layer(il));
-        if (T <= 16 && !layer_hooked && (il + 1 < rt.layer_end) &&
+        if (!layer_hooked && (il + 1 < rt.layer_end) &&
             layers_[il + 1].hc_attn_fn.dtype == DType::BF16) {
             launch_hc_post_flat_rmsnorm_mix(
                 rt.d_sub_out, rt.d_inpL_alt, rt.d_post, rt.d_comb, rt.d_inpL,

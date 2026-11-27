@@ -42,8 +42,9 @@ struct BailingMoe3CpuConfig {
     bool  expert_weights_norm  = true;
     float expert_weights_scale = 2.5f;
     float rms_eps              = 1e-6f;
-    int   max_ctx              = 131072;
-    bool  kv_q8_0              = true;
+    int         max_ctx        = 131072;
+    KvCacheType kv_type        = KvCacheType::Q8_0;
+    bool        kv_q8_0        = true;
 
     std::vector<int>   head_count_kv;
     std::vector<float> swiglu_clamp_exp;
@@ -87,8 +88,15 @@ public:
 
     void load(const std::string & gguf_path,
               int max_ctx = 131072,
-              bool kv_q8_0 = true,
+              KvCacheType kv_type = KvCacheType::Q8_0,
               int n_threads = 0);
+
+    void load(const std::string & gguf_path,
+              int max_ctx,
+              bool kv_q8_0,
+              int n_threads = 0) {
+        load(gguf_path, max_ctx, kv_q8_0 ? KvCacheType::Q8_0 : KvCacheType::F16, n_threads);
+    }
 
     void reset_state();
 
@@ -139,6 +147,7 @@ private:
 
     // MLA RoPE-576 KV caches (only allocated where is_kda == false)
     std::vector<std::vector<CpuMlaKv576Q8Pos>> mla_kv_q8_;
+    std::vector<std::vector<CpuMlaKv576Q4Pos>> mla_kv_q4_;
     std::vector<std::vector<uint16_t>>         mla_kv_f16_;
 
     // Reusable activation scratch buffers

@@ -692,6 +692,232 @@ inline std::string render_qwen3_chat_prompt(const json & messages,
     return out;
 }
 
+// Renders OpenAI chat messages (+ optional tools) into exact Raon-1-mini ChatML format.
+inline std::string render_raon1_chat_prompt(const json & messages,
+                                            const json & tools,
+                                            bool enable_thinking = true) {
+    auto trim = [](std::string s) -> std::string {
+        size_t a = 0;
+        while (a < s.size() && (s[a] == ' ' || s[a] == '\t' || s[a] == '\n' || s[a] == '\r')) ++a;
+        size_t b = s.size();
+        while (b > a && (s[b - 1] == ' ' || s[b - 1] == '\t' || s[b - 1] == '\n' || s[b - 1] == '\r')) --b;
+        return s.substr(a, b - a);
+    };
+    auto extract_text = [](const json & c) -> std::string {
+        if (c.is_string()) return c.get<std::string>();
+        if (c.is_array()) {
+            std::string s;
+            for (const auto & part : c) {
+                if (part.is_string()) s += part.get<std::string>();
+                else if (part.is_object() && part.contains("text") && part["text"].is_string()) {
+                    s += part["text"].get<std::string>();
+                }
+            }
+            return s;
+        }
+        return "";
+    };
+
+    std::string out;
+    const bool has_tools    = tools.is_array() && !tools.empty();
+    const bool first_is_sys = messages.is_array() && !messages.empty() && messages[0].value("role", "") == "system";
+
+    if (has_tools) {
+        out += "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>";
+        for (const auto & tool : tools) {
+            out += "\n" + tool.dump();
+        }
+        out += "\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
+               "<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
+               "<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n"
+               "</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n"
+               "- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n"
+               "- Required parameters MUST be specified\n"
+               "- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n"
+               "- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>";
+        if (first_is_sys && messages[0].contains("content")) {
+            std::string sys = trim(extract_text(messages[0]["content"]));
+            if (!sys.empty()) out += "\n\n" + sys;
+        }
+        out += "<|im_end|>\n";
+    } else if (first_is_sys && messages[0].contains("content")) {
+        out += "<|im_start|>system\n" + trim(extract_text(messages[0]["content"])) + "<|im_end|>\n";
+    }
+
+    for (size_t i = 0; i < messages.size(); ++i) {
+        const auto & m = messages[i];
+        const std::string role = m.value("role", "");
+        if (role == "system" && i == 0) continue;
+        std::string txt = m.contains("content") ? trim(extract_text(m["content"])) : "";
+
+        if (role == "system") {
+            out += "<|im_start|>system\n" + txt + "<|im_end|>\n";
+        } else if (role == "user") {
+            out += "<|im_start|>user\n" + txt + "<|im_end|>\n";
+        } else if (role == "assistant") {
+            std::string rc = (m.contains("reasoning_content") && m["reasoning_content"].is_string())
+                                 ? trim(m["reasoning_content"].get<std::string>()) : "";
+            if (rc.empty() && txt.compare(0, 7, "<think>") == 0) {
+                size_t end_t = txt.find("</think>");
+                if (end_t != std::string::npos) {
+                    rc  = trim(txt.substr(7, end_t - 7));
+                    txt = trim(txt.substr(end_t + 8));
+                }
+            }
+            out += "<|im_start|>assistant\n";
+            if (!rc.empty()) out += "<think>\n" + rc + "\n</think>\n\n";
+            else             out += "<think></think>\n\n";
+            out += txt;
+            if (m.contains("tool_calls") && m["tool_calls"].is_array()) {
+                for (size_t ti = 0; ti < m["tool_calls"].size(); ++ti) {
+                    const auto & tc = m["tool_calls"][ti];
+                    const auto & fn = tc.contains("function") ? tc["function"] : tc;
+                    if (ti == 0 && !txt.empty()) out += "\n\n";
+                    else if (ti > 0) out += "\n";
+                    out += "<tool_call>\n<function=" + fn.value("name", "") + ">\n";
+                    json args = json::object();
+                    if (fn.contains("arguments")) {
+                        if (fn["arguments"].is_string()) {
+                            try { args = json::parse(fn["arguments"].get<std::string>()); } catch (...) {}
+                        } else if (fn["arguments"].is_object()) {
+                            args = fn["arguments"];
+                        }
+                    }
+                    for (auto it = args.begin(); it != args.end(); ++it) {
+                        out += "<parameter=" + it.key() + ">\n";
+                        out += it.value().is_string() ? it.value().get<std::string>() : it.value().dump();
+                        out += "\n</parameter>\n";
+                    }
+                    out += "</function>\n</tool_call>";
+                }
+            }
+            out += "<|im_end|>\n";
+        } else if (role == "tool") {
+            const bool prev_tool = (i > 0 && messages[i - 1].value("role", "") == "tool");
+            const bool next_tool = (i + 1 < messages.size() && messages[i + 1].value("role", "") == "tool");
+            if (!prev_tool) out += "<|im_start|>user";
+            out += "\n<tool_response>\n" + txt + "\n</tool_response>";
+            if (!next_tool) out += "<|im_end|>\n";
+        }
+    }
+
+    out += "<|im_start|>assistant\n";
+    if (enable_thinking) out += "<think>\n";
+    else                 out += "<think></think>\n\n";
+    return out;
+}
+
+// Renders OpenAI chat messages (+ optional tools) into exact Qwen2 / Qwen2.5 Instruct ChatML format (non-thinking).
+inline std::string render_qwen2_chat_prompt(const json & messages, const json & tools) {
+    auto extract_text = [](const json & c) -> std::string {
+        if (c.is_string()) return c.get<std::string>();
+        if (c.is_array()) {
+            std::string s;
+            for (const auto & part : c) {
+                if (part.is_string()) s += part.get<std::string>();
+                else if (part.is_object() && part.contains("text") && part["text"].is_string()) {
+                    s += part["text"].get<std::string>();
+                }
+            }
+            return s;
+        }
+        return "";
+    };
+
+    std::string out;
+    const bool has_tools    = tools.is_array() && !tools.empty();
+    const bool first_is_sys = messages.is_array() && !messages.empty() && messages[0].value("role", "") == "system";
+    const std::string sys_txt = (first_is_sys && messages[0].contains("content"))
+                                    ? extract_text(messages[0]["content"])
+                                    : "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.";
+
+    out += "<|im_start|>system\n" + sys_txt;
+    if (has_tools) {
+        out += "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n"
+               "You are provided with function signatures within <tools></tools> XML tags:\n<tools>";
+        for (const auto & tool : tools) {
+            out += "\n" + tool.dump();
+        }
+        out += "\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n"
+               "<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>";
+    }
+    out += "<|im_end|>\n";
+
+    for (size_t i = 0; i < messages.size(); ++i) {
+        const auto & m = messages[i];
+        const std::string role = m.value("role", "");
+        if (role == "system" && i == 0) continue;
+        const std::string txt = m.contains("content") ? extract_text(m["content"]) : "";
+
+        if (role == "system") {
+            out += "<|im_start|>system\n" + txt + "<|im_end|>\n";
+        } else if (role == "user") {
+            out += "<|im_start|>user\n" + txt + "<|im_end|>\n";
+        } else if (role == "assistant") {
+            out += "<|im_start|>assistant\n" + txt;
+            if (m.contains("tool_calls") && m["tool_calls"].is_array()) {
+                for (const auto & tc : m["tool_calls"]) {
+                    const auto & fn = tc.contains("function") ? tc["function"] : tc;
+                    json args = json::object();
+                    if (fn.contains("arguments")) {
+                        if (fn["arguments"].is_string()) {
+                            try { args = json::parse(fn["arguments"].get<std::string>()); } catch (...) {}
+                        } else if (fn["arguments"].is_object()) {
+                            args = fn["arguments"];
+                        }
+                    }
+                    json obj = {{"name", fn.value("name", "")}, {"arguments", args}};
+                    out += "\n<tool_call>\n" + obj.dump() + "\n</tool_call>";
+                }
+            }
+            out += "<|im_end|>\n";
+        } else if (role == "tool") {
+            const bool prev_tool = (i > 0 && messages[i - 1].value("role", "") == "tool");
+            const bool next_tool = (i + 1 < messages.size() && messages[i + 1].value("role", "") == "tool");
+            if (!prev_tool) out += "<|im_start|>user";
+            out += "\n<tool_response>\n" + txt + "\n</tool_response>";
+            if (!next_tool) out += "<|im_end|>\n";
+        }
+    }
+
+    out += "<|im_start|>assistant\n";
+    return out;
+}
+
+// Parses Qwen2 / Qwen2.5 Instruct output (plain text + optional JSON <tool_call>{...}</tool_call>).
+inline ParsedAssistantResponse parse_qwen2_output(const std::string & raw) {
+    ParsedAssistantResponse res;
+    size_t tc_pos = raw.find("<tool_call>");
+    if (tc_pos == std::string::npos) {
+        res.content = raw;
+        return res;
+    }
+    res.content = raw.substr(0, tc_pos);
+    while (!res.content.empty() && (res.content.back() == '\n' || res.content.back() == ' ')) {
+        res.content.pop_back();
+    }
+    size_t cursor = tc_pos;
+    while ((cursor = raw.find("<tool_call>", cursor)) != std::string::npos) {
+        const size_t body_start = cursor + 11;
+        size_t tc_end = raw.find("</tool_call>", body_start);
+        if (tc_end == std::string::npos) tc_end = raw.size();
+        std::string body = raw.substr(body_start, tc_end - body_start);
+        try {
+            json tj = json::parse(body);
+            std::string fname = tj.value("name", "");
+            json args = tj.contains("arguments") ? tj["arguments"] : json::object();
+            std::string args_s = args.is_string() ? args.get<std::string>() : args.dump();
+            res.tool_calls.push_back({
+                {"id", next_tool_call_id()},
+                {"type", "function"},
+                {"function", {{"name", fname}, {"arguments", args_s}}}
+            });
+        } catch (...) {}
+        cursor = (tc_end < raw.size()) ? (tc_end + 12) : raw.size();
+    }
+    return res;
+}
+
 // Renders OpenAI chat messages (+ optional tools) into exact Bailing V3 (Ling-3.0 / Ling-3.2-Air) format.
 inline std::string render_bailing3_chat_prompt(const json & messages,
                                                const json & tools,
@@ -857,29 +1083,127 @@ inline std::string render_gemma4_chat_prompt(const json & messages, bool enable_
 inline ParsedAssistantResponse parse_gemma4_output(const std::string & raw, bool started_in_think = true) {
     ParsedAssistantResponse res;
     std::string rest = raw;
-    static const std::string kStartCh = "<|channel>thought\n";
+    static const std::string kStartCh = "<|channel>thought";
     static const std::string kEndCh   = "<channel|>";
     bool in_think = started_in_think;
-    if (!in_think && rest.compare(0, kStartCh.size(), kStartCh) == 0) {
-        rest.erase(0, kStartCh.size());
-        in_think = true;
-    }
-    if (in_think) {
+
+    auto trim_ws_back = [](std::string & s) {
+        while (!s.empty() && (s.back() == '\n' || s.back() == ' ')) s.pop_back();
+    };
+
+    // Strip leading thought blocks (including empty <|channel>thought\n<channel|> emitted when thinking is off)
+    while (true) {
+        if (!in_think) {
+            if (rest.compare(0, kStartCh.size(), kStartCh) == 0) {
+                rest.erase(0, kStartCh.size());
+                if (!rest.empty() && rest.front() == '\n') rest.erase(rest.begin());
+                in_think = true;
+            } else {
+                break;
+            }
+        }
         size_t pos = rest.find(kEndCh);
         if (pos != std::string::npos) {
-            res.reasoning_content = rest.substr(0, pos);
-            while (!res.reasoning_content.empty() && (res.reasoning_content.back() == '\n' || res.reasoning_content.back() == ' ')) {
-                res.reasoning_content.pop_back();
+            std::string rc = rest.substr(0, pos);
+            trim_ws_back(rc);
+            if (!rc.empty()) {
+                if (!res.reasoning_content.empty()) res.reasoning_content += "\n";
+                res.reasoning_content += rc;
             }
             rest = rest.substr(pos + kEndCh.size());
             while (!rest.empty() && rest.front() == '\n') rest.erase(rest.begin());
+            in_think = false;
         } else {
-            res.reasoning_content = rest;
+            trim_ws_back(rest);
+            if (!rest.empty()) {
+                if (!res.reasoning_content.empty()) res.reasoning_content += "\n";
+                res.reasoning_content += rest;
+            }
             return res;
         }
     }
     res.content = rest;
     return res;
 }
+
+// Incremental SSE stream splitter for Gemma 4 <|channel>thought ... <channel|> blocks.
+// Guarantees partial tags never leak into delta.content even when enable_thinking == false.
+struct Gemma4StreamSplitter {
+    bool in_think = false;
+    bool strip_leading_nl = false;
+
+    explicit Gemma4StreamSplitter(bool started_in_think = false) : in_think(started_in_think) {}
+
+    template <typename EmitFn, typename SafePrefixFn>
+    bool flush(std::string & pending, bool is_final, size_t max_stop_len,
+               EmitFn && emit, SafePrefixFn && utf8_safe_prefix) {
+        static const std::string kStartCh = "<|channel>thought";
+        static const std::string kEndCh   = "<channel|>";
+        while (true) {
+            if (in_think) {
+                size_t end_t = pending.find(kEndCh);
+                const size_t hold = std::max<size_t>(kEndCh.size(), max_stop_len);
+                if (end_t != std::string::npos) {
+                    std::string r = pending.substr(0, end_t);
+                    while (!r.empty() && (r.back() == '\n' || r.back() == ' ')) r.pop_back();
+                    if (!r.empty() && !emit("reasoning_content", r)) return false;
+                    pending.erase(0, end_t + kEndCh.size());
+                    while (!pending.empty() && pending.front() == '\n') pending.erase(pending.begin());
+                    in_think = false;
+                    strip_leading_nl = pending.empty();
+                    continue;
+                }
+                if (is_final) {
+                    if (!pending.empty() && !emit("reasoning_content", pending)) return false;
+                    pending.clear();
+                    return true;
+                }
+                if (pending.size() > hold) {
+                    size_t n = utf8_safe_prefix(pending, pending.size() - hold);
+                    if (n > 0) {
+                        if (!emit("reasoning_content", pending.substr(0, n))) return false;
+                        pending.erase(0, n);
+                    }
+                }
+                return true;
+            } else {
+                if (strip_leading_nl) {
+                    while (!pending.empty() && pending.front() == '\n') pending.erase(pending.begin());
+                    if (!pending.empty()) strip_leading_nl = false;
+                }
+                size_t st = pending.find(kStartCh);
+                const size_t hold = std::max<size_t>(kStartCh.size() + 1, max_stop_len);
+                if (st != std::string::npos) {
+                    // Wait for 1 more byte if not final and tag sits right at end (to consume optional '\n')
+                    if (!is_final && st + kStartCh.size() == pending.size()) {
+                        if (st > 0) {
+                            if (!emit("content", pending.substr(0, st))) return false;
+                            pending.erase(0, st);
+                        }
+                        return true;
+                    }
+                    if (st > 0 && !emit("content", pending.substr(0, st))) return false;
+                    pending.erase(0, st + kStartCh.size());
+                    if (!pending.empty() && pending.front() == '\n') pending.erase(pending.begin());
+                    in_think = true;
+                    continue;
+                }
+                if (is_final) {
+                    if (!pending.empty() && !emit("content", pending)) return false;
+                    pending.clear();
+                    return true;
+                }
+                if (pending.size() > hold) {
+                    size_t n = utf8_safe_prefix(pending, pending.size() - hold);
+                    if (n > 0) {
+                        if (!emit("content", pending.substr(0, n))) return false;
+                        pending.erase(0, n);
+                    }
+                }
+                return true;
+            }
+        }
+    }
+};
 
 } // namespace rookery

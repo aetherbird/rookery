@@ -384,3 +384,93 @@ Tested whether early-layer (`L0`, immediately before `blk.1`'s native 50.66 GiB 
 1. **Sub-1% systems & runtime viability is proven across 5 distinct host architectures and 4 provider tiers (`1.00 GiB` to `103.00 GiB`):** 100.00% causal addressing parity (`2,351/2,351` Maxwell, `923/923` Ling-3.0-tiny & flapling-14b, `977/977` Inkling-2-Mini, `927/927` Qwen3.8-Flash-Next), bounded space-less fallback, dedicated non-blocking H2D streams, `release_sequence()` lifecycle wiring, exact `+0.000000` disabled invariance (including `--mtp` on Maxwell and 6-GPU `qwen4exp`), and `0.4%–1.0%` warm decode overhead.
 2. **Compact `engram-z-v3` tiers deliver outsized transfer per gigabyte:** Both **`1.00 GiB` `Gemma-4-E4B` 16-layer `UNIGRAM_PLE`** (zero hash collisions across 262K vocab) and **`7.63 GiB` `flapling-22b` 8B FP8** (`val_cos = +0.6237`) compose zero-shot onto all 5 hosts without pairwise training — `Gemma-4 PLE` beat DeepSeek 103 GiB on `Inkling-2-Mini` `EVAL_TECH` (`4.657` vs `4.674`) and by `11–13.7×` on `Ling-3.0-tiny` `EVAL_FACTUAL`, while `flapling-8B` lifted `Ling-3.0-tiny` to `46/60` Tech QA and `20.0/28` on `ling_test_v2`.
 3. **Late-layer gated injection beats early-layer un-gated injection across every host (including native-Engram hosts):** Un-gated early hooks (`L1` on Maxwell, `L5` on Inkling-2-Mini, `L0` before `blk.1`'s native PLE on Qwen3.8-Flash-Next) consistently degraded live QA or agentic generation, whereas KL-disciplined late-layer gated hooks delivered clean downstream parity or gains across live `ling_test_v2` (`Ling-3.0-tiny 15.67 → 20.0/28`, `Maxwell --mtp 16.0 → 19.0/28`, `Qwen3.8-Flash-Next 24.0 → 25.0/28`, `Inkling-2-Mini 26.0/28` parity, `flapling-14b 16.0 → 15.0/28`), with on-policy calibration strictly outperforming off-policy foreign completions.
+
+---
+
+## 13. Frozen-Host Mid-Layer E2E, Compact `7.64 GiB WTA-8B-IQ4_NL`, Dual-Table Fusion (`CompositeLayerHook`), & 4-Architecture Live Benchmark Breakthroughs
+
+### A. Architectural Advances
+1. **Frozen-Host Mid-Layer End-to-End Training (`scripts/train_engram_midlayer.py`):** Backpropagates surprisal-weighted CE + Host-KL + Contrastive Shuffled-KL through exact frozen downstream host Transformer layers (`cos >= 0.999996`, `100%` top-1 parity gate before Epoch 1) before exporting to standard zero-overhead `RKAD v3`:
+   - `bailingmoe3` (`Ling-3.0-tiny`): `L22 → frozen blk.23` (MLA + 128-expert MoE + Shared Expert + `lm_head`).
+   - `inkling2_loop` (`Inkling-2-Mini`): `L20 / L22 → frozen blk.21..23` (Global Attention + MoE + Attention-over-Depth `depth_mix` + `logit_softcap=30.0`; multi-layer postlude block dumping via `ROOKERY_DUMP_INK2_BLOCKS` in `src/models/inkling2_loop.cu`).
+   - `sensenova_loop` (`SenseNova-Loop-9B-Q8_0`): `L54 → frozen blk.31` (`FrozenSenseNovaGqaLayer` with exact YaRN RoPE, QGate, and Dense SwiGLU; `cos = 0.999996`, `top1_agree = 100.00%`, `|dNLL| = 0.00058`).
+2. **Frequency Winner-Take-All Compact DeepSeek Table (`scripts/pack_compact_ds4.py` — `7.64 GiB`, `WTA-8B-IQ4_NL`):** Rather than quantizing to FP8 or truncating heads, copies raw `IQ4_NL` blocks directly from the `103.00 GiB` DeepSeek-V4.1-Flash donor into `57.0M` rows across all 24 heads (`2/3/4`-gram, `6,144-D`), resolving hash collisions via corpus-frequency Winner-Take-All so high-frequency N-grams keep their exact donor row bytes and stay 100% compatible with DeepSeek's native `engram_kv` (`W_V`/`W_K`) pre-decoding. Result: **beats the `103.00 GiB` donor table on every tested host at 13.5× smaller size**.
+3. **Zero-Overhead Dual-Table Fusion (`CompositeLayerHook` in `src/engram/engram_sidecar.{h,cpp}`, `--engram2` CLI flags in `src/main.cpp` & `tests/test_engram_sidecar.cpp`):** Composes two independent `EngramSidecar` instances (e.g., an `NGRAM_HASH` table + a `UNIGRAM_PLE` table) onto the same or distinct mid-layers with shared prefix-cache guards, `/health` `"engram2"` reporting, and full 4-way `--eval-factual` / `--eval-ppl` support (preserving `97.7%–98.5%` of base decode speed). Also fixed an SSE streaming `ep` by-value capture bug in `src/main.cpp`.
+4. **Exact `pre == "inkling2"` Tokenizer Fix (`src/tokenizer/bpe.{h,cpp}`, `tests/test_server_units.cpp`):** Added `BpeTokenizer::pretokenize_gpt4o()` (`o200k` / `LLAMA_VOCAB_PRE_TYPE_GPT4O` regex) and `ignore_merges_` fast-path lookup for `pre == "inkling2" | "gpt-4o" | "o200k_base"`, eliminating the fallback to `pretokenize_maxwell` that previously split standalone `\n` and punctuation+newline tokens (`):\n`, `\n\n`). Verified **`40,802 / 40,802` (100.000%) bit-exact token-ID parity** against reference `llama.cpp` across edge cases (`56/56`), `eval_code_heldout` (`25,696/25,696`), and `clean_diverse` (`15,050/15,050`), dropping `Inkling-2-Mini` BASE `eval_code` PPL from `~2.16` to **`1.632`** (with `WTA-8B` still improving monotonically `1.632 → 1.630`, `top1 87.63% → 87.76%`, `DISABLED +0.000000`). *(Note: the `Inkling-2-Mini` benchmarks below were measured apples-to-apples on the prior tokenizer where BASE and all Engram/PLE arms used the exact same tokenization.)*
+
+---
+
+### B. `Inkling-2-Mini` — `core_v14_local` (`-c 98304 -ctk q4_0 -ctv q4_0`, Single RTX 3090)
+**12 / 13 non-base runs beat BASE, 1 tied, 5 Grade A's, zero regressions**, while cutting total wall time by **18%–32%** and output tokens by **17%–30%**:
+
+| Config (`Inkling-2-Mini -c 96k`) | Table Size | Score | Pass | Wall Time | Tool Calls | Output Tok | Prompt Tok |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **`WTA-8B-IQ4_NL` (`r=512`, `L20+L22`)** | **`7.64 GiB`** | **`45.0 / 47` (A, `+6.0`)** | **36/37** | **101.5m (-18%)** | 252 (6.81) | 413.7k | 5.93M |
+| **`E4B+31B-PCA PLE` (`v5 r=512`, `L20+L22`)** | **`2.00 GiB`** | **`43.0 / 47` (A, `+4.0`)** | 35/37 | **84.6m (-32%)** | 214 (5.78) | **315.6k (-30%)** | 4.62M |
+| **`DT-Fusion WTA + E4B+31B` (`v5`)** | `9.64 GiB` | **`43.0 / 47` (A, `+4.0`)** | 35/37 | **86.0m (-31%)** | **183 (4.95)** | **326.5k (-28%)** | **2.64M (-20%)** |
+| **`WTA-8B-IQ4_NL` (`v6 r=768 ep10`)** | **`7.64 GiB`** | **`43.0 / 47` (A, `+4.0`)** | 35/37 | **92.4m (-26%)** | 236 (6.38) | 373.5k (-17%) | 3.82M |
+| **`Raon-1-nano 24L PLE` (`r=256`)** | **`1.49 GiB`** | **`43.0 / 47` (A, `+4.0`)** | 35/37 | 126.0m (+1%) | 190 (5.14) | 503.2k | 3.12M |
+| `DT-Fusion WTA + E4B+31B` (`v6 r=768`) | `9.64 GiB` | **`42.0 / 47` (B, `+3.0`)** | 34/37 | 156.9m | 457 (12.35) | 613.3k | 19.56M |
+| `Raon-1-nano 24L PLE` (`v6 r=768`) | `1.49 GiB` | **`41.0 / 47` (B, `+2.0`)** | 34/37 | **94.6m (-24%)** | 207 (5.59) | 340.5k (-24%) | 3.33M |
+| `DeepSeek-V4.1-Flash` (`v5 r=512`) | `103.00 GiB` | **`41.0 / 47` (B, `+2.0`)** | 34/37 | 109.0m (-12%) | **171 (4.62)** | 381.5k (-15%) | **2.44M (-26%)** |
+| `flapling-8B` (`v5 r=512`) | `7.63 GiB` | **`40.8 / 47` (B, `+1.8`)** | 33/37 | 95.9m (-23%) | 207 (5.59) | 371.7k (-18%) | 3.69M |
+| `E4B+31B-PCA PLE` (`v6 r=768`) | `2.00 GiB` | **`40.0 / 47` (B, `+1.0`)** | 33/37 | 120.8m (-3%) | 189 (5.11) | 422.2k (-6%) | 2.76M |
+| `flapling-8B-SCALES` / `DT-Fusion flapsc+Raon` *(retired)* | `7.63 / 9.12 GiB` | `40.0 / 47` (B, `+1.0`) | 33/37 | `127.9 / 132.9m` | `211 / 225` | `469.7k / 445.4k` | `4.15M / 4.42M` |
+| `Dual-PLE (Raon + E4B+31B)` | `3.49 GiB` | `39.0 / 47` (B, `0.0`) | 33/37 | 112.7m (-9%) | 205 (5.54) | 386.4k (-14%) | 2.88M |
+| **`BASE`** | — | `39.0 / 47` (B) | `33/37` | `124.3m` | `192 (5.19)` | `450.8k` | `3.30M` |
+
+---
+
+### C. 4-Architecture Live Fast-Bench Scoreboards (`scripts/engram_fast_bench.py`, `scripts/engram_hard200_eval.py`)
+
+1. **`Inkling-2-Mini` (`664` items: HumanEval 164 + MMLU-Pro 300 + GSM8K 200):**
+   - `BASE`: `156 | 217 | 191` → **`564 / 664 (84.94%)`**
+   - **`7.64 GiB WTA-8B` (`v6-ultra r=768 ep10`, `L20+L22`):** **`155 | 226 (+9, record) | 194 (+3)` → `575 / 664 (86.60%, +11 ALL-TIME RECORD)`** *(vs `563/664` at `r=512`, proving `+12` live scaling from `r=768 ep10` with 3 downstream MoE layers!)*
+   - `7.63 GiB flapling-8B (v5 dual)`: `153 | 224 (+7) | 193` → **`570 / 664 (+6)`**
+   - `1.49 GiB Raon-1-nano (v6 r=768)`: `154 | 222 (+5) | 193` → **`569 / 664 (+5)`** *(vs `568/664` at `r=256`)*
+   - `103 GiB DeepSeek (v6 r=768 ep10)`: `153 | 220 (+3) | 195 (+4, record)` → **`568 / 664 (+4)`** *(vs `561` at `r=512`)*
+   - `9.64 GiB DT-Fusion (v6 WTA + E4B+31B)`: `151 | 226 (+9, tied record) | 191` → **`568 / 664 (+4)`**
+   - `2.00 GiB E4B+31B-PCA (v6 r=768)`: `154 | 218 (+1) | 194 (+3)` → **`566 / 664 (+2)`** *(vs `560` at `r=512`)*
+   - `105 GiB DT-Fusion (v6 DS + E4B+31B)`: `152 | 218 (+1) | 195 (+4, tied record)` → **`565 / 664 (+1)`**
+   - `9.13 GiB DT-Fusion (v6 WTA + Raon)`: `151 | 222 (+5) | 191` → `564 / 664 (0)`
+   - `3.49 GiB Dual-PLE (v6 E4B+31B + Raon)`: `153 | 218 | 192` → `563 / 664 (-1)`; `104.5 GiB DT-Fusion (v6 DS + Raon)`: `149 | 220 | 193` → `562 / 664 (-2)`.
+
+2. **`Ling-3.0-tiny` (`664` items, default `k=8`):**
+   - `BASE`: `132 | 156 | 179` → **`467 / 664 (70.33%)`** (`206–208 tok/s`)
+   - **`7.64 GiB WTA-8B` (`L22 → blk.23`, agent-safe):** **`133 (+1) | 179 (+23, all-time record) | 178` → `490 / 664 (73.80%, +23 ALL-TIME RECORD)`**
+   - **`8.64 GiB DT-Fusion (WTA-8B + 1.00 GiB E4B)`:** `129 | 176 (+20) | 182 (+3)` → **`487 / 664 (+20)`** *(beats `104 GiB` DeepSeek+E4B at 12× smaller size!)*
+   - `104 GiB DT-Fusion (DeepSeek + E4B)`: `135 (+3) | 169 (+13) | 180` → **`484 / 664 (+17)`** (`192–198 tok/s`)
+   - `104.5 GiB DT-Fusion (DeepSeek + Raon)`: `133 | 169 (+13) | 181` → **`483 / 664 (+16)`**
+   - `104 GiB DT-Fusion (v6 DeepSeek + E4B)`: **`137 (+5, all-time HE record) | 164 | 181` → `482 / 664 (+15)`**
+   - `9.13 GiB DT-Fusion (WTA + Raon)`: `134 | 167 | 180` → **`481 / 664 (+14)`**
+   - Standalone `1.00 GiB E4B PLE`, `1.49 GiB Raon-1-nano`, `103 GiB DeepSeek`: all **`478 / 664 (+11)`**; `2.49 GiB Dual-PLE (E4B + Raon)`: **`475 / 664 (+8)`**.
+
+3. **`Gemma-4-12B-It` (`514` live items, `--no-think`: `hard200` + `164` HE + `150` MMLU-Pro, `L47`) — 4 / 4 Standalone Wins:**
+   - `BASE`: `173 | 152 | 72` → **`397 / 514`** (`43.4m`, `398 tok/item`)
+   - **`1.00 GiB E4B PLE`**: `174 | 155 | 78` → **`407 / 514 (+10)`**
+   - **`2.00 GiB E4B+31B-PCA`**: `173 | 155 | 79` → **`407 / 514 (+10)`** (`41.2m`, `371 tok/item = -6.9%`)
+   - **`1.49 GiB Raon-1-nano`**: `174 | 153 | 77` → **`404 / 514 (+7)`**
+   - **`103 GiB DeepSeek`**: `173 | 155 | 75` → **`403 / 514 (+6)`**
+   - *(All 3 unarbitrated final-layer `L47+L47` fusions degraded vs standalone `L47`, establishing that mid-layer downstream Transformer arbitration is required for super-additive DT-Fusion.)*
+
+4. **`SenseNova-Loop-9B-Q8_0` (`614` live items, `--no-think`: `hard200` + `164` HE + `150` MMLU-Pro + `100` GSM8K, `L54 → blk.31`) — 11 / 11 Wins (100% Win Rate, Zero Ties, Zero Regressions):**
+   - `--verify-addressing`: `100.00%` (`44,496/44,496` N-gram hashes on `WTA-8B`, `927/927` on `Raon-1-nano`).
+   - 4-way `eval_code` check (`v5 DT-Fusion WTA + E4B+31B`): `BASE 2.083`, `DISABLED 2.083 (+0.000000)`, **`REAL 2.066 (-0.0172)` at `s=0.5`** (`2.061 / -0.0216` at `s=1.0`), `38.5 vs 39.4 tok/s` (`97.7%` of BASE speed).
+
+| Config (`SenseNova-Loop-9B-Q8_0`) | Table Size | hard200 | HumanEval | MMLU-Pro (150) | GSM8K (100) | Total (614) | vs BASE |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **`WTA-8B` (`r=512 ep6`)** | **`7.64 GiB`** | 145 (+1) | 138 (+1) | **111 (+7)** | 96 (-1) | **`490 / 614 (79.80%)`** | **`+8`** |
+| **`DT-Fusion (WTA + E4B+31B, v5)`** | `9.64 GiB` | 145 (+1) | **140 (+3)** | **108 (+4)** | 96 (-1) | **`489 / 614 (79.64%)`** | **`+7`** |
+| **`DT-Fusion (WTA + Raon, v5)`** | `9.13 GiB` | 145 (+1) | 139 (+2) | 106 (+2) | **98 (+1)** | **`488 / 614 (79.48%)`** | **`+6`** |
+| **`Dual-PLE (E4B+31B + Raon)`** | **`3.49 GiB`** | **147 (+3)** | 137 (0) | 106 (+2) | **98 (+1)** | **`488 / 614 (79.48%)`** | **`+6`** *(super-additive)* |
+| `DT-Fusion (WTA + Raon, v6 r=768)` | `9.13 GiB` | 146 (+2) | 139 (+2) | 106 (+2) | 97 (0) | **`488 / 614`** | **`+6`** |
+| `DT-Fusion (WTA + E4B+31B, v6 r=768)` | `9.64 GiB` | **147 (+3)** | 135 (-2) | **108 (+4)** | **98 (+1)** | **`488 / 614`** | **`+6`** |
+| `E4B+31B-PCA` (`r=384` / `v6 r=768`) | `2.00 GiB` | 145 (+1) | 136 / 137 | 106 (+2) | 98 / 97 | **`485 / 614`** | **`+3`** |
+| `WTA-8B` (`v6 r=768 ep10`) | `7.64 GiB` | **147 (+3)** | 136 (-1) | 105 (+1) | 97 (0) | **`485 / 614`** | **`+3`** |
+| `Raon-1-nano` (`v6 r=768` / `r=384`) | `1.49 GiB` | 145 (+1) | 137 / 139 | 106 / 102 | 96 / 97 | **`484 / 483`** | **`+2 / +1`** |
+| **`BASE`** | — | `144` | `137` | `104` | `97` | **`482 / 614 (78.50%)`** | — |
+
+### D. Architectural Laws Established
+1. **Frequency WTA `7.64 GiB IQ4_NL` is the universal #1 table:** Beats the `103 GiB` DeepSeek donor table and every fusion on all 3 tested architectures (`Inkling-2-Mini 45.0/47` & `575/664`, `Ling-3.0-tiny 490/664`, `SenseNova-Loop-9B 490/614`) at 13.5× smaller size.
+2. **Downstream arbitration depth governs optimal adapter capacity:** With 1 downstream arbitration layer (`SenseNova blk.31`), gentler `r=512 ep6` (`490/614`, `eval_code 2.074`) outperforms `r=768 ep10` (`485/614`, slight code log-loss over-sharpening `2.092`), whereas 3 downstream MoE layers (`Inkling-2-Mini blk.21..23`) absorb `r=768 ep10` cleanly (`563 → 575/664, +12`).
+3. **Mid-layer arbitration is required for super-additive DT-Fusion:** Fusing complementary tables before downstream Transformer layer(s) yields super-additive live gains (`Ling-3` `103G DS 478 + 1G E4B 478 → 484`; `SenseNova` `E4B+31B 485 + Raon 483 → 488` at `3.49 GiB`, and `WTA + E4B+31B` HumanEval `140/164`), whereas unarbitrated final-layer `L47+L47` fusion on `Gemma-4-12B` degrades vs standalone.

@@ -31,11 +31,25 @@ inline bool prof_enabled() {
     return on;
 }
 
+inline void gemma4_embed(
+    const DeviceTensor & W, const int32_t * d_tokens, float * d_out,
+    int dim, int T, cudaStream_t stream) {
+
+    if (W.dtype == DType::Q4_0) {
+        launch_gemma4_embedding_q4_0(W, d_tokens, d_out, dim, T, stream);
+    } else {
+        launch_embedding_lookup(W, d_tokens, d_out, dim, 1, T, stream);
+    }
+}
+
 inline void gemma4_linear(
     cublasHandle_t cublas, const DeviceTensor & W,
     const float * d_x, float * d_y, int T,
     void * d_scratch, size_t scratch_bytes, cudaStream_t stream) {
 
+    if (W.dtype == DType::Q4_0 && try_launch_gemma4_linear_q4_0(cublas, W, d_x, d_y, T, d_scratch, scratch_bytes, stream)) {
+        return;
+    }
     if (T >= 16 && try_launch_gemma4_linear_sm60_f16(cublas, W, d_x, d_y, T, d_scratch, scratch_bytes, stream)) {
         return;
     }
@@ -98,7 +112,8 @@ void Gemma4Model::load(const std::string & gguf_path,
                        const std::vector<int> & gpu_ids,
                        const std::vector<float> & split_weights,
                        int max_ctx,
-                       bool kv_q8_0) {
+                       KvCacheType kv_type,
+                       float rope_scale_full) {
     if (gpu_ids.empty()) throw std::runtime_error("Gemma4Model::load: gpu_ids is empty");
 
     const auto t0 = std::chrono::steady_clock::now();
@@ -112,13 +127,13 @@ void Gemma4Model::load(const std::string & gguf_path,
     cfg_.n_layers              = static_cast<int>(sg.get_u64("gemma4.block_count", 35));
     cfg_.n_embd                = static_cast<int>(sg.get_u64("gemma4.embedding_length", 1536));
     cfg_.n_head                = static_cast<int>(sg.get_u64("gemma4.attention.head_count", 8));
-    cfg_.n_head_kv             = static_cast<int>(sg.get_u64("gemma4.attention.head_count_kv", 1));
     cfg_.head_dim_full         = static_cast<int>(sg.get_u64("gemma4.attention.key_length", 512));
     cfg_.head_dim_swa          = static_cast<int>(sg.get_u64("gemma4.attention.key_length_swa", 256));
     cfg_.rope_dim_full         = static_cast<int>(sg.get_u64("gemma4.rope.dimension_count", cfg_.head_dim_full));
     cfg_.rope_dim_swa          = static_cast<int>(sg.get_u64("gemma4.rope.dimension_count_swa", cfg_.head_dim_swa));
     cfg_.rope_freq_base_full   = static_cast<float>(sg.get_f64("gemma4.rope.freq_base", 1000000.0));
     cfg_.rope_freq_base_swa    = static_cast<float>(sg.get_f64("gemma4.rope.freq_base_swa", 10000.0));
+    cfg_.rope_scale_full       = std::max(1.0f, rope_scale_full);
     cfg_.rms_eps               = static_cast<float>(sg.get_f64("gemma4.attention.layer_norm_rms_epsilon", 1e-6));
     cfg_.sliding_window        = static_cast<int>(sg.get_u64("gemma4.attention.sliding_window", 512));
     cfg_.shared_kv_layers      = static_cast<int>(sg.get_u64("gemma4.attention.shared_kv_layers", 0));
@@ -126,11 +141,31 @@ void Gemma4Model::load(const std::string & gguf_path,
     cfg_.n_embd_per_layer      = static_cast<int>(sg.get_u64("gemma4.embedding_length_per_layer_input", 0));
     cfg_.final_logit_softcap   = static_cast<float>(sg.get_f64("gemma4.final_logit_softcapping", 30.0));
     cfg_.max_ctx               = max_ctx;
-    cfg_.kv_q8_0               = kv_q8_0;
+    cfg_.kv_type               = kv_type;
 
     const auto tok_loc = sg.find_tensor("token_embd.weight");
     if (!tok_loc.info) throw std::runtime_error("Gemma4Model::load: missing token_embd.weight");
     cfg_.n_vocab = static_cast<int>(tok_loc.info->ne[1]);
+
+    // Per-layer head_count_kv (array on 12B/26B/31B, scalar on E2B/E4B)
+    cfg_.n_head_kv.assign(cfg_.n_layers, 1);
+    if (meta.has_kv("gemma4.attention.head_count_kv")) {
+        const auto & kvv = meta.kv("gemma4.attention.head_count_kv");
+        if (auto * vu = std::get_if<std::vector<uint64_t>>(&kvv.data)) {
+            for (int il = 0; il < cfg_.n_layers && il < static_cast<int>(vu->size()); ++il) {
+                cfg_.n_head_kv[il] = static_cast<int>((*vu)[il]);
+            }
+        } else if (auto * vi = std::get_if<std::vector<int64_t>>(&kvv.data)) {
+            for (int il = 0; il < cfg_.n_layers && il < static_cast<int>(vi->size()); ++il) {
+                cfg_.n_head_kv[il] = static_cast<int>((*vi)[il]);
+            }
+        } else {
+            int scalar_kv = static_cast<int>(kvv.as_u64());
+            cfg_.n_head_kv.assign(cfg_.n_layers, scalar_kv);
+        }
+    }
+    cfg_.max_head_kv = 1;
+    for (int k : cfg_.n_head_kv) cfg_.max_head_kv = std::max(cfg_.max_head_kv, k);
 
     // Per-layer feed_forward_length (array or scalar)
     cfg_.n_ff.assign(cfg_.n_layers, 6144);
@@ -161,8 +196,9 @@ void Gemma4Model::load(const std::string & gguf_path,
         }
     }
 
-    // KV sharing map: layers >= n_layer_kv_from_start reuse last own-KV layer of same SWA type
+    // KV sharing map & ring-buffer capacities (SWA layers only need sliding_window + max_batch slots!)
     cfg_.kv_source.resize(cfg_.n_layers);
+    cfg_.kv_cap.resize(cfg_.n_layers);
     for (int il = 0; il < cfg_.n_layers; ++il) {
         if (il < cfg_.n_layer_kv_from_start) {
             cfg_.kv_source[il] = il;
@@ -170,6 +206,9 @@ void Gemma4Model::load(const std::string & gguf_path,
             cfg_.kv_source[il] = cfg_.n_layer_kv_from_start - (cfg_.is_swa[il] ? 2 : 1);
             if (cfg_.kv_source[il] < 0) cfg_.kv_source[il] = 0;
         }
+        cfg_.kv_cap[il] = (cfg_.is_swa[il] && cfg_.sliding_window > 0)
+            ? std::min(cfg_.max_ctx, cfg_.sliding_window + max_batch_)
+            : cfg_.max_ctx;
     }
 
     // Partition layers across GPUs
@@ -237,6 +276,7 @@ void Gemma4Model::load(const std::string & gguf_path,
     } else {
         output_ = pool_.upload(sg, "token_embd.weight", dev_last, !device_has_bf16(dev_last), true);
     }
+    pool_.release_staging(); // Free large embedding SoA staging buffer before uploading layers (keeps 6GB GPUs under VRAM cap!)
 
     // Upload per-layer weights
     layers_.resize(cfg_.n_layers);
@@ -254,6 +294,8 @@ void Gemma4Model::load(const std::string & gguf_path,
             L.is_swa    = cfg_.is_swa[il];
             L.has_kv    = (il < cfg_.n_layer_kv_from_start);
             L.kv_source = cfg_.kv_source[il];
+            L.kv_cap    = cfg_.kv_cap[il];
+            L.n_head_kv = cfg_.n_head_kv[il];
             L.n_ff      = cfg_.n_ff[il];
 
             const std::string pfx = "blk." + std::to_string(il) + ".";
@@ -299,16 +341,23 @@ void Gemma4Model::load(const std::string & gguf_path,
     k_cache_.assign(cfg_.n_layers, nullptr);
     v_cache_.assign(cfg_.n_layers, nullptr);
     auto kv_layer_bytes = [&](int il) -> size_t {
-        const int hd = cfg_.is_swa[il] ? cfg_.head_dim_swa : cfg_.head_dim_full;
-        if (cfg_.kv_q8_0) {
-            return static_cast<size_t>(cfg_.max_ctx) * cfg_.n_head_kv * (hd / 32) * sizeof(BlockQ8_0);
+        const int hd    = cfg_.is_swa[il] ? cfg_.head_dim_swa : cfg_.head_dim_full;
+        const int n_kv  = cfg_.n_head_kv[il];
+        const int cap   = cfg_.kv_cap[il];
+        if (cfg_.kv_type == KvCacheType::Q8_0) {
+            return static_cast<size_t>(cap) * n_kv * (hd / 32) * sizeof(BlockQ8_0);
         }
-        return static_cast<size_t>(cfg_.max_ctx) * cfg_.n_head_kv * hd * sizeof(__half);
+        if (cfg_.kv_type == KvCacheType::Q4_0) {
+            return static_cast<size_t>(cap) * n_kv * (hd / 32) * sizeof(BlockQ4_0);
+        }
+        return static_cast<size_t>(cap) * n_kv * hd * sizeof(__half);
     };
 
+    size_t total_kv_bytes = 0;
     for (int il = 0; il < cfg_.n_layer_kv_from_start; ++il) {
         cudaSetDevice(layers_[il].device);
         const size_t bytes = kv_layer_bytes(il);
+        total_kv_bytes += bytes * 2;
         ck(cudaMalloc(&k_cache_[il], bytes), "gemma4 malloc k_cache");
         ck(cudaMalloc(&v_cache_[il], bytes), "gemma4 malloc v_cache");
         ck(cudaMemset(k_cache_[il], 0, bytes), "gemma4 zero k_cache");
@@ -356,8 +405,8 @@ void Gemma4Model::load(const std::string & gguf_path,
         ck(cudaMalloc(&rt.d_sub,      Tmax * H * sizeof(float)), "g4 d_sub");
         ck(cudaMalloc(&rt.d_attn_res, Tmax * H * sizeof(float)), "g4 d_attn_res");
         ck(cudaMalloc(&rt.d_q,        Tmax * cfg_.n_head * max_hd * sizeof(float)), "g4 d_q");
-        ck(cudaMalloc(&rt.d_k,        Tmax * cfg_.n_head_kv * max_hd * sizeof(float)), "g4 d_k");
-        ck(cudaMalloc(&rt.d_v,        Tmax * cfg_.n_head_kv * max_hd * sizeof(float)), "g4 d_v");
+        ck(cudaMalloc(&rt.d_k,        Tmax * cfg_.max_head_kv * max_hd * sizeof(float)), "g4 d_k");
+        ck(cudaMalloc(&rt.d_v,        Tmax * cfg_.max_head_kv * max_hd * sizeof(float)), "g4 d_v");
         ck(cudaMalloc(&rt.d_attn_out, Tmax * cfg_.n_head * max_hd * sizeof(float)), "g4 d_attn_out");
         ck(cudaMalloc(&rt.d_ff_gate,  Tmax * max_ff * sizeof(float)), "g4 d_ff_gate");
         ck(cudaMalloc(&rt.d_ff_up,    Tmax * max_ff * sizeof(float)), "g4 d_ff_up");
@@ -380,19 +429,25 @@ void Gemma4Model::load(const std::string & gguf_path,
             ck(cudaMalloc(&rt.d_argmax, sizeof(int32_t)), "g4 d_argmax");
         }
 
-        rt.scratch_bytes = static_cast<size_t>(96) << 20; // 96 MiB scratch
+        size_t free_vram = 0, total_vram = 0;
+        cudaMemGetInfo(&free_vram, &total_vram);
+        // Use 144 MiB scratch when plenty of VRAM is free so large 12B FFN matrices (112.5 MiB F16) run in a single Hgemm!
+        rt.scratch_bytes = (free_vram > (static_cast<size_t>(512) << 20))
+            ? (static_cast<size_t>(144) << 20)
+            : (static_cast<size_t>(96) << 20);
         ck(cudaMalloc(&rt.d_scratch, rt.scratch_bytes), "g4 d_scratch");
     }
 
     const auto t1 = std::chrono::steady_clock::now();
     const double load_s = std::chrono::duration<double>(t1 - t0).count();
-    std::printf("[Gemma4] Loaded %s (%d layers: %d own-KV + %d shared-KV, n_embd=%d, n_head=%d/%d, hd=%d/%d, swa=%d, ple=%d, softcap=%.1f, ctx=%d, kv=%s) in %.2f s\n",
+    std::printf("[Gemma4] Loaded %s (%d layers: %d own-KV + %d shared-KV, n_embd=%d, n_head=%d/%d, hd=%d/%d, swa=%d, ple=%d, softcap=%.1f, ctx=%d, kv=%s %.2f GiB) in %.2f s\n",
                 sg.get_str("general.name", "Gemma-4").c_str(),
                 cfg_.n_layers, cfg_.n_layer_kv_from_start, cfg_.shared_kv_layers,
-                cfg_.n_embd, cfg_.n_head, cfg_.n_head_kv,
+                cfg_.n_embd, cfg_.n_head, cfg_.max_head_kv,
                 cfg_.head_dim_swa, cfg_.head_dim_full, cfg_.sliding_window,
                 cfg_.n_embd_per_layer, cfg_.final_logit_softcap,
-                cfg_.max_ctx, cfg_.kv_q8_0 ? "Q8_0" : "F16", load_s);
+                cfg_.max_ctx, kv_cache_type_name(cfg_.kv_type),
+                static_cast<double>(total_kv_bytes) / (1024.0 * 1024.0 * 1024.0), load_s);
     for (size_t g = 0; g < n_gpus; ++g) {
         std::printf("  GPU%d: layers [%2d..%2d) (%2d layers), %.2f GiB weights\n",
                     runtimes_[g].device, runtimes_[g].layer_start, runtimes_[g].layer_end,
@@ -439,12 +494,12 @@ void Gemma4Model::run_gpu_segment(size_t gi, int T, bool run_argmax, int pos_min
     // 1. Embeddings + PLE projection on GPU 0
     if (gi == 0) {
         p_begin();
-        launch_embedding_lookup(tok_embd_, rt.d_tokens, rt.d_cur, H, 1, T_cur, st);
+        gemma4_embed(tok_embd_, rt.d_tokens, rt.d_cur, H, T_cur, st);
         launch_gemma4_scale(rt.d_cur, static_cast<int64_t>(T_cur) * H, std::sqrt(static_cast<float>(H)), st);
 
         if (cfg_.n_embd_per_layer > 0) {
             const int ple_total_dim = cfg_.n_layers * cfg_.n_embd_per_layer;
-            launch_embedding_lookup(per_layer_tok_embd_, rt.d_tokens, rt.d_ple_raw, ple_total_dim, 1, T_cur, st);
+            gemma4_embed(per_layer_tok_embd_, rt.d_tokens, rt.d_ple_raw, ple_total_dim, T_cur, st);
             gemma4_linear(rt.cublas, per_layer_model_proj_, rt.d_cur, rt.d_ple_proj, T_cur, rt.d_scratch, rt.scratch_bytes, st);
             launch_gemma4_ple_combine(
                 rt.d_ple_proj, rt.d_ple_raw,
@@ -470,21 +525,31 @@ void Gemma4Model::run_gpu_segment(size_t gi, int T, bool run_argmax, int pos_min
         }
 
         const auto & L = layers_[il];
-        const int hd       = L.is_swa ? cfg_.head_dim_swa : cfg_.head_dim_full;
-        const int rdim     = L.is_swa ? cfg_.rope_dim_swa : cfg_.rope_dim_full;
-        const float fbase  = L.is_swa ? cfg_.rope_freq_base_swa : cfg_.rope_freq_base_full;
-        const int swa_win  = L.is_swa ? cfg_.sliding_window : 0;
+        const int hd        = L.is_swa ? cfg_.head_dim_swa : cfg_.head_dim_full;
+        const int rdim      = L.is_swa ? cfg_.rope_dim_swa : cfg_.rope_dim_full;
+        const float fbase   = L.is_swa ? cfg_.rope_freq_base_swa : cfg_.rope_freq_base_full;
+        const float rscale  = L.is_swa ? 1.0f : cfg_.rope_scale_full;
+        const int swa_win   = L.is_swa ? cfg_.sliding_window : 0;
+        const int n_kv      = L.n_head_kv;
+        const int kv_cap    = layers_[L.kv_source].kv_cap;
 
         // 2.1 Pre-attention RMSNorm + Q/K/V projections
         p_begin();
         launch_rmsnorm(rt.d_cur, static_cast<const float *>(L.attn_norm.ptr), rt.d_norm, H, T_cur, cfg_.rms_eps, st);
 
         if (L.has_kv) {
-            if (T_cur < 16 && L.wq.dtype == DType::Q4_K && L.wk.dtype == DType::Q4_K &&
+            const DeviceTensor * ws[3] = {&L.wq, &L.wk, &L.wv};
+            float * ys[3]              = {rt.d_q, rt.d_k, rt.d_v};
+            const int n_mat = L.wv.valid() ? 3 : 2;
+            if (T_cur < 16 && L.wq.dtype == DType::Q4_0 && L.wk.dtype == DType::Q4_0 &&
+                (!L.wv.valid() || L.wv.dtype == DType::Q4_0) &&
+                try_launch_gemma4_linear_multi_q4_0(ws, ys, n_mat, rt.d_norm, T_cur, rt.d_scratch, rt.scratch_bytes, st)) {
+                if (!L.wv.valid()) {
+                    ck(cudaMemcpyAsync(rt.d_v, rt.d_k, static_cast<size_t>(T_cur) * n_kv * hd * sizeof(float),
+                                       cudaMemcpyDeviceToDevice, st), "g4 copy k->v");
+                }
+            } else if (T_cur < 16 && L.wq.dtype == DType::Q4_K && L.wk.dtype == DType::Q4_K &&
                 (!L.wv.valid() || L.wv.dtype == DType::Q4_K || (L.wv.dtype == DType::Q6_K && L.wv.is_soa))) {
-                const DeviceTensor * ws[3] = {&L.wq, &L.wk, &L.wv};
-                float * ys[3]              = {rt.d_q, rt.d_k, rt.d_v};
-                const int n_mat = L.wv.valid() ? 3 : 2;
                 bool done = false;
                 if (sm == 60) {
                     done = try_launch_linear_multi_sm60_h2(ws, ys, n_mat, rt.d_norm, T_cur, rt.d_scratch, rt.scratch_bytes, st);
@@ -494,7 +559,7 @@ void Gemma4Model::run_gpu_segment(size_t gi, int T, bool run_argmax, int pos_min
                     launch_linear_multi_prequant(ws, ys, n_mat, rt.d_scratch, T_cur, st);
                 }
                 if (!L.wv.valid()) {
-                    ck(cudaMemcpyAsync(rt.d_v, rt.d_k, static_cast<size_t>(T_cur) * cfg_.n_head_kv * hd * sizeof(float),
+                    ck(cudaMemcpyAsync(rt.d_v, rt.d_k, static_cast<size_t>(T_cur) * n_kv * hd * sizeof(float),
                                        cudaMemcpyDeviceToDevice, st), "g4 copy k->v");
                 }
             } else {
@@ -503,7 +568,7 @@ void Gemma4Model::run_gpu_segment(size_t gi, int T, bool run_argmax, int pos_min
                 if (L.wv.valid()) {
                     gemma4_linear(rt.cublas, L.wv, rt.d_norm, rt.d_v, T_cur, rt.d_scratch, rt.scratch_bytes, st);
                 } else {
-                    ck(cudaMemcpyAsync(rt.d_v, rt.d_k, static_cast<size_t>(T_cur) * cfg_.n_head_kv * hd * sizeof(float),
+                    ck(cudaMemcpyAsync(rt.d_v, rt.d_k, static_cast<size_t>(T_cur) * n_kv * hd * sizeof(float),
                                        cudaMemcpyDeviceToDevice, st), "g4 copy k->v");
                 }
             }
@@ -522,8 +587,8 @@ void Gemma4Model::run_gpu_segment(size_t gi, int T, bool run_argmax, int pos_min
             d_rfreqs,
             L.has_kv ? k_cache_[il] : nullptr,
             L.has_kv ? v_cache_[il] : nullptr,
-            cfg_.kv_q8_0, rt.d_pos, T_cur, cfg_.n_head, cfg_.n_head_kv,
-            hd, rdim, cfg_.max_ctx, cfg_.rms_eps, fbase, L.has_kv, st);
+            cfg_.kv_type, rt.d_pos, T_cur, cfg_.n_head, n_kv,
+            hd, rdim, kv_cap, cfg_.rms_eps, fbase, rscale, L.has_kv, st);
         p_end(tm_rope);
 
         // 2.3 Resolve KV cache pointers (own layer or shared kv_source / cross-GPU mirror)
@@ -542,9 +607,9 @@ void Gemma4Model::run_gpu_segment(size_t gi, int T, bool run_argmax, int pos_min
         // 2.4 Attention (scale = 1.0, SWA or Full)
         p_begin();
         launch_gemma4_attn(
-            rt.cublas, rt.d_q, kc_ptr, vc_ptr, cfg_.kv_q8_0,
+            rt.cublas, rt.d_q, kc_ptr, vc_ptr, cfg_.kv_type,
             rt.d_pos, rt.d_attn_out, rt.d_scratch, rt.scratch_bytes,
-            T_cur, cfg_.n_head, cfg_.n_head_kv, hd, cfg_.max_ctx, swa_win, pos_min, pos_max, st);
+            T_cur, cfg_.n_head, n_kv, hd, kv_cap, swa_win, pos_min, pos_max, st);
         p_end(tm_attn);
 
         // 2.5 Output projection + Post-Attention RMSNorm + Residual Add
@@ -558,23 +623,33 @@ void Gemma4Model::run_gpu_segment(size_t gi, int T, bool run_argmax, int pos_min
         // 2.6 Dense GeGLU FFN + Post-FFN RMSNorm + Residual Add
         p_begin();
         launch_rmsnorm(rt.d_attn_res, static_cast<const float *>(L.ffn_norm.ptr), rt.d_norm, H, T_cur, cfg_.rms_eps, st);
-        if (T_cur < 16 && L.ffn_gate.dtype == DType::Q4_K && L.ffn_up.dtype == DType::Q4_K) {
-            const DeviceTensor * ws[2] = {&L.ffn_gate, &L.ffn_up};
-            float * ys[2]              = {rt.d_ff_gate, rt.d_ff_up};
-            bool done = false;
-            if (sm == 60) {
-                done = try_launch_linear_multi_sm60_h2(ws, ys, 2, rt.d_norm, T_cur, rt.d_scratch, rt.scratch_bytes, st);
-            }
-            if (!done) {
-                launch_quantize_q8_1(rt.d_norm, rt.d_scratch, H, T_cur, st);
-                launch_linear_multi_prequant(ws, ys, 2, rt.d_scratch, T_cur, st);
-            }
+        if (sm == 60 && L.ffn_gate.dtype == DType::Q4_0 && L.ffn_up.dtype == DType::Q4_0 && L.ffn_down.dtype == DType::Q4_0 &&
+            try_launch_gemma4_ffn_q4_0_sm60(rt.cublas, L.ffn_gate, L.ffn_up, L.ffn_down,
+                                            rt.d_norm, rt.d_sub, T_cur, rt.d_scratch, rt.scratch_bytes, st)) {
+            // Fused sm_60 Q4_0 FFN (decode: 16-warp gate+up+GeGLU+prep + tiled-smem down; prefill: pure-FP16 HGEMM)
         } else {
-            gemma4_linear(rt.cublas, L.ffn_gate, rt.d_norm, rt.d_ff_gate, T_cur, rt.d_scratch, rt.scratch_bytes, st);
-            gemma4_linear(rt.cublas, L.ffn_up,   rt.d_norm, rt.d_ff_up,   T_cur, rt.d_scratch, rt.scratch_bytes, st);
+            if (T_cur < 16 && L.ffn_gate.dtype == DType::Q4_0 && L.ffn_up.dtype == DType::Q4_0) {
+                const DeviceTensor * ws[2] = {&L.ffn_gate, &L.ffn_up};
+                float * ys[2]              = {rt.d_ff_gate, rt.d_ff_up};
+                try_launch_gemma4_linear_multi_q4_0(ws, ys, 2, rt.d_norm, T_cur, rt.d_scratch, rt.scratch_bytes, st);
+            } else if (T_cur < 16 && L.ffn_gate.dtype == DType::Q4_K && L.ffn_up.dtype == DType::Q4_K) {
+                const DeviceTensor * ws[2] = {&L.ffn_gate, &L.ffn_up};
+                float * ys[2]              = {rt.d_ff_gate, rt.d_ff_up};
+                bool done = false;
+                if (sm == 60) {
+                    done = try_launch_linear_multi_sm60_h2(ws, ys, 2, rt.d_norm, T_cur, rt.d_scratch, rt.scratch_bytes, st);
+                }
+                if (!done) {
+                    launch_quantize_q8_1(rt.d_norm, rt.d_scratch, H, T_cur, st);
+                    launch_linear_multi_prequant(ws, ys, 2, rt.d_scratch, T_cur, st);
+                }
+            } else {
+                gemma4_linear(rt.cublas, L.ffn_gate, rt.d_norm, rt.d_ff_gate, T_cur, rt.d_scratch, rt.scratch_bytes, st);
+                gemma4_linear(rt.cublas, L.ffn_up,   rt.d_norm, rt.d_ff_up,   T_cur, rt.d_scratch, rt.scratch_bytes, st);
+            }
+            launch_gemma4_geglu(rt.d_ff_gate, rt.d_ff_up, rt.d_ff_gate, static_cast<int64_t>(T_cur) * L.n_ff, st);
+            gemma4_linear(rt.cublas, L.ffn_down, rt.d_ff_gate, rt.d_sub, T_cur, rt.d_scratch, rt.scratch_bytes, st);
         }
-        launch_gemma4_geglu(rt.d_ff_gate, rt.d_ff_up, rt.d_ff_gate, static_cast<int64_t>(T_cur) * L.n_ff, st);
-        gemma4_linear(rt.cublas, L.ffn_down, rt.d_ff_gate, rt.d_sub, T_cur, rt.d_scratch, rt.scratch_bytes, st);
 
         const float * d_lscale = L.layer_output_scale.valid() ? static_cast<const float *>(L.layer_output_scale.ptr) : nullptr;
         launch_gemma4_post_norm_add_scale(
@@ -712,34 +787,45 @@ void Gemma4Model::forward(const std::vector<int32_t> & tokens,
         run_gpu_segment(gi, T_cur, /*run_argmax=*/false, pos_min, pos_max, can_prune, compute_logits, ple_tok_off, T_next, ple_next);
 
         // Sync cross-GPU KV mirrors sourced from layers in [rt.layer_start, rt.layer_end)
+        auto sync_mirror_range = [&](const KvMirror & m, int s_start, int count) {
+            const int il   = m.src_layer;
+            const int hd   = cfg_.is_swa[il] ? cfg_.head_dim_swa : cfg_.head_dim_full;
+            const int n_kv = cfg_.n_head_kv[il];
+            const int cap  = cfg_.kv_cap[il];
+            if (cfg_.kv_type == KvCacheType::Q8_0 || cfg_.kv_type == KvCacheType::Q4_0) {
+                const size_t qs_row_b = static_cast<size_t>(n_kv) * (cfg_.kv_type == KvCacheType::Q8_0 ? hd : (hd / 2));
+                const size_t qs_total = static_cast<size_t>(cap) * qs_row_b;
+                const size_t d_row_b  = static_cast<size_t>(n_kv) * (hd / 32) * sizeof(uint16_t);
+                const size_t q_off = static_cast<size_t>(s_start) * qs_row_b;
+                const size_t q_len = static_cast<size_t>(count) * qs_row_b;
+                const size_t d_off = qs_total + static_cast<size_t>(s_start) * d_row_b;
+                const size_t d_len = static_cast<size_t>(count) * d_row_b;
+                ck(cudaMemcpyPeerAsync(static_cast<uint8_t *>(m.k_buf) + q_off, m.dst_dev,
+                                       static_cast<const uint8_t *>(k_cache_[il]) + q_off, rt.device, q_len, rt.stream), "g4 peer k_qs");
+                ck(cudaMemcpyPeerAsync(static_cast<uint8_t *>(m.k_buf) + d_off, m.dst_dev,
+                                       static_cast<const uint8_t *>(k_cache_[il]) + d_off, rt.device, d_len, rt.stream), "g4 peer k_d");
+                ck(cudaMemcpyPeerAsync(static_cast<uint8_t *>(m.v_buf) + q_off, m.dst_dev,
+                                       static_cast<const uint8_t *>(v_cache_[il]) + q_off, rt.device, q_len, rt.stream), "g4 peer v_qs");
+                ck(cudaMemcpyPeerAsync(static_cast<uint8_t *>(m.v_buf) + d_off, m.dst_dev,
+                                       static_cast<const uint8_t *>(v_cache_[il]) + d_off, rt.device, d_len, rt.stream), "g4 peer v_d");
+            } else {
+                const size_t row_b = static_cast<size_t>(n_kv) * hd * sizeof(__half);
+                const size_t off_b = static_cast<size_t>(s_start) * row_b;
+                const size_t len_b = static_cast<size_t>(count) * row_b;
+                ck(cudaMemcpyPeerAsync(static_cast<uint8_t *>(m.k_buf) + off_b, m.dst_dev,
+                                       static_cast<const uint8_t *>(k_cache_[il]) + off_b, rt.device, len_b, rt.stream), "g4 peer k_mirror");
+                ck(cudaMemcpyPeerAsync(static_cast<uint8_t *>(m.v_buf) + off_b, m.dst_dev,
+                                       static_cast<const uint8_t *>(v_cache_[il]) + off_b, rt.device, len_b, rt.stream), "g4 peer v_mirror");
+            }
+        };
         for (const auto & m : kv_mirrors_) {
             if (m.src_layer >= rt.layer_start && m.src_layer < rt.layer_end) {
-                const int hd = cfg_.is_swa[m.src_layer] ? cfg_.head_dim_swa : cfg_.head_dim_full;
-                if (cfg_.kv_q8_0) {
-                    const size_t qs_total = static_cast<size_t>(cfg_.max_ctx) * cfg_.n_head_kv * hd;
-                    const size_t qs_row_b = static_cast<size_t>(cfg_.n_head_kv) * hd;
-                    const size_t d_row_b  = static_cast<size_t>(cfg_.n_head_kv) * (hd / 32) * sizeof(uint16_t);
-                    const size_t q_off = static_cast<size_t>(pos_min) * qs_row_b;
-                    const size_t q_len = static_cast<size_t>(pos_max - pos_min + 1) * qs_row_b;
-                    const size_t d_off = qs_total + static_cast<size_t>(pos_min) * d_row_b;
-                    const size_t d_len = static_cast<size_t>(pos_max - pos_min + 1) * d_row_b;
-                    ck(cudaMemcpyPeerAsync(static_cast<uint8_t *>(m.k_buf) + q_off, m.dst_dev,
-                                           static_cast<const uint8_t *>(k_cache_[m.src_layer]) + q_off, rt.device, q_len, rt.stream), "g4 peer k_qs");
-                    ck(cudaMemcpyPeerAsync(static_cast<uint8_t *>(m.k_buf) + d_off, m.dst_dev,
-                                           static_cast<const uint8_t *>(k_cache_[m.src_layer]) + d_off, rt.device, d_len, rt.stream), "g4 peer k_d");
-                    ck(cudaMemcpyPeerAsync(static_cast<uint8_t *>(m.v_buf) + q_off, m.dst_dev,
-                                           static_cast<const uint8_t *>(v_cache_[m.src_layer]) + q_off, rt.device, q_len, rt.stream), "g4 peer v_qs");
-                    ck(cudaMemcpyPeerAsync(static_cast<uint8_t *>(m.v_buf) + d_off, m.dst_dev,
-                                           static_cast<const uint8_t *>(v_cache_[m.src_layer]) + d_off, rt.device, d_len, rt.stream), "g4 peer v_d");
-                } else {
-                    const size_t row_b = static_cast<size_t>(cfg_.n_head_kv) * hd * sizeof(__half);
-                    const size_t off_b = static_cast<size_t>(pos_min) * row_b;
-                    const size_t len_b = static_cast<size_t>(pos_max - pos_min + 1) * row_b;
-                    ck(cudaMemcpyPeerAsync(static_cast<uint8_t *>(m.k_buf) + off_b, m.dst_dev,
-                                           static_cast<const uint8_t *>(k_cache_[m.src_layer]) + off_b, rt.device, len_b, rt.stream), "g4 peer k_mirror");
-                    ck(cudaMemcpyPeerAsync(static_cast<uint8_t *>(m.v_buf) + off_b, m.dst_dev,
-                                           static_cast<const uint8_t *>(v_cache_[m.src_layer]) + off_b, rt.device, len_b, rt.stream), "g4 peer v_mirror");
-                }
+                const int cap   = cfg_.kv_cap[m.src_layer];
+                const int total = std::min(pos_max - pos_min + 1, cap);
+                const int s0    = pos_min % cap;
+                const int n1    = std::min(total, cap - s0);
+                sync_mirror_range(m, s0, n1);
+                if (n1 < total) sync_mirror_range(m, 0, total - n1);
             }
         }
 
@@ -800,28 +886,32 @@ int32_t Gemma4Model::forward_decode_greedy(int32_t token, int32_t pos) {
             run_gpu_segment(gi, 1, /*run_argmax=*/true, pos, pos, /*prune_prefill=*/false, /*compute_logits=*/true, 0, t_out, p_out);
             for (const auto & m : kv_mirrors_) {
                 if (m.src_layer >= rt.layer_start && m.src_layer < rt.layer_end) {
-                    const int hd = cfg_.is_swa[m.src_layer] ? cfg_.head_dim_swa : cfg_.head_dim_full;
-                    if (cfg_.kv_q8_0) {
-                        const size_t qs_total = static_cast<size_t>(cfg_.max_ctx) * cfg_.n_head_kv * hd;
-                        const size_t qs_row_b = static_cast<size_t>(cfg_.n_head_kv) * hd;
-                        const size_t d_row_b  = static_cast<size_t>(cfg_.n_head_kv) * (hd / 32) * sizeof(uint16_t);
-                        const size_t q_off = static_cast<size_t>(pos) * qs_row_b;
-                        const size_t d_off = qs_total + static_cast<size_t>(pos) * d_row_b;
+                    const int il   = m.src_layer;
+                    const int hd   = cfg_.is_swa[il] ? cfg_.head_dim_swa : cfg_.head_dim_full;
+                    const int n_kv = cfg_.n_head_kv[il];
+                    const int cap  = cfg_.kv_cap[il];
+                    const int slot = pos % cap;
+                    if (cfg_.kv_type == KvCacheType::Q8_0 || cfg_.kv_type == KvCacheType::Q4_0) {
+                        const size_t qs_row_b = static_cast<size_t>(n_kv) * (cfg_.kv_type == KvCacheType::Q8_0 ? hd : (hd / 2));
+                        const size_t qs_total = static_cast<size_t>(cap) * qs_row_b;
+                        const size_t d_row_b  = static_cast<size_t>(n_kv) * (hd / 32) * sizeof(uint16_t);
+                        const size_t q_off = static_cast<size_t>(slot) * qs_row_b;
+                        const size_t d_off = qs_total + static_cast<size_t>(slot) * d_row_b;
                         ck(cudaMemcpyPeerAsync(static_cast<uint8_t *>(m.k_buf) + q_off, m.dst_dev,
-                                               static_cast<const uint8_t *>(k_cache_[m.src_layer]) + q_off, rt.device, qs_row_b, rt.stream), "g4 dec k_qs");
+                                               static_cast<const uint8_t *>(k_cache_[il]) + q_off, rt.device, qs_row_b, rt.stream), "g4 dec k_qs");
                         ck(cudaMemcpyPeerAsync(static_cast<uint8_t *>(m.k_buf) + d_off, m.dst_dev,
-                                               static_cast<const uint8_t *>(k_cache_[m.src_layer]) + d_off, rt.device, d_row_b, rt.stream), "g4 dec k_d");
+                                               static_cast<const uint8_t *>(k_cache_[il]) + d_off, rt.device, d_row_b, rt.stream), "g4 dec k_d");
                         ck(cudaMemcpyPeerAsync(static_cast<uint8_t *>(m.v_buf) + q_off, m.dst_dev,
-                                               static_cast<const uint8_t *>(v_cache_[m.src_layer]) + q_off, rt.device, qs_row_b, rt.stream), "g4 dec v_qs");
+                                               static_cast<const uint8_t *>(v_cache_[il]) + q_off, rt.device, qs_row_b, rt.stream), "g4 dec v_qs");
                         ck(cudaMemcpyPeerAsync(static_cast<uint8_t *>(m.v_buf) + d_off, m.dst_dev,
-                                               static_cast<const uint8_t *>(v_cache_[m.src_layer]) + d_off, rt.device, d_row_b, rt.stream), "g4 dec v_d");
+                                               static_cast<const uint8_t *>(v_cache_[il]) + d_off, rt.device, d_row_b, rt.stream), "g4 dec v_d");
                     } else {
-                        const size_t row_b = static_cast<size_t>(cfg_.n_head_kv) * hd * sizeof(__half);
-                        const size_t off_b = static_cast<size_t>(pos) * row_b;
+                        const size_t row_b = static_cast<size_t>(n_kv) * hd * sizeof(__half);
+                        const size_t off_b = static_cast<size_t>(slot) * row_b;
                         ck(cudaMemcpyPeerAsync(static_cast<uint8_t *>(m.k_buf) + off_b, m.dst_dev,
-                                               static_cast<const uint8_t *>(k_cache_[m.src_layer]) + off_b, rt.device, row_b, rt.stream), "g4 dec peer k_mirror");
+                                               static_cast<const uint8_t *>(k_cache_[il]) + off_b, rt.device, row_b, rt.stream), "g4 dec peer k_mirror");
                         ck(cudaMemcpyPeerAsync(static_cast<uint8_t *>(m.v_buf) + off_b, m.dst_dev,
-                                               static_cast<const uint8_t *>(v_cache_[m.src_layer]) + off_b, rt.device, row_b, rt.stream), "g4 dec peer v_mirror");
+                                               static_cast<const uint8_t *>(v_cache_[il]) + off_b, rt.device, row_b, rt.stream), "g4 dec peer v_mirror");
                     }
                 }
             }
@@ -875,28 +965,32 @@ void Gemma4Model::forward_decode_logits(int32_t token, int32_t pos, std::vector<
             run_gpu_segment(gi, 1, /*run_argmax=*/false, pos, pos, /*prune_prefill=*/false, /*compute_logits=*/true, 0, t_out, p_out);
             for (const auto & m : kv_mirrors_) {
                 if (m.src_layer >= rt.layer_start && m.src_layer < rt.layer_end) {
-                    const int hd = cfg_.is_swa[m.src_layer] ? cfg_.head_dim_swa : cfg_.head_dim_full;
-                    if (cfg_.kv_q8_0) {
-                        const size_t qs_total = static_cast<size_t>(cfg_.max_ctx) * cfg_.n_head_kv * hd;
-                        const size_t qs_row_b = static_cast<size_t>(cfg_.n_head_kv) * hd;
-                        const size_t d_row_b  = static_cast<size_t>(cfg_.n_head_kv) * (hd / 32) * sizeof(uint16_t);
-                        const size_t q_off = static_cast<size_t>(pos) * qs_row_b;
-                        const size_t d_off = qs_total + static_cast<size_t>(pos) * d_row_b;
+                    const int il   = m.src_layer;
+                    const int hd   = cfg_.is_swa[il] ? cfg_.head_dim_swa : cfg_.head_dim_full;
+                    const int n_kv = cfg_.n_head_kv[il];
+                    const int cap  = cfg_.kv_cap[il];
+                    const int slot = pos % cap;
+                    if (cfg_.kv_type == KvCacheType::Q8_0 || cfg_.kv_type == KvCacheType::Q4_0) {
+                        const size_t qs_row_b = static_cast<size_t>(n_kv) * (cfg_.kv_type == KvCacheType::Q8_0 ? hd : (hd / 2));
+                        const size_t qs_total = static_cast<size_t>(cap) * qs_row_b;
+                        const size_t d_row_b  = static_cast<size_t>(n_kv) * (hd / 32) * sizeof(uint16_t);
+                        const size_t q_off = static_cast<size_t>(slot) * qs_row_b;
+                        const size_t d_off = qs_total + static_cast<size_t>(slot) * d_row_b;
                         ck(cudaMemcpyPeerAsync(static_cast<uint8_t *>(m.k_buf) + q_off, m.dst_dev,
-                                               static_cast<const uint8_t *>(k_cache_[m.src_layer]) + q_off, rt.device, qs_row_b, rt.stream), "g4 dec k_qs");
+                                               static_cast<const uint8_t *>(k_cache_[il]) + q_off, rt.device, qs_row_b, rt.stream), "g4 dec k_qs");
                         ck(cudaMemcpyPeerAsync(static_cast<uint8_t *>(m.k_buf) + d_off, m.dst_dev,
-                                               static_cast<const uint8_t *>(k_cache_[m.src_layer]) + d_off, rt.device, d_row_b, rt.stream), "g4 dec k_d");
+                                               static_cast<const uint8_t *>(k_cache_[il]) + d_off, rt.device, d_row_b, rt.stream), "g4 dec k_d");
                         ck(cudaMemcpyPeerAsync(static_cast<uint8_t *>(m.v_buf) + q_off, m.dst_dev,
-                                               static_cast<const uint8_t *>(v_cache_[m.src_layer]) + q_off, rt.device, qs_row_b, rt.stream), "g4 dec v_qs");
+                                               static_cast<const uint8_t *>(v_cache_[il]) + q_off, rt.device, qs_row_b, rt.stream), "g4 dec v_qs");
                         ck(cudaMemcpyPeerAsync(static_cast<uint8_t *>(m.v_buf) + d_off, m.dst_dev,
-                                               static_cast<const uint8_t *>(v_cache_[m.src_layer]) + d_off, rt.device, d_row_b, rt.stream), "g4 dec v_d");
+                                               static_cast<const uint8_t *>(v_cache_[il]) + d_off, rt.device, d_row_b, rt.stream), "g4 dec v_d");
                     } else {
-                        const size_t row_b = static_cast<size_t>(cfg_.n_head_kv) * hd * sizeof(__half);
-                        const size_t off_b = static_cast<size_t>(pos) * row_b;
+                        const size_t row_b = static_cast<size_t>(n_kv) * hd * sizeof(__half);
+                        const size_t off_b = static_cast<size_t>(slot) * row_b;
                         ck(cudaMemcpyPeerAsync(static_cast<uint8_t *>(m.k_buf) + off_b, m.dst_dev,
-                                               static_cast<const uint8_t *>(k_cache_[m.src_layer]) + off_b, rt.device, row_b, rt.stream), "g4 dec peer k_mirror");
+                                               static_cast<const uint8_t *>(k_cache_[il]) + off_b, rt.device, row_b, rt.stream), "g4 dec peer k_mirror");
                         ck(cudaMemcpyPeerAsync(static_cast<uint8_t *>(m.v_buf) + off_b, m.dst_dev,
-                                               static_cast<const uint8_t *>(v_cache_[m.src_layer]) + off_b, rt.device, row_b, rt.stream), "g4 dec peer v_mirror");
+                                               static_cast<const uint8_t *>(v_cache_[il]) + off_b, rt.device, row_b, rt.stream), "g4 dec peer v_mirror");
                     }
                 }
             }

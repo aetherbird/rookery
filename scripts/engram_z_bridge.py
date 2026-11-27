@@ -356,7 +356,7 @@ def cmd_fit_importer_l3(args):
     print(f"[Host Importer L3] Canonical Z ({ex_meta['z_space_id']}, d_z={d_z}) -> {args.host_arch} L{meta_ce['target_layer']}, "
           f"tau*={train_tau:.2f}, logit_softcap={logit_softcap:.1f}", flush=True)
 
-    bridge = RookeryGatedBridge(d_z, meta_ce["d_host"], meta_ce["hc"], args.rank, args.scale, args.dropout).to(device)
+    bridge = RookeryGatedBridge(d_z, meta_ce["d_host"], meta_ce["hc"], args.rank, args.scale, args.dropout, gate_bias=args.gate_bias).to(device)
     opt = torch.optim.AdamW(bridge.parameters(), lr=args.lr, weight_decay=2e-2)
     total_steps = args.epochs * ((n_tr + args.batch_size - 1) // args.batch_size)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, total_steps), eta_min=args.lr * 0.05)
@@ -383,11 +383,24 @@ def cmd_fit_importer_l3(args):
                 base_logits = maxwell_head_logits(hb, hc_fn, hc_scale, hc_base, out_norm, lm_head, logit_softcap=logit_softcap)
                 base_logp = F.log_softmax(base_logits / train_tau, dim=-1)
                 base_p = base_logp.exp()
+                if args.surprisal_alpha > 0.0:
+                    base_nll = F.cross_entropy(base_logits, yb, reduction="none")
+                    u_tok = torch.sigmoid((base_nll - args.surprisal_thresh) / 0.5)
+                    ce_w = 1.0 + args.surprisal_alpha * u_tok
+                    ce_w = ce_w / ce_w.mean().clamp(min=1e-6)
+                    kl_w = 1.0 + args.surprisal_alpha * (1.0 - u_tok)
+                    kl_w = kl_w / kl_w.mean().clamp(min=1e-6)
+                else:
+                    ce_w = kl_w = None
 
             h_out, rel_norm, _ = bridge(hb, zb, return_stats=True)
             logp = F.log_softmax(maxwell_head_logits(h_out, hc_fn, hc_scale, hc_base, out_norm, lm_head, logit_softcap=logit_softcap) / train_tau, dim=-1)
-            ce = F.nll_loss(logp, yb)
-            kl = (base_p * (base_logp - logp)).sum(dim=-1).mean()
+            if ce_w is not None:
+                ce = (F.nll_loss(logp, yb, reduction="none") * ce_w).mean()
+                kl = ((base_p * (base_logp - logp)).sum(dim=-1) * kl_w).mean()
+            else:
+                ce = F.nll_loss(logp, yb)
+                kl = (base_p * (base_logp - logp)).sum(dim=-1).mean()
             loss = ce + args.kl_beta * kl + args.delta_reg * (rel_norm ** 2)
 
             skl_val = 0.0
@@ -434,6 +447,7 @@ def cmd_fit_importer_l3(args):
         "rank": args.rank,
         "scale": args.scale,
         "delta_clip": args.delta_clip,
+        "gate_bias": float(args.gate_bias),
         "val_ppl": round(math.exp(best_score), 4),
     }
     arrays = {
@@ -474,6 +488,7 @@ def cmd_compose(args):
         "host_n_layers": im_meta["host_n_layers"],
         "host_d_embd": d_host,
         "host_hc_mult": im_meta["host_hc_mult"],
+        "default_gate_bias": float(im_meta.get("gate_bias", 0.0)),
         "calibration": f"canonical_z_folded:{ex_meta['z_space_id']}:{mode}",
     }
     m_bytes = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
@@ -565,6 +580,7 @@ def cmd_compose_multi(args):
         "host_n_layers": im0_meta["host_n_layers"],
         "host_d_embd": d_host,
         "host_hc_mult": im0_meta["host_hc_mult"],
+        "default_gate_bias": float(im0_meta.get("gate_bias", 0.0)),
         "calibration": f"canonical_z_multi:{ex_meta['z_space_id']}:{modes}",
     }
     m_bytes = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
@@ -670,6 +686,9 @@ def main():
     p4.add_argument("--rank", type=int, default=128)
     p4.add_argument("--scale", type=float, default=0.05)
     p4.add_argument("--delta-clip", type=float, default=0.15)
+    p4.add_argument("--gate-bias", type=float, default=0.0)
+    p4.add_argument("--surprisal-alpha", type=float, default=0.0)
+    p4.add_argument("--surprisal-thresh", type=float, default=1.5)
     p4.add_argument("--epochs", type=int, default=6)
     p4.add_argument("--batch-size", type=int, default=256)
     p4.add_argument("--lr", type=float, default=8e-4)

@@ -1,5 +1,8 @@
+#include "cpu/gemma4_cpu.h"
 #include "gguf/sharded.h"
+#ifdef ROOKERY_ENABLE_CUDA
 #include "models/gemma4.h"
+#endif
 #include "tokenizer/bpe.h"
 
 #include <algorithm>
@@ -27,7 +30,8 @@ static std::vector<float> parse_csv_floats(const std::string & s) {
     return out;
 }
 
-static void run_bench_matrix(rookery::Gemma4Model & model,
+template <typename ModelT>
+static void run_bench_matrix(ModelT & model,
                              const rookery::BpeTokenizer & tok,
                              const std::vector<int> & pp_lens,
                              const std::vector<int> & depths,
@@ -107,64 +111,18 @@ static void run_bench_matrix(rookery::Gemma4Model & model,
     }
 }
 
-int main(int argc, char ** argv) {
-    std::string model_path;
-    std::string prompt = "The capital of France is";
-    std::vector<int>   gpus = {0};
-    std::vector<float> split;
-    std::vector<int>   bench_pp;
-    std::vector<int>   bench_d;
-    int  max_ctx  = 8192;
-    int  n_gen    = 64;
-    int  chunk    = 512;
-    bool kv_q8_0  = true;
-    bool no_graph = false;
-
-    for (int i = 1; i < argc; ++i) {
-        std::string a = argv[i];
-        auto next = [&]() -> std::string { return (i + 1 < argc) ? argv[++i] : ""; };
-        if (a == "-m" || a == "--model")      model_path = next();
-        else if (a == "-p" || a == "--prompt") prompt = next();
-        else if (a == "--gpus")               gpus = parse_csv_ints(next());
-        else if (a == "--split" || a == "-ts") split = parse_csv_floats(next());
-        else if (a == "-c" || a == "--ctx")   max_ctx = std::atoi(next().c_str());
-        else if (a == "-n" || a == "--gen")   n_gen = std::atoi(next().c_str());
-        else if (a == "--chunk")              chunk = std::atoi(next().c_str());
-        else if (a == "--kv-f16")             kv_q8_0 = false;
-        else if (a == "--no-graph")           no_graph = true;
-        else if (a == "--bench-pp")           bench_pp = parse_csv_ints(next());
-        else if (a == "--bench-d")            bench_d = parse_csv_ints(next());
-    }
-    if (model_path.empty()) {
-        std::fprintf(stderr, "Usage: %s -m <gemma4.gguf> [--gpus 0,...] [--split ...] [-c 8192] [-n 64] [--chunk 512] [--kv-f16] [--no-graph] [--bench-pp 512,2048] [--bench-d 0,4096] [-p prompt]\n", argv[0]);
-        return 1;
-    }
-
-    rookery::BpeTokenizer tok;
-    {
-        auto sg = rookery::ShardedGguf::open(model_path);
-        tok.load(sg.meta());
-    }
-    tok.add_stop_token("<turn|>");
-    tok.add_stop_token("<eos>");
-
-    rookery::Gemma4Model model;
-    model.load(model_path, gpus, split, max_ctx, kv_q8_0);
-    if (no_graph) model.set_use_cuda_graphs(false);
-    model.warmup_decode_graphs();
-
-    if (!bench_pp.empty() || !bench_d.empty()) {
-        run_bench_matrix(model, tok, bench_pp, bench_d, n_gen, static_cast<size_t>(chunk));
-        return 0;
-    }
-
+template <typename ModelT>
+static void run_prompt(ModelT & model,
+                       const rookery::BpeTokenizer & tok,
+                       const std::string & prompt,
+                       int n_gen,
+                       size_t p_chunk) {
     auto ids = tok.encode(prompt, tok.add_bos_default(), true);
     std::printf("Prompt (%zu tok):", ids.size());
     for (size_t i = 0; i < std::min<size_t>(ids.size(), 16); ++i) std::printf(" %d", ids[i]);
     if (ids.size() > 16) std::printf(" ...");
     std::printf("\n");
 
-    const size_t p_chunk = static_cast<size_t>(chunk);
     std::vector<float> logits;
     const auto t0 = std::chrono::steady_clock::now();
     for (size_t off = 0; off < ids.size(); off += p_chunk) {
@@ -172,7 +130,7 @@ int main(int argc, char ** argv) {
         std::vector<int32_t> ctoks(ids.begin() + static_cast<ptrdiff_t>(off), ids.begin() + static_cast<ptrdiff_t>(off + n));
         std::vector<int32_t> cpos(n);
         std::iota(cpos.begin(), cpos.end(), static_cast<int32_t>(off));
-        model.forward(ctoks, cpos, logits);
+        model.forward(ctoks, cpos, logits, /*compute_logits=*/(off + n >= ids.size()));
     }
     const auto t1 = std::chrono::steady_clock::now();
     const double pp_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -201,5 +159,84 @@ int main(int argc, char ** argv) {
     const double tg_ms = std::chrono::duration<double, std::milli>(g1 - g0).count();
     std::printf("Decode %d tok: %.2f ms (%.2f tok/s)\n", gen - 1, tg_ms, (gen - 1) * 1000.0 / std::max(tg_ms, 0.001));
     std::printf("Output: %s%s\n", prompt.c_str(), out.c_str());
+}
+
+int main(int argc, char ** argv) {
+    std::string model_path;
+    std::string prompt = "The capital of France is";
+    std::vector<int>   gpus = {0};
+    std::vector<float> split;
+    std::vector<int>   bench_pp;
+    std::vector<int>   bench_d;
+    int  max_ctx   = 8192;
+    int  n_gen     = 64;
+    int  chunk     = 256;
+    int  n_threads = 0;
+    rookery::KvCacheType kv_type = rookery::KvCacheType::Q8_0;
+    float rope_scale = 1.0f;
+    bool no_graph  = false;
+#ifdef ROOKERY_ENABLE_CUDA
+    bool use_cpu   = false;
+#else
+    bool use_cpu   = true;
+#endif
+
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        auto next = [&]() -> std::string { return (i + 1 < argc) ? argv[++i] : ""; };
+        if (a == "-m" || a == "--model")       model_path = next();
+        else if (a == "-p" || a == "--prompt") prompt = next();
+        else if (a == "--gpus")                gpus = parse_csv_ints(next());
+        else if (a == "--split" || a == "-ts") split = parse_csv_floats(next());
+        else if (a == "-c" || a == "--ctx")    max_ctx = std::atoi(next().c_str());
+        else if (a == "-n" || a == "--gen")    n_gen = std::atoi(next().c_str());
+        else if (a == "-t" || a == "--threads") n_threads = std::atoi(next().c_str());
+        else if (a == "--cpu")                 use_cpu = true;
+        else if (a == "--chunk")               chunk = std::atoi(next().c_str());
+        else if (a == "--kv-f16")              kv_type = rookery::KvCacheType::F16;
+        else if (a == "--kv-q4")               kv_type = rookery::KvCacheType::Q4_0;
+        else if (a == "--rope-scale")          rope_scale = std::stof(next());
+        else if (a == "--no-graph")            no_graph = true;
+        else if (a == "--bench-pp")            bench_pp = parse_csv_ints(next());
+        else if (a == "--bench-d")             bench_d = parse_csv_ints(next());
+    }
+    if (model_path.empty()) {
+        std::fprintf(stderr, "Usage: %s -m <gemma4.gguf> [--cpu] [-t 4] [--gpus 0,...] [--split ...] [-c 8192] [-n 64] [--chunk 256] [--kv-f16|--kv-q4] [--rope-scale 1.0] [--no-graph] [--bench-pp 128] [--bench-d 0] [-p prompt]\n", argv[0]);
+        return 1;
+    }
+
+    rookery::BpeTokenizer tok;
+    {
+        auto sg = rookery::ShardedGguf::open(model_path);
+        tok.load(sg.meta());
+    }
+    tok.add_stop_token("<turn|>");
+    tok.add_stop_token("<eos>");
+
+    if (use_cpu) {
+        rookery::cpu::Gemma4CpuModel model;
+        model.load(model_path, max_ctx, kv_type, n_threads);
+        if (!bench_pp.empty() || !bench_d.empty()) {
+            run_bench_matrix(model, tok, bench_pp, bench_d, n_gen, static_cast<size_t>(chunk));
+            return 0;
+        }
+        run_prompt(model, tok, prompt, n_gen, static_cast<size_t>(chunk));
+        return 0;
+    }
+
+#ifdef ROOKERY_ENABLE_CUDA
+    rookery::Gemma4Model model;
+    model.load(model_path, gpus, split, max_ctx, kv_type, rope_scale);
+    if (no_graph) model.set_use_cuda_graphs(false);
+    model.warmup_decode_graphs();
+
+    if (!bench_pp.empty() || !bench_d.empty()) {
+        run_bench_matrix(model, tok, bench_pp, bench_d, n_gen, static_cast<size_t>(chunk));
+        return 0;
+    }
+    run_prompt(model, tok, prompt, n_gen, static_cast<size_t>(chunk));
+#else
+    (void) gpus; (void) split; (void) no_graph; (void) rope_scale;
+#endif
     return 0;
 }

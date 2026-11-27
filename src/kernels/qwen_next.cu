@@ -126,6 +126,94 @@ __global__ void qwen_gdn_packed_d128_kernel(
     s_col[lane + 96] = s3;
 }
 
+// Chunked shared-memory GDN prefill recurrence (BC=16, 8 warps = 8 columns/CTA, ~16.5 KB smem):
+// Loads Q/K/V/exp(g)/beta ONCE per 16-token chunk into smem instead of 8x per-warp global reads (-27% GDN prefill!).
+template <int BC>
+__global__ void qwen_gdn_packed_d128_chunk_smem_kernel(
+    const float * __restrict__ qkv_conv,
+    const float * __restrict__ g,
+    const float * __restrict__ beta,
+    float *       __restrict__ state,
+    float *       __restrict__ out,
+    int T, int n_k_heads, int n_v_heads, int row_stride, float scale) {
+
+    const int h    = blockIdx.x;
+    const int col0 = blockIdx.y * 8;
+    const int warp = threadIdx.y; // 0..7
+    const int lane = threadIdx.x; // 0..31
+    const int tid  = warp * 32 + lane;
+    const int col  = col0 + warp;
+
+    const int kh     = h % n_k_heads;
+    const int q_base = kh * 128;
+    const int k_base = (n_k_heads + kh) * 128;
+    const int v_base = (2 * n_k_heads + h) * 128 + col0;
+
+    __shared__ float s_q[BC][128];
+    __shared__ float s_k[BC][128];
+    __shared__ float s_v[BC][8];
+    __shared__ float s_d[BC];
+    __shared__ float s_b[BC];
+
+    const size_t col_off = (static_cast<size_t>(h) * 128 + col) * 128;
+    float * s_col = state + col_off;
+    float s0 = s_col[lane +  0];
+    float s1 = s_col[lane + 32];
+    float s2 = s_col[lane + 64];
+    float s3 = s_col[lane + 96];
+
+    for (int t0 = 0; t0 < T; t0 += BC) {
+        const int tc = (t0 + BC < T) ? BC : (T - t0);
+        for (int idx = tid; idx < tc * 32; idx += 256) {
+            const int c  = idx >> 5;
+            const int l4 = idx & 31;
+            const float * row = qkv_conv + static_cast<size_t>(t0 + c) * row_stride;
+            reinterpret_cast<float4 *>(s_q[c])[l4] = reinterpret_cast<const float4 *>(row + q_base)[l4];
+            reinterpret_cast<float4 *>(s_k[c])[l4] = reinterpret_cast<const float4 *>(row + k_base)[l4];
+        }
+        if (tid < tc * 8) {
+            const int c = tid >> 3;
+            const int j = tid & 7;
+            s_v[c][j] = qkv_conv[static_cast<size_t>(t0 + c) * row_stride + v_base + j];
+        }
+        if (tid < tc) {
+            const size_t off = static_cast<size_t>(t0 + tid) * n_v_heads + h;
+            s_d[tid] = expf(g[off]);
+            s_b[tid] = beta[off];
+        }
+        __syncthreads();
+
+        for (int c = 0; c < tc; ++c) {
+            const float d    = s_d[c];
+            const float bval = s_b[c];
+            const float k0 = s_k[c][lane +  0];
+            const float k1 = s_k[c][lane + 32];
+            const float k2 = s_k[c][lane + 64];
+            const float k3 = s_k[c][lane + 96];
+            const float q0 = s_q[c][lane +  0];
+            const float q1 = s_q[c][lane + 32];
+            const float q2 = s_q[c][lane + 64];
+            const float q3 = s_q[c][lane + 96];
+
+            s0 *= d; s1 *= d; s2 *= d; s3 *= d;
+            float kv = warp_sum(s0 * k0 + s1 * k1 + s2 * k2 + s3 * k3);
+            kv = __shfl_sync(0xffffffffu, kv, 0);
+
+            const float delta = (s_v[c][warp] - kv) * bval;
+            s0 += k0 * delta; s1 += k1 * delta; s2 += k2 * delta; s3 += k3 * delta;
+
+            float attn = warp_sum(s0 * q0 + s1 * q1 + s2 * q2 + s3 * q3);
+            if (lane == 0) out[(static_cast<size_t>(t0 + c) * n_v_heads + h) * 128 + col] = attn * scale;
+        }
+        __syncthreads();
+    }
+
+    s_col[lane +  0] = s0;
+    s_col[lane + 32] = s1;
+    s_col[lane + 64] = s2;
+    s_col[lane + 96] = s3;
+}
+
 // Fused per-head RMSNorm(o, norm_w, eps) * SiLU(z) in-place on o [T, n_v_heads, 128]
 __global__ void rms_norm_silu_gate_d128_kernel(
     float *       __restrict__ o,
@@ -520,10 +608,10 @@ __global__ void gqa_d256_init_flash_kernel(float * m, float * l, int M) {
     if (i < M) { m[i] = -FLT_MAX; l[i] = 0.0f; }
 }
 
-template <typename TMat>
+template <typename TS, typename TP>
 __global__ void gqa_d256_flash_softmax_rescale_kernel(
-    const float *   __restrict__ s_tile,
-    TMat *          __restrict__ p_tile,
+    const TS *      __restrict__ s_tile,
+    TP *            __restrict__ p_tile,
     const int32_t * __restrict__ pos,
     float *         __restrict__ m_buf,
     float *         __restrict__ l_buf,
@@ -541,19 +629,24 @@ __global__ void gqa_d256_flash_softmax_rescale_kernel(
     const int lane = tid & 31;
     const int warp = tid >> 5;
 
-    const float * s_row = s_tile + static_cast<size_t>(r) * kc;
-    TMat *        p_row = p_tile + static_cast<size_t>(r) * kc;
-    float *       o_row = o_buf  + static_cast<size_t>(r) * 256;
+    const TS * s_row = s_tile + static_cast<size_t>(r) * kc;
+    TP *       p_row = p_tile + static_cast<size_t>(r) * kc;
+    float *    o_row = o_buf  + static_cast<size_t>(r) * 256;
+
+    auto read_s = [s_row](int c) -> float {
+        if constexpr (std::is_same_v<TS, __half>) return __half2float(s_row[c]);
+        else return s_row[c];
+    };
 
     if (k0 > maxp) {
         if (k0 == 0) o_row[tid] = 0.0f;
-        for (int c = tid; c < kc; c += blockDim.x) p_row[c] = qwen_f32_to_mat<TMat>(0.0f);
+        for (int c = tid; c < kc; c += blockDim.x) p_row[c] = qwen_f32_to_mat<TP>(0.0f);
         return;
     }
 
     const int valid_c = (k0 + kc - 1 <= maxp) ? kc : (maxp - k0 + 1);
     float local_m = -FLT_MAX;
-    for (int c = tid; c < valid_c; c += blockDim.x) local_m = fmaxf(local_m, s_row[c]);
+    for (int c = tid; c < valid_c; c += blockDim.x) local_m = fmaxf(local_m, read_s(c));
     local_m = warp_max(local_m);
     __shared__ float s_red[8];
     if (lane == 0) s_red[warp] = local_m;
@@ -573,11 +666,11 @@ __global__ void gqa_d256_flash_softmax_rescale_kernel(
     float local_l = 0.0f;
     for (int c = tid; c < kc; c += blockDim.x) {
         if (c < valid_c) {
-            const float e = expf(s_row[c] - m_new);
-            p_row[c] = qwen_f32_to_mat<TMat>(e);
+            const float e = expf(read_s(c) - m_new);
+            p_row[c] = qwen_f32_to_mat<TP>(e);
             local_l += e;
         } else {
-            p_row[c] = qwen_f32_to_mat<TMat>(0.0f);
+            p_row[c] = qwen_f32_to_mat<TP>(0.0f);
         }
     }
     local_l = warp_sum(local_l);
@@ -594,6 +687,22 @@ __global__ void gqa_d256_flash_softmax_rescale_kernel(
 
     if (k0 == 0) o_row[tid] = 0.0f;
     else if (alpha != 1.0f) o_row[tid] *= alpha;
+}
+
+__global__ void gqa_d256_add_f16_to_f32_kernel(
+    const __half * __restrict__ src, float * __restrict__ dst, int64_t n) {
+    const int64_t i4 = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t idx = i4 * 4;
+    if (idx + 3 < n) {
+        const uint2 pk = __ldg(&reinterpret_cast<const uint2 *>(src)[i4]);
+        const float2 f0 = __half22float2(*reinterpret_cast<const __half2 *>(&pk.x));
+        const float2 f1 = __half22float2(*reinterpret_cast<const __half2 *>(&pk.y));
+        float4 cur = reinterpret_cast<float4 *>(dst)[i4];
+        cur.x += f0.x; cur.y += f0.y; cur.z += f1.x; cur.w += f1.y;
+        reinterpret_cast<float4 *>(dst)[i4] = cur;
+    } else {
+        for (int64_t i = idx; i < n; ++i) dst[i] += __half2float(__ldg(&src[i]));
+    }
 }
 
 __global__ void gqa_d256_flash_finalize_kernel(
@@ -1424,10 +1533,16 @@ void launch_qwen_gdn_packed_d128(
     qwen_qkv_l2_norm_d128_kernel<<<dim3((2 * n_k_heads + wpb_n - 1) / wpb_n, T), dim3(32, wpb_n), 0, stream>>>(
         d_qkv_conv, n_k_heads, row_stride, eps);
 
-    constexpr int wpb_g = 4;
-    qwen_gdn_packed_d128_kernel<<<dim3(n_v_heads, 128 / wpb_g), dim3(32, wpb_g), 0, stream>>>(
-        d_qkv_conv, d_g, d_beta, d_state, d_out, d_state_snap,
-        T, n_k_heads, n_v_heads, row_stride, scale);
+    if (T >= 16 && d_state_snap == nullptr) {
+        qwen_gdn_packed_d128_chunk_smem_kernel<16><<<dim3(n_v_heads, 16), dim3(32, 8), 0, stream>>>(
+            d_qkv_conv, d_g, d_beta, d_state, d_out,
+            T, n_k_heads, n_v_heads, row_stride, scale);
+    } else {
+        constexpr int wpb_g = 4;
+        qwen_gdn_packed_d128_kernel<<<dim3(n_v_heads, 128 / wpb_g), dim3(32, wpb_g), 0, stream>>>(
+            d_qkv_conv, d_g, d_beta, d_state, d_out, d_state_snap,
+            T, n_k_heads, n_v_heads, row_stride, scale);
+    }
 }
 
 void launch_rms_norm_silu_gate_d128(
@@ -1477,9 +1592,11 @@ void launch_gqa_attn_d256(
     int T, int n_head, int n_kv, float scale,
     cublasHandle_t cublas, int kv_len_max, cudaStream_t stream) {
 
-    // Fast Tiled FlashAttention for prefill (T >= 8): FP16 Tensor Core (sm>=70) or FP32 SGEMM (<sm_70)!
+    // Fast Tiled FlashAttention for prefill (T >= 8):
+    // FP16 Tensor Core (sm>=70), native FP16 HGEMM (sm_60), or FP32 SGEMM (sm_5x/sm_61).
     if (T >= 8 && cublas != nullptr && kv_len_max > 0) {
         const bool use_tc = device_has_tensor_cores(-1);
+        const int  sm     = device_sm_version(-1);
         const int gqa = n_head / n_kv;
         const int M_per_kv = T * gqa;
         const int M_tot = n_kv * M_per_kv;
@@ -1534,7 +1651,7 @@ void launch_gqa_attn_d256(
                         d_s32, CUDA_R_32F, kc,  static_cast<long long>(M_per_kv) * kc,
                         n_kv, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 
-                    gqa_d256_flash_softmax_rescale_kernel<__half><<<M_tot, 256, 0, stream>>>(
+                    gqa_d256_flash_softmax_rescale_kernel<float, __half><<<M_tot, 256, 0, stream>>>(
                         d_s32, d_p16, d_pos, d_m, d_l, d_ob, T, n_head, n_kv, k0, kc);
 
                     cublasGemmStridedBatchedEx(
@@ -1546,6 +1663,78 @@ void launch_gqa_attn_d256(
                         &one,
                         d_ob,  CUDA_R_32F, 256, static_cast<long long>(M_per_kv) * 256,
                         n_kv, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                }
+                gqa_d256_flash_finalize_kernel<<<M_tot, 256, 0, stream>>>(d_ob, d_l, d_out, T, n_head, n_kv);
+                return;
+            }
+        } else if (sm == 60) {
+            constexpr int K_TILE = 512;
+            const size_t q16_b  = align256(static_cast<size_t>(M_tot) * 256 * sizeof(__half));
+            const size_t k16_b  = align256(static_cast<size_t>(n_kv) * K_TILE * 256 * sizeof(__half));
+            const size_t v16_b  = k16_b;
+            const size_t s16_b  = align256(static_cast<size_t>(M_tot) * K_TILE * sizeof(__half));
+            const size_t p16_b  = s16_b;
+            const size_t ot16_b = q16_b;
+            const size_t o32_b  = align256(static_cast<size_t>(M_tot) * 256 * sizeof(float));
+            const size_t ml_b   = align256(static_cast<size_t>(M_tot) * sizeof(float));
+            const size_t need   = q16_b + k16_b + v16_b + s16_b + p16_b + ot16_b + o32_b + 2 * ml_b;
+
+            if (need <= scratch_bytes) {
+                auto * base = static_cast<uint8_t *>(d_scratch);
+                size_t off = 0;
+                auto * d_q16  = reinterpret_cast<__half *>(base + off); off += q16_b;
+                auto * d_k16  = reinterpret_cast<__half *>(base + off); off += k16_b;
+                auto * d_v16  = reinterpret_cast<__half *>(base + off); off += v16_b;
+                auto * d_s16  = reinterpret_cast<__half *>(base + off); off += s16_b;
+                auto * d_p16  = reinterpret_cast<__half *>(base + off); off += p16_b;
+                auto * d_ot16 = reinterpret_cast<__half *>(base + off); off += ot16_b;
+                auto * d_ob   = reinterpret_cast<float  *>(base + off); off += o32_b;
+                auto * d_m    = reinterpret_cast<float  *>(base + off); off += ml_b;
+                auto * d_l    = reinterpret_cast<float  *>(base + off);
+
+                const int tot_q = T * n_head * 256;
+                gqa_d256_q_to_kvh_kernel<__half><<<(tot_q + 255) / 256, 256, 0, stream>>>(d_q, d_q16, T, n_head, n_kv, scale);
+                gqa_d256_init_flash_kernel<<<(M_tot + 255) / 256, 256, 0, stream>>>(d_m, d_l, M_tot);
+
+                const __half h_one  = __float2half_rn(1.0f);
+                const __half h_zero = __float2half_rn(0.0f);
+                cublasSetStream(cublas, stream);
+                const int64_t n_o  = static_cast<int64_t>(M_tot) * 256;
+                const int64_t n_o4 = (n_o + 3) >> 2;
+
+                for (int k0 = 0; k0 < kv_len_max; k0 += K_TILE) {
+                    const int kc = (k0 + K_TILE < kv_len_max) ? K_TILE : (kv_len_max - k0);
+                    if (kv_is_q8_0) {
+                        gqa_d256_dequant_kv_tile_kernel<true, __half><<<dim3(n_kv, kc), dim3(32, 8), 0, stream>>>(
+                            d_k_cache, d_v_cache, d_k16, d_v16, k0, kc, n_kv);
+                    } else {
+                        gqa_d256_dequant_kv_tile_kernel<false, __half><<<dim3(n_kv, kc), 256, 0, stream>>>(
+                            d_k_cache, d_v_cache, d_k16, d_v16, k0, kc, n_kv);
+                    }
+                    cublasHgemmStridedBatched(
+                        cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                        kc, M_per_kv, 256,
+                        &h_one,
+                        d_k16, 256, static_cast<long long>(kc) * 256,
+                        d_q16, 256, static_cast<long long>(M_per_kv) * 256,
+                        &h_zero,
+                        d_s16, kc,  static_cast<long long>(M_per_kv) * kc,
+                        n_kv);
+
+                    gqa_d256_flash_softmax_rescale_kernel<__half, __half><<<M_tot, 256, 0, stream>>>(
+                        d_s16, d_p16, d_pos, d_m, d_l, d_ob, T, n_head, n_kv, k0, kc);
+
+                    cublasHgemmStridedBatched(
+                        cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                        256, M_per_kv, kc,
+                        &h_one,
+                        d_v16,  256, static_cast<long long>(kc) * 256,
+                        d_p16,  kc,  static_cast<long long>(M_per_kv) * kc,
+                        &h_zero,
+                        d_ot16, 256, static_cast<long long>(M_per_kv) * 256,
+                        n_kv);
+
+                    gqa_d256_add_f16_to_f32_kernel<<<(n_o4 + 255) / 256, 256, 0, stream>>>(d_ot16, d_ob, n_o);
                 }
                 gqa_d256_flash_finalize_kernel<<<M_tot, 256, 0, stream>>>(d_ob, d_l, d_out, T, n_head, n_kv);
                 return;
@@ -1599,7 +1788,7 @@ void launch_gqa_attn_d256(
                         d_s32, kc,  static_cast<long long>(M_per_kv) * kc,
                         n_kv);
 
-                    gqa_d256_flash_softmax_rescale_kernel<float><<<M_tot, 256, 0, stream>>>(
+                    gqa_d256_flash_softmax_rescale_kernel<float, float><<<M_tot, 256, 0, stream>>>(
                         d_s32, d_p32, d_pos, d_m, d_l, d_ob, T, n_head, n_kv, k0, kc);
 
                     cublasSgemmStridedBatched(
@@ -1671,6 +1860,7 @@ void launch_qwen_moe_ffn_gated_shared(
                            up_exps.dtype   == DType::Q6_K && up_exps.is_soa);
     const bool dn_is_q8 = (down_exps.dtype == DType::Q8_0 && down_exps.is_soa);
 
+    bool routed_used_sm60_iq = false;
     if ((gu_is_q8 || gu_is_q6) && dn_is_q8) {
         const int K_blocks = K >> 5;
         const int ff_blks  = ff >> 5;
@@ -1780,13 +1970,25 @@ void launch_qwen_moe_ffn_gated_shared(
         }
     } else {
         DeviceTensor empty_sh{};
-        launch_moe_ffn_kquant_with_shared(
-            cublas, gate_exps, up_exps, down_exps, empty_sh, empty_sh, empty_sh,
-            d_x, d_top_ids, d_top_w, d_out, d_scratch, scratch_bytes, T, k_used, 0.0f, 0.0f, stream);
+        if (try_launch_moe_iq_pascal(
+                gate_exps, up_exps, down_exps, empty_sh,
+                d_x, d_top_ids, d_top_w, d_out, d_scratch, scratch_bytes,
+                T, k_used, 0.0f, stream)) {
+            routed_used_sm60_iq = (T < 16 && device_sm_version(gate_exps.device) == 60);
+        } else {
+            launch_moe_ffn_kquant_with_shared(
+                cublas, gate_exps, up_exps, down_exps, empty_sh, empty_sh, empty_sh,
+                d_x, d_top_ids, d_top_w, d_out, d_scratch, scratch_bytes, T, k_used, 0.0f, 0.0f, stream);
+        }
     }
 
     // 2. Gated Shared Expert: d_out += sigmoid(d_shexp_gate_logit[t]) * down_shexp(SiLU(gate_shexp(x)) * up_shexp(x))
     if (gate_shexp.valid() && up_shexp.valid() && down_shexp.valid()) {
+        if (T < 16 && try_launch_qwen_shexp_q8_0_sm60_decode(
+                gate_shexp, up_shexp, down_shexp, d_x, d_shexp_gate_logit,
+                d_out, d_scratch, scratch_bytes, T, stream, routed_used_sm60_iq)) {
+            return;
+        }
         size_t off = 0;
         auto * sh_g   = reinterpret_cast<float *>(base + off); off += align256(static_cast<size_t>(T) * ff_sh * sizeof(float));
         auto * sh_u   = reinterpret_cast<float *>(base + off); off += align256(static_cast<size_t>(T) * ff_sh * sizeof(float));
@@ -1794,8 +1996,22 @@ void launch_qwen_moe_ffn_gated_shared(
         void * sh_scr = base + off;
         const size_t sh_rem = (off < scratch_bytes) ? (scratch_bytes - off) : 0;
 
-        launch_linear(cublas, gate_shexp, d_x, sh_g, T, sh_scr, sh_rem, stream);
-        launch_linear(cublas, up_shexp,   d_x, sh_u, T, sh_scr, sh_rem, stream);
+        if (T < 16 && gate_shexp.dtype == DType::Q8_0 && gate_shexp.is_soa &&
+            up_shexp.dtype == DType::Q8_0 && up_shexp.is_soa && sh_rem >= align256(static_cast<size_t>(T) * (K * 2 + (K >> 5) * 4 + 256))) {
+            const int sm = device_sm_version(gate_shexp.device);
+            if (sm == 60) {
+                launch_q8_0_prep_x_sm60_h2(d_x, sh_scr, K, T, stream);
+                launch_linear_q8_0_sm60_h2_prepped(gate_shexp, sh_scr, sh_g, T, stream);
+                launch_linear_q8_0_sm60_h2_prepped(up_shexp,   sh_scr, sh_u, T, stream);
+            } else {
+                launch_quantize_q8_1(d_x, sh_scr, K, T, stream);
+                launch_linear_q8_0_prequant(gate_shexp, sh_scr, sh_g, T, stream);
+                launch_linear_q8_0_prequant(up_shexp,   sh_scr, sh_u, T, stream);
+            }
+        } else {
+            launch_linear(cublas, gate_shexp, d_x, sh_g, T, sh_scr, sh_rem, stream);
+            launch_linear(cublas, up_shexp,   d_x, sh_u, T, sh_scr, sh_rem, stream);
+        }
         launch_silu_mul(sh_g, sh_u, sh_g, static_cast<int64_t>(T) * ff_sh, stream);
         launch_linear(cublas, down_shexp, sh_g, sh_out, T, sh_scr, sh_rem, stream);
 

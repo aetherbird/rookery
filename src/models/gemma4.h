@@ -18,13 +18,14 @@ struct Gemma4Config {
     int   n_embd                = 1536;
     int   n_vocab               = 262144;
     int   n_head                = 8;
-    int   n_head_kv             = 1;
+    int   max_head_kv           = 1;
     int   head_dim_full         = 512;
     int   head_dim_swa          = 256;
     int   rope_dim_full         = 512;
     int   rope_dim_swa          = 256;
     float rope_freq_base_full   = 1000000.0f;
     float rope_freq_base_swa    = 10000.0f;
+    float rope_scale_full       = 1.0f;
     float rms_eps               = 1e-6f;
     int   sliding_window        = 512;
     int   shared_kv_layers      = 20;
@@ -32,12 +33,14 @@ struct Gemma4Config {
     int   n_embd_per_layer      = 256;
     float final_logit_softcap   = 30.0f;
     int   max_ctx               = 8192;
-    bool  kv_q8_0               = true;
+    KvCacheType kv_type         = KvCacheType::Q8_0;
     bool  tied_embeddings       = true;
 
+    std::vector<int>  n_head_kv;  // [n_layers] (can vary per layer, e.g. 8 SWA / 1 Full on 12B)
     std::vector<int>  n_ff;       // [n_layers]
     std::vector<bool> is_swa;     // [n_layers]
     std::vector<int>  kv_source;  // [n_layers]: own layer index if < n_layer_kv_from_start, else shared source layer
+    std::vector<int>  kv_cap;     // [n_layers]: ring capacity (swa+max_batch for SWA, max_ctx for Full)
 };
 
 struct Gemma4LayerWeights {
@@ -45,6 +48,8 @@ struct Gemma4LayerWeights {
     bool is_swa    = true;
     bool has_kv    = true;
     int  kv_source = 0;
+    int  kv_cap    = 0;
+    int  n_head_kv = 1;
     int  n_ff      = 6144;
 
     // Attention
@@ -79,7 +84,16 @@ public:
               const std::vector<int> & gpu_ids,
               const std::vector<float> & split_weights,
               int max_ctx = 8192,
-              bool kv_q8_0 = true);
+              KvCacheType kv_type = KvCacheType::Q8_0,
+              float rope_scale_full = 1.0f);
+
+    void load(const std::string & gguf_path,
+              const std::vector<int> & gpu_ids,
+              const std::vector<float> & split_weights,
+              int max_ctx,
+              bool kv_q8_0) {
+        load(gguf_path, gpu_ids, split_weights, max_ctx, kv_q8_0 ? KvCacheType::Q8_0 : KvCacheType::F16, 1.0f);
+    }
 
     void reset_state();
 

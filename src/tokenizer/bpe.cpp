@@ -103,8 +103,11 @@ void BpeTokenizer::load(const GgufFile & gguf) {
     const std::string pre       = gguf.get_str("tokenizer.ggml.pre", "");
     use_spm_bpe_    = (tok_model == "gemma4" || pre == "gemma4" || tok_model == "spm" || tok_model == "llama");
     max_digits_     = (pre == "qwen35" || pre == "qwen2" || pre == "bailingmoe" || pre == "bailingmoe2") ? 1 : 3;
+    use_gpt4o_pre_  = (pre == "inkling2" || pre == "gpt-4o" || pre == "o200k_base" || pre == "minimax-m2");
     use_llama3_pre_ = (pre == "qwen35" || pre == "qwen2" || pre == "glm4" || pre == "glm5" ||
                        pre == "llama3" || pre == "llama-bpe" || pre == "bailingmoe" || pre == "bailingmoe2");
+    use_raon_pre_   = (pre == "raon");
+    ignore_merges_  = (pre == "inkling2" || pre == "gpt-4o" || pre == "o200k_base");
 
     const auto & tok_val = gguf.kv("tokenizer.ggml.tokens");
     const auto * tok_vec = std::get_if<std::vector<std::string>>(&tok_val.data);
@@ -332,6 +335,131 @@ std::vector<std::string> BpeTokenizer::pretokenize_maxwell(const std::string & t
     return pieces;
 }
 
+// Exact GPT-4o / o200k_base / Inkling-2 pre-tokenizer regex (matches llama.cpp LLAMA_VOCAB_PRE_TYPE_GPT4O):
+// [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?
+// |[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?
+// |\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+
+std::vector<std::string> BpeTokenizer::pretokenize_gpt4o(const std::string & text) {
+    struct CpSpan { uint32_t cp; size_t off; size_t len; };
+    std::vector<CpSpan> cps;
+    cps.reserve(text.size());
+    for (size_t pos = 0; pos < text.size();) {
+        uint32_t cp = 0; size_t len = 0;
+        decode_utf8_at(text, pos, cp, len);
+        cps.push_back({cp, pos, len});
+        pos += len;
+    }
+
+    auto is_mark = [](uint32_t cp) {
+        return (cp >= 0x0300 && cp <= 0x036F) ||
+               (cp >= 0x1AB0 && cp <= 0x1AFF) ||
+               (cp >= 0x1DC0 && cp <= 0x1DFF) ||
+               (cp >= 0x20D0 && cp <= 0x20FF) ||
+               (cp >= 0xFE20 && cp <= 0xFE2F);
+    };
+    auto is_lm = [&](uint32_t cp) { return is_letter(cp) || is_mark(cp); };
+    auto is_non_lower = [&](uint32_t cp) { return is_lm(cp) && !is_ascii_lower(cp); };
+    auto is_non_upper = [&](uint32_t cp) { return is_lm(cp) && !is_ascii_upper(cp); };
+    auto slice = [&](size_t a, size_t b) {
+        size_t s = cps[a].off;
+        size_t e = cps[b - 1].off + cps[b - 1].len;
+        return text.substr(s, e - s);
+    };
+
+    std::vector<std::string> pieces;
+    size_t i = 0, n = cps.size();
+    while (i < n) {
+        const uint32_t c = cps[i].cp;
+
+        // 1 & 2. Optional non-\r\n\p{L}\p{N} prefix + word + optional English contraction
+        const bool start_at_i  = is_lm(c);
+        const bool start_at_i1 = (!start_at_i && c != '\r' && c != '\n' && !is_digit(c) &&
+                                  i + 1 < n && is_lm(cps[i + 1].cp));
+        if (start_at_i || start_at_i1) {
+            const size_t start_l = start_at_i ? i : (i + 1);
+            size_t u_end = start_l;
+            while (u_end < n && is_non_lower(cps[u_end].cp)) ++u_end;
+
+            size_t j = start_l;
+            if (u_end < n && is_non_upper(cps[u_end].cp)) {
+                // Branch 1: non_lower* followed by non_upper+
+                j = u_end + 1;
+                while (j < n && is_non_upper(cps[j].cp)) ++j;
+            } else {
+                // Check if Branch 1 matches via backtracking within [start_l, u_end)
+                size_t k = u_end;
+                while (k > start_l && !is_non_upper(cps[k - 1].cp)) --k;
+                if (k > start_l) {
+                    j = k;
+                } else {
+                    // Branch 2: pure uppercase ASCII run non_lower+ non_upper*
+                    j = u_end;
+                }
+            }
+
+            // Optional contraction: (?i:'s|'t|'re|'ve|'m|'ll|'d)
+            if (j + 1 < n && cps[j].cp == '\'') {
+                char c1 = static_cast<char>(std::tolower(static_cast<unsigned char>(cps[j + 1].cp)));
+                if (c1 == 's' || c1 == 't' || c1 == 'm' || c1 == 'd') {
+                    j += 2;
+                } else if (j + 2 < n) {
+                    char c2 = static_cast<char>(std::tolower(static_cast<unsigned char>(cps[j + 2].cp)));
+                    if ((c1 == 'r' && c2 == 'e') || (c1 == 'v' && c2 == 'e') || (c1 == 'l' && c2 == 'l')) {
+                        j += 3;
+                    }
+                }
+            }
+            pieces.push_back(slice(i, j));
+            i = j;
+            continue;
+        }
+
+        // 3. Digits: \p{N}{1,3}
+        if (is_digit(c)) {
+            size_t j = i + 1;
+            while (j < n && (j - i) < 3 && is_digit(cps[j].cp)) ++j;
+            pieces.push_back(slice(i, j));
+            i = j;
+            continue;
+        }
+
+        // 4. Punctuation + trailing \r\n/:  ?[^\s\p{L}\p{N}]+[\r\n/]*
+        const bool sp_punct = (c == ' ' && i + 1 < n && !is_space(cps[i + 1].cp) &&
+                               !is_letter(cps[i + 1].cp) && !is_digit(cps[i + 1].cp));
+        if (sp_punct || (!is_space(c) && !is_letter(c) && !is_digit(c))) {
+            size_t j = sp_punct ? (i + 2) : (i + 1);
+            while (j < n && !is_space(cps[j].cp) && !is_letter(cps[j].cp) && !is_digit(cps[j].cp)) ++j;
+            while (j < n && (cps[j].cp == '\r' || cps[j].cp == '\n' || cps[j].cp == '/')) ++j;
+            pieces.push_back(slice(i, j));
+            i = j;
+            continue;
+        }
+
+        // 5/6/7. Whitespace: \s*[\r\n]+ | \s+(?!\S) | \s+
+        if (is_space(c)) {
+            size_t j = i;
+            size_t last_nl = std::string::npos;
+            while (j < n && is_space(cps[j].cp)) {
+                if (cps[j].cp == '\r' || cps[j].cp == '\n') last_nl = j;
+                ++j;
+            }
+            if (last_nl != std::string::npos) {
+                pieces.push_back(slice(i, last_nl + 1));
+                i = last_nl + 1;
+                continue;
+            }
+            if (j - i > 1 && j < n) --j;
+            pieces.push_back(slice(i, j));
+            i = j;
+            continue;
+        }
+
+        pieces.push_back(slice(i, i + 1));
+        ++i;
+    }
+    return pieces;
+}
+
 // Exact Llama3 / Qwen2 / Qwen3.5 / GLM4 / GLM5 pre-tokenizer regex:
 // (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,max_digits}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
 std::vector<std::string> BpeTokenizer::pretokenize_llama3(const std::string & text) const {
@@ -434,6 +562,17 @@ std::vector<std::string> BpeTokenizer::pretokenize_llama3(const std::string & te
 void BpeTokenizer::bpe_encode_piece(const std::string & piece, std::vector<int32_t> & out) const {
     if (piece.empty()) return;
 
+    if (ignore_merges_) {
+        std::string full;
+        full.reserve(piece.size() * 2);
+        for (unsigned char b : piece) full += byte_to_unicode_[b];
+        auto it = token_to_id_.find(full);
+        if (it != token_to_id_.end()) {
+            out.push_back(it->second);
+            return;
+        }
+    }
+
     std::vector<std::string> syms;
     syms.reserve(piece.size());
     for (unsigned char b : piece) {
@@ -535,6 +674,132 @@ void BpeTokenizer::bpe_encode_spm_segment(const std::string & seg, std::vector<i
     }
 }
 
+std::vector<std::string> BpeTokenizer::pretokenize_raon(const std::string & text) const {
+    struct CpSpan { uint32_t cp; size_t off; size_t len; };
+    std::vector<CpSpan> cps;
+    cps.reserve(text.size());
+    for (size_t pos = 0; pos < text.size();) {
+        uint32_t cp = 0; size_t len = 0;
+        decode_utf8_at(text, pos, cp, len);
+        cps.push_back({cp, pos, len});
+        pos += len;
+    }
+
+    auto is_cjk_kana = [](uint32_t cp) {
+        return (cp >= 0x4E00 && cp <= 0x9FA5) ||
+               (cp >= 0x3040 && cp <= 0x309F) ||
+               (cp >= 0x30A0 && cp <= 0x30FF);
+    };
+    auto is_mark = [](uint32_t cp) {
+        return (cp >= 0x0300 && cp <= 0x036F) ||
+               (cp >= 0x1AB0 && cp <= 0x1AFF) ||
+               (cp >= 0x1DC0 && cp <= 0x1DFF) ||
+               (cp >= 0x20D0 && cp <= 0x20FF) ||
+               (cp >= 0xFE20 && cp <= 0xFE2F);
+    };
+    auto is_raon_letter = [&](uint32_t cp) {
+        return is_letter(cp) || (cp >= 0x1100 && cp <= 0x11FF) || (cp >= 0x3130 && cp <= 0x318F);
+    };
+    auto is_non_cjk_letter = [&](uint32_t cp) {
+        return is_raon_letter(cp) && !is_cjk_kana(cp);
+    };
+    auto is_punct = [&](uint32_t cp) {
+        return !is_space(cp) && !is_raon_letter(cp) && !is_digit(cp);
+    };
+    auto slice = [&](size_t a, size_t b) {
+        size_t s = cps[a].off;
+        size_t e = cps[b - 1].off + cps[b - 1].len;
+        return text.substr(s, e - s);
+    };
+
+    std::vector<std::string> pieces;
+    size_t i = 0, n = cps.size();
+    while (i < n) {
+        const uint32_t c = cps[i].cp;
+
+        // 1.  ?[\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff]+
+        if (is_cjk_kana(c) || (c == ' ' && i + 1 < n && is_cjk_kana(cps[i + 1].cp))) {
+            size_t j = (c == ' ') ? (i + 1) : i;
+            while (j < n && is_cjk_kana(cps[j].cp)) ++j;
+            pieces.push_back(slice(i, j));
+            i = j;
+            continue;
+        }
+
+        // 2.  ?(?:non-cjk-letter + marks)+(?: (?:non-cjk-letter + marks)+)*
+        if (is_non_cjk_letter(c) || (c == ' ' && i + 1 < n && is_non_cjk_letter(cps[i + 1].cp))) {
+            size_t j = (c == ' ') ? (i + 1) : i;
+            while (j < n) {
+                if (is_non_cjk_letter(cps[j].cp)) {
+                    ++j;
+                    while (j < n && is_mark(cps[j].cp)) ++j;
+                } else if (cps[j].cp == ' ' && j + 1 < n && is_non_cjk_letter(cps[j + 1].cp)) {
+                    ++j; // consume single separating space and continue multi-word run
+                } else {
+                    break;
+                }
+            }
+            pieces.push_back(slice(i, j));
+            i = j;
+            continue;
+        }
+
+        // 3. \p{N}{1,3}(?=(?:\p{N}{3})*(?!\p{N})) — right-aligned 1..3 digit chunks
+        if (is_digit(c)) {
+            size_t end = i;
+            while (end < n && is_digit(cps[end].cp)) ++end;
+            size_t rem = end - i;
+            size_t first = rem % 3;
+            if (first == 0) first = 3;
+            pieces.push_back(slice(i, i + first));
+            i += first;
+            while (i < end) {
+                pieces.push_back(slice(i, i + 3));
+                i += 3;
+            }
+            continue;
+        }
+
+        // 4.  ?[^\s\p{L}\p{N}]+[\r\n/]*
+        if (is_punct(c) || (c == ' ' && i + 1 < n && is_punct(cps[i + 1].cp))) {
+            size_t j = (c == ' ') ? (i + 1) : i;
+            while (j < n && is_punct(cps[j].cp)) ++j;
+            while (j < n && (cps[j].cp == '\r' || cps[j].cp == '\n' || cps[j].cp == '/')) ++j;
+            pieces.push_back(slice(i, j));
+            i = j;
+            continue;
+        }
+
+        // 5. \s*[\r\n]+
+        if (is_space(c)) {
+            size_t j = i;
+            size_t last_nl = std::string::npos;
+            while (j < n && is_space(cps[j].cp)) {
+                if (cps[j].cp == '\r' || cps[j].cp == '\n') last_nl = j;
+                ++j;
+            }
+            if (last_nl != std::string::npos) {
+                pieces.push_back(slice(i, last_nl + 1));
+                i = last_nl + 1;
+                continue;
+            }
+            // 6. \s+(?!\S) | \s+
+            if (j < n && j - i > 1) {
+                pieces.push_back(slice(i, j - 1));
+                i = j - 1;
+            } else {
+                pieces.push_back(slice(i, j));
+                i = j;
+            }
+            continue;
+        }
+
+        pieces.push_back(slice(i, i + 1));
+        ++i;
+    }
+    return pieces;
+}
+
 std::vector<int32_t> BpeTokenizer::encode(const std::string & text, bool add_bos, bool parse_special) const {
     std::vector<int32_t> out;
     if (add_bos && add_bos_default_) {
@@ -545,7 +810,11 @@ std::vector<int32_t> BpeTokenizer::encode(const std::string & text, bool add_bos
         if (use_spm_bpe_) {
             bpe_encode_spm_segment(seg, out);
         } else {
-            const auto pcs = use_llama3_pre_ ? pretokenize_llama3(seg) : pretokenize_maxwell(seg);
+            const auto pcs = use_raon_pre_
+                ? pretokenize_raon(seg)
+                : (use_gpt4o_pre_
+                    ? pretokenize_gpt4o(seg)
+                    : (use_llama3_pre_ ? pretokenize_llama3(seg) : pretokenize_maxwell(seg)));
             for (const auto & p : pcs) bpe_encode_piece(p, out);
         }
     };

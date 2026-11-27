@@ -68,6 +68,7 @@ struct EngramAdapterManifest {
     int         host_n_layers        = 0;
     int         host_d_embd          = 0;
     int         host_hc_mult         = 0;
+    float       default_gate_bias    = 0.0f;
     std::string calibration;
 };
 
@@ -210,6 +211,8 @@ public:
     }
     void set_global_scale(float s) { default_params_.scale = s; }
     float global_scale() const { return default_params_.scale; }
+    void set_gate_bias(float b) { default_params_.gate_bias = b; }
+    float gate_bias() const { return default_params_.gate_bias; }
     void set_default_params(const EngramRuntimeParams & p) { default_params_ = p; }
     const EngramRuntimeParams & default_params() const { return default_params_; }
     const EngramTable & table() const { return table_; }
@@ -325,6 +328,36 @@ private:
     std::vector<std::vector<uint16_t>> ce_cur_e_f16_; // [n_eng_layers][T * d_engram]
     std::vector<float>   ce_h_tmp_;
     EngramSeqState       ce_seq_state_;
+};
+
+// Lightweight composite LayerHook for true multi-table Engram / PLE fusion
+// (e.g. Hash-Engram @ L20 + Unigram-PLE @ L22). Zero overhead when unused.
+class CompositeLayerHook : public LayerHook {
+public:
+    void clear() { hooks_.clear(); }
+    void add(LayerHook * hook) {
+        if (hook) hooks_.push_back(hook);
+    }
+    bool empty() const { return hooks_.empty(); }
+    size_t size() const { return hooks_.size(); }
+
+    bool hooks_layer(int layer_idx) const override {
+        for (const auto * h : hooks_) {
+            if (h->hooks_layer(layer_idx)) return true;
+        }
+        return false;
+    }
+
+    void on_post_layer(int layer_idx, int device, float * d_inpL, int n_tokens, int n_embd, int hc, cudaStream_t stream) override {
+        for (auto * h : hooks_) {
+            if (h->hooks_layer(layer_idx)) {
+                h->on_post_layer(layer_idx, device, d_inpL, n_tokens, n_embd, hc, stream);
+            }
+        }
+    }
+
+private:
+    std::vector<LayerHook *> hooks_;
 };
 
 } // namespace rookery

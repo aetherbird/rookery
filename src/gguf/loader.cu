@@ -71,8 +71,8 @@ struct PackedBlockIQ4_NL {
 };
 static_assert(sizeof(PackedBlockIQ4_NL) == 18, "PackedBlockIQ4_NL size");
 
-// Fast GPU unpack: packed 18-byte BlockIQ4_NL[n_blocks] -> 256B-aligned SoA (qs[n_blocks*16], d[n_blocks]).
-// Enables 100% coalesced 128-bit LDG.128 loads in IQ4_NL MoE kernels with ZERO extra VRAM!
+// Fast GPU unpack: packed 18-byte BlockIQ4_NL/BlockQ4_0[n_blocks] -> 256B-aligned SoA (qs[n_blocks*16], d[n_blocks]).
+// Enables 100% coalesced 128-bit LDG.128 loads in IQ4_NL and Q4_0 kernels with ZERO extra VRAM!
 __global__ void unpack_iq4_nl_to_soa_kernel(
     const PackedBlockIQ4_NL * __restrict__ src,
     uint8_t *                 __restrict__ dst_qs,
@@ -278,7 +278,7 @@ DeviceTensor WeightPool::upload_raw(const GgufTensorInfo & info_ref,
         return dt;
     }
 
-    if (info->dtype == DType::IQ4_NL) {
+    if (info->dtype == DType::IQ4_NL || info->dtype == DType::Q4_0) {
         const int64_t n_blocks  = static_cast<int64_t>(info->nbytes / sizeof(PackedBlockIQ4_NL));
         const size_t  qs_bytes  = align256(static_cast<size_t>(n_blocks) * 16);
         const size_t  sc_bytes  = align256(static_cast<size_t>(n_blocks) * sizeof(uint16_t));
@@ -286,9 +286,9 @@ DeviceTensor WeightPool::upload_raw(const GgufTensorInfo & info_ref,
 
         void * st_ptr = ensure_staging(info->nbytes);
         void * dptr = nullptr;
-        cuda_ok(cudaMalloc(&dptr, tot_bytes), ("cudaMalloc SoA IQ4_NL for " + name).c_str());
+        cuda_ok(cudaMalloc(&dptr, tot_bytes), ("cudaMalloc SoA 4-bit for " + name).c_str());
         cuda_ok(cudaMemcpy(st_ptr, src, info->nbytes, cudaMemcpyHostToDevice),
-                ("cudaMemcpy staging IQ4_NL for " + name).c_str());
+                ("cudaMemcpy staging 4-bit for " + name).c_str());
 
         auto * d_qs = static_cast<uint8_t *>(dptr);
         auto * d_sc = reinterpret_cast<uint16_t *>(static_cast<uint8_t *>(dptr) + qs_bytes);
@@ -297,7 +297,7 @@ DeviceTensor WeightPool::upload_raw(const GgufTensorInfo & info_ref,
         const int64_t grid = (n_blocks + (wpb * 2) - 1) / (wpb * 2);
         unpack_iq4_nl_to_soa_kernel<<<static_cast<unsigned int>(grid), dim3(32, wpb)>>>(
             static_cast<const PackedBlockIQ4_NL *>(st_ptr), d_qs, d_sc, n_blocks);
-        cuda_ok(cudaGetLastError(), ("unpack_iq4_nl_to_soa launch for " + name).c_str());
+        cuda_ok(cudaGetLastError(), ("unpack_4bit_to_soa launch for " + name).c_str());
 
         {
             std::lock_guard<std::mutex> lk(mu_);
@@ -308,7 +308,7 @@ DeviceTensor WeightPool::upload_raw(const GgufTensorInfo & info_ref,
         DeviceTensor dt;
         dt.ptr        = d_qs;
         dt.scales_ptr = d_sc;
-        dt.dtype      = DType::IQ4_NL;
+        dt.dtype      = info->dtype;
         dt.device     = dev;
         for (int i = 0; i < 4; ++i) dt.ne[i] = info->ne[i];
         dt.nbytes     = tot_bytes;
@@ -486,6 +486,18 @@ void dequant_to_f16_host(DType dtype, const void * src, size_t n_elems, uint16_t
         for (size_t b = 0; b < nb; ++b) {
             const float d = f16_bits_to_f32(blk[b].d);
             for (int i = 0; i < 32; ++i) dst[b * 32 + i] = f32_to_f16_bits(d * blk[b].qs[i]);
+        }
+        return;
+    }
+    if (dtype == DType::Q4_0) {
+        const size_t nb = n_elems / 32;
+        const auto * blk = reinterpret_cast<const BlockQ4_0 *>(p);
+        for (size_t b = 0; b < nb; ++b) {
+            const float d = f16_bits_to_f32(blk[b].d);
+            for (int j = 0; j < 16; ++j) {
+                dst[b * 32 + j]      = f32_to_f16_bits(d * static_cast<float>(static_cast<int>(blk[b].qs[j] & 0x0Fu) - 8));
+                dst[b * 32 + j + 16] = f32_to_f16_bits(d * static_cast<float>(static_cast<int>(blk[b].qs[j] >> 4)    - 8));
+            }
         }
         return;
     }

@@ -50,6 +50,9 @@ set(ROOKERY_CORE_SOURCES
     src/engram/engram_sidecar.cpp
     src/cpu/cpu_kernels.cpp
     src/cpu/bailingmoe3_cpu.cpp
+    src/cpu/gemma4_cpu.cpp
+    src/cpu/qwen2_cpu.cpp
+    src/cpu/qwen35_cpu.cpp
 )
 
 if(ROOKERY_HAS_CUDA)
@@ -70,8 +73,11 @@ if(ROOKERY_HAS_CUDA)
         src/kernels/mla_attn.cu
         src/kernels/inkling2.cu
         src/kernels/qwen_next.cu
+        src/kernels/qwen35_pascal.cu
         src/kernels/qwen4exp.cu
         src/kernels/gemma4.cu
+        src/kernels/raon1_mini.cu
+        src/kernels/sensenova_loop.cu
         src/models/maxwell_moe.cu
         src/models/glm5_next.cu
         src/models/inkling2_loop.cu
@@ -79,6 +85,8 @@ if(ROOKERY_HAS_CUDA)
         src/models/qwen4exp.cu
         src/models/bailingmoe3.cu
         src/models/gemma4.cu
+        src/models/raon1_mini.cu
+        src/models/sensenova_loop.cu
     )
 else()
     list(APPEND ROOKERY_CORE_SOURCES
@@ -117,6 +125,12 @@ target_link_libraries(rookery_inspect PRIVATE rookery_core)
 add_executable(rookery_bailingmoe3_test tests/test_bailingmoe3_forward.cpp)
 target_link_libraries(rookery_bailingmoe3_test PRIVATE rookery_core)
 
+add_executable(rookery_gemma4_test tests/test_gemma4_forward.cpp)
+target_link_libraries(rookery_gemma4_test PRIVATE rookery_core)
+
+add_executable(rookery_qwen2_test tests/test_qwen2_forward.cpp)
+target_link_libraries(rookery_qwen2_test PRIVATE rookery_core)
+
 add_executable(rookery_unit_test tests/test_server_units.cpp)
 target_link_libraries(rookery_unit_test PRIVATE rookery_core)
 
@@ -136,8 +150,11 @@ if(ROOKERY_HAS_CUDA)
     add_executable(rookery_qwen4exp_test tests/test_qwen4exp_forward.cpp)
     target_link_libraries(rookery_qwen4exp_test PRIVATE rookery_core)
 
-    add_executable(rookery_gemma4_test tests/test_gemma4_forward.cpp)
-    target_link_libraries(rookery_gemma4_test PRIVATE rookery_core)
+    add_executable(rookery_raon1_test tests/test_raon1_forward.cpp)
+    target_link_libraries(rookery_raon1_test PRIVATE rookery_core)
+
+    add_executable(rookery_sensenova_test tests/test_sensenova_forward.cpp)
+    target_link_libraries(rookery_sensenova_test PRIVATE rookery_core)
 
     add_executable(rookery_engram_test tests/test_engram_sidecar.cpp)
     target_link_libraries(rookery_engram_test PRIVATE rookery_core)

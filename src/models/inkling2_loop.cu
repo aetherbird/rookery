@@ -801,6 +801,36 @@ void Inkling2LoopModel::run_layer(DevRuntime & rt, int il, int ip, int T, int & 
                             T, cfg_.n_expert_used, cfg_.situ_beta, cfg_.situ_linear_beta, st);
     launch_inkling2_shortconv(rt.d_moe_raw, static_cast<const float *>(L.ffn_post_conv.ptr),
                               nullptr, conv_ffn_[il], rt.d_cur, T, H, 0, st, rt.d_cur);
+    static const char * s_blk_env = std::getenv("ROOKERY_DUMP_INK2_BLOCKS");
+    if (s_blk_env && s_blk_env[0] != '\0') {
+        static const char * s_blk_l_env = std::getenv("ROOKERY_DUMP_INK2_BLOCKS_LAYER");
+        const int blk_target_ip = (s_blk_l_env && s_blk_l_env[0] != '\0') ? std::atoi(s_blk_l_env) : (cfg_.n_phys - 2);
+        if (ip == blk_target_ip) {
+            static FILE * s_blk_fp = nullptr;
+            static std::string s_blk_name;
+            if (!s_blk_fp || s_blk_name != s_blk_env) {
+                if (s_blk_fp) std::fclose(s_blk_fp);
+                s_blk_fp = std::fopen(s_blk_env, "wb");
+                s_blk_name = s_blk_env;
+            }
+            if (s_blk_fp) {
+                cudaStreamSynchronize(st);
+                std::vector<float> tmp(static_cast<size_t>(T) * H);
+                std::vector<uint16_t> out_f16(static_cast<size_t>(T) * n_blocks * H);
+                for (int b = 0; b < n_blocks; ++b) {
+                    cudaMemcpy(tmp.data(), rt.d_blocks[b], tmp.size() * sizeof(float), cudaMemcpyDeviceToHost);
+                    for (int t = 0; t < T; ++t) {
+                        for (int d = 0; d < H; ++d) {
+                            __half h16 = __float2half_rn(tmp[static_cast<size_t>(t) * H + d]);
+                            out_f16[(static_cast<size_t>(t) * n_blocks + b) * H + d] = *reinterpret_cast<uint16_t *>(&h16);
+                        }
+                    }
+                }
+                std::fwrite(out_f16.data(), sizeof(uint16_t), out_f16.size(), s_blk_fp);
+                std::fflush(s_blk_fp);
+            }
+        }
+    }
     if (hook_ != nullptr && ip != cfg_.n_phys - 1 && hook_->hooks_layer(ip)) {
         hook_->on_post_layer(ip, rt.device, rt.d_cur, T, H, 1, st);
     }

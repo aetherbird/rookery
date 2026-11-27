@@ -35,7 +35,9 @@ struct Qwen35Config {
     int   ssm_d_inner          = 4096; // n_v_heads * head_v_dim
     int   full_attn_interval   = 4;
 
-    // MoE
+    // MoE / Dense FFN
+    bool  is_dense             = false;
+    int   n_ff                 = 0;
     int   n_expert             = 256;
     int   n_expert_used        = 8;
     int   n_ff_exp             = 512;
@@ -62,7 +64,10 @@ struct Qwen35LayerWeights {
     DeviceTensor wq, wk, wv, wo;
     DeviceTensor attn_q_norm, attn_k_norm;
 
-    // MoE + Gated Shared Expert
+    // Dense SwiGLU FFN (qwen35)
+    DeviceTensor ffn_gate, ffn_up, ffn_down;
+
+    // MoE + Gated Shared Expert (qwen35moe)
     DeviceTensor ffn_gate_inp;
     DeviceTensor ffn_gate_exps, ffn_up_exps, ffn_down_exps;
     DeviceTensor ffn_gate_inp_shexp;
@@ -75,6 +80,7 @@ struct Qwen35MtpWeights {
     DeviceTensor attn_norm, post_attn_norm;
     DeviceTensor wq, wk, wv, wo;
     DeviceTensor attn_q_norm, attn_k_norm;
+    DeviceTensor ffn_gate, ffn_up, ffn_down;
     DeviceTensor ffn_gate_inp;
     DeviceTensor ffn_gate_exps, ffn_up_exps, ffn_down_exps;
     DeviceTensor ffn_gate_inp_shexp;
@@ -114,7 +120,8 @@ public:
 
     void forward(const std::vector<int32_t> & tokens,
                  const std::vector<int32_t> & positions,
-                 std::vector<float> & out_logits);
+                 std::vector<float> & out_logits,
+                 bool compute_logits = true);
 
     int32_t forward_decode_greedy(int32_t token, int32_t pos);
     void    forward_decode_logits(int32_t token, int32_t pos, std::vector<float> & out_logits);
@@ -181,7 +188,11 @@ private:
         float *   d_v          = nullptr; // [T, n_kv * 256]
         float *   d_attn_out   = nullptr; // [T, n_head * 256]
 
-        // MoE scratch
+        // Dense FFN scratch (qwen35)
+        float *   d_ff_gate    = nullptr; // [T, n_ff]
+        float *   d_ff_up      = nullptr; // [T, n_ff]
+
+        // MoE scratch (qwen35moe)
         float *   d_router     = nullptr; // [T, n_expert]
         float *   d_shexp_gate = nullptr; // [T]
         int32_t * d_top_ids    = nullptr; // [T, k_used]
@@ -204,7 +215,8 @@ private:
         size_t    scratch_bytes = 0;
     };
 
-    void run_gpu_segment(size_t gi, int T, bool run_argmax, bool save_gdn_snap, int kv_len_max = 0);
+    void run_gpu_segment(size_t gi, int T, bool run_argmax, bool save_gdn_snap,
+                         int kv_len_max = 0, bool compute_logits = true);
     void run_mtp_layer(int T, bool run_argmax, int kv_len_max = 0);
     void embed_tokens_to_last_dev(const int32_t * h_tokens, int T);
     void capture_decode_graphs();

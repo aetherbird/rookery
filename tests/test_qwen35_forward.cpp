@@ -42,6 +42,8 @@ int main(int argc, char ** argv) {
     int  pp_test   = 0;
     bool use_graph = true;
     bool use_mtp   = true;
+    std::vector<int> bench_pp;
+    std::vector<int> bench_d;
 
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
@@ -51,6 +53,8 @@ int main(int argc, char ** argv) {
         else if (a == "--gen" && i + 1 < argc)    n_gen = std::atoi(argv[++i]);
         else if (a == "--ctx" && i + 1 < argc)    max_ctx = std::atoi(argv[++i]);
         else if (a == "--pp-test" && i + 1 < argc) pp_test = std::atoi(argv[++i]);
+        else if (a == "--bench-pp" && i + 1 < argc) bench_pp = parse_ints(argv[++i]);
+        else if (a == "--bench-d" && i + 1 < argc)  bench_d = parse_ints(argv[++i]);
         else if (a == "--no-graph")               use_graph = false;
         else if (a == "--no-mtp")                 use_mtp = false;
         else if (a == "--mtp")                    use_mtp = true;
@@ -72,6 +76,79 @@ int main(int argc, char ** argv) {
     rookery::Qwen35MoeModel model;
     model.set_use_cuda_graphs(use_graph);
     model.load(path, gpus, split, max_ctx, true, use_mtp);
+
+    if (!bench_pp.empty() || !bench_d.empty()) {
+        const std::string para =
+            "In modern GPU inference engines, batched prompt prefill groups routed MoE tokens by expert so each "
+            "quantized weight matrix is read from HBM once per batch instead of once per token. Combined with "
+            "Tensor Core FlashAttention and instant host-RAM state checkpoints for gated delta-net layers, "
+            "multi-turn conversations achieve sub-second time to first token. ";
+        auto para_ids = tok.encode(para, false, false);
+        int max_need = 64;
+        for (int p : bench_pp) max_need = std::max(max_need, p);
+        for (int d : bench_d)  max_need = std::max(max_need, d + 1);
+        std::vector<int32_t> long_p;
+        while (static_cast<int>(long_p.size()) < max_need) {
+            for (int32_t id : para_ids) {
+                long_p.push_back(id);
+                if (static_cast<int>(long_p.size()) >= max_need) break;
+            }
+        }
+        std::vector<int32_t> lpos(long_p.size());
+        std::iota(lpos.begin(), lpos.end(), 0);
+
+        // Warmup
+        {
+            std::vector<float> lg;
+            model.reset_state();
+            model.forward({long_p.begin(), long_p.begin() + 16}, {lpos.begin(), lpos.begin() + 16}, lg);
+        }
+        for (int pp : bench_pp) {
+            std::vector<float> lg;
+            model.reset_state();
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int off = 0; off < pp; off += 512) {
+                const int len = std::min(512, pp - off);
+                const bool last = (off + len >= pp);
+                model.forward({long_p.begin() + off, long_p.begin() + off + len},
+                              {lpos.begin() + off, lpos.begin() + off + len}, lg, last);
+            }
+            const auto t1 = std::chrono::steady_clock::now();
+            const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            std::printf("BENCH pp%d: %.2f ms (%.2f tok/s)\n", pp, ms, pp * 1000.0 / ms);
+        }
+        for (int d : bench_d) {
+            std::vector<float> lg;
+            model.reset_state();
+            int cur_pos = 0;
+            int32_t cur_tok = long_p[0];
+            if (d > 0) {
+                for (int off = 0; off < d; off += 512) {
+                    const int len = std::min(512, d - off);
+                    const bool last = (off + len >= d);
+                    model.forward({long_p.begin() + off, long_p.begin() + off + len},
+                                  {lpos.begin() + off, lpos.begin() + off + len}, lg, last);
+                }
+                cur_tok = static_cast<int32_t>(std::max_element(lg.begin(), lg.end()) - lg.begin());
+                cur_pos = d;
+            } else {
+                model.forward({long_p[0]}, {0}, lg, true);
+                cur_tok = static_cast<int32_t>(std::max_element(lg.begin(), lg.end()) - lg.begin());
+                cur_pos = 1;
+            }
+            // Warmup decode + graph capture
+            cur_tok = model.forward_decode_greedy(cur_tok, cur_pos++);
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int s = 0; s < n_gen; ++s) {
+                cur_tok = model.forward_decode_greedy(cur_tok, cur_pos++);
+            }
+            const auto t1 = std::chrono::steady_clock::now();
+            const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            std::printf("BENCH tg%d@d%d (graph=%s): %.2f ms (%.2f tok/s)\n",
+                        n_gen, d, use_graph ? "on" : "off", ms, n_gen * 1000.0 / ms);
+        }
+        return 0;
+    }
 
     if (pp_test > 0) {
         const std::string para =

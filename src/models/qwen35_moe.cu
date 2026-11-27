@@ -67,6 +67,7 @@ Qwen35MoeModel::~Qwen35MoeModel() {
         freep(rt.d_alpha); freep(rt.d_beta); freep(rt.d_gdn_out);
         freep(rt.d_q_full); freep(rt.d_q); freep(rt.d_gate);
         freep(rt.d_k); freep(rt.d_v); freep(rt.d_attn_out);
+        freep(rt.d_ff_gate); freep(rt.d_ff_up);
         freep(rt.d_router); freep(rt.d_shexp_gate); freep(rt.d_top_ids); freep(rt.d_top_w);
         freep(rt.d_tokens); freep(rt.d_pos); freep(rt.d_logits); freep(rt.d_argmax);
         freep(rt.d_h_nextn); freep(rt.d_mtp_e); freep(rt.d_mtp_eh);
@@ -89,12 +90,13 @@ void Qwen35MoeModel::load(const std::string & gguf_path,
     const auto t0 = std::chrono::steady_clock::now();
     auto sg = ShardedGguf::open(gguf_path);
     const std::string arch = sg.get_str("general.architecture");
-    if (arch != "qwen35moe") {
-        throw std::runtime_error("Expected qwen35moe GGUF, got: " + arch);
+    if (arch != "qwen35moe" && arch != "qwen35") {
+        throw std::runtime_error("Expected qwen35moe or qwen35 GGUF, got: " + arch);
     }
     const std::string pfx = arch + ".";
 
-    cfg_.n_blocks             = static_cast<int>(sg.get_u64(pfx + "block_count", 41));
+    cfg_.is_dense             = (arch == "qwen35");
+    cfg_.n_blocks             = static_cast<int>(sg.get_u64(pfx + "block_count", cfg_.is_dense ? 32 : 41));
     cfg_.n_nextn              = static_cast<int>(sg.get_u64(pfx + "nextn_predict_layers", 0));
     cfg_.n_layers             = cfg_.n_blocks - cfg_.n_nextn;
     cfg_.n_embd               = static_cast<int>(sg.get_u64(pfx + "embedding_length", 2048));
@@ -115,11 +117,21 @@ void Qwen35MoeModel::load(const std::string & gguf_path,
     cfg_.ssm_dt_rank          = static_cast<int>(sg.get_u64(pfx + "ssm.time_step_rank", 32));
     cfg_.ssm_d_inner          = static_cast<int>(sg.get_u64(pfx + "ssm.inner_size", 4096));
     cfg_.full_attn_interval   = static_cast<int>(sg.get_u64(pfx + "full_attention_interval", 4));
-    cfg_.n_expert             = static_cast<int>(sg.get_u64(pfx + "expert_count", 256));
-    cfg_.n_expert_used        = static_cast<int>(sg.get_u64(pfx + "expert_used_count", 8));
-    cfg_.n_ff_exp             = static_cast<int>(sg.get_u64(pfx + "expert_feed_forward_length", 512));
-    cfg_.n_ff_shexp           = static_cast<int>(sg.get_u64(pfx + "expert_shared_feed_forward_length", 512));
-    cfg_.expert_weights_scale = static_cast<float>(sg.get_f64(pfx + "expert_weights_scale", 1.0));
+    if (cfg_.is_dense) {
+        cfg_.n_ff                 = static_cast<int>(sg.get_u64(pfx + "feed_forward_length", 12288));
+        cfg_.n_expert             = 0;
+        cfg_.n_expert_used        = 0;
+        cfg_.n_ff_exp             = 0;
+        cfg_.n_ff_shexp           = 0;
+        cfg_.expert_weights_scale = 1.0f;
+    } else {
+        cfg_.n_ff                 = 0;
+        cfg_.n_expert             = static_cast<int>(sg.get_u64(pfx + "expert_count", 256));
+        cfg_.n_expert_used        = static_cast<int>(sg.get_u64(pfx + "expert_used_count", 8));
+        cfg_.n_ff_exp             = static_cast<int>(sg.get_u64(pfx + "expert_feed_forward_length", 512));
+        cfg_.n_ff_shexp           = static_cast<int>(sg.get_u64(pfx + "expert_shared_feed_forward_length", 512));
+        cfg_.expert_weights_scale = static_cast<float>(sg.get_f64(pfx + "expert_weights_scale", 1.0));
+    }
     cfg_.max_ctx              = max_ctx;
     cfg_.kv_q8_0              = kv_q8_0;
 
@@ -234,14 +246,20 @@ void Qwen35MoeModel::load(const std::string & gguf_path,
                         cuda_ok(cudaMalloc(&v_cache_[il], kv_bytes), "qwen35 malloc v_cache");
                     }
 
-                    L.ffn_gate_inp       = pool_.upload(sg, p + "ffn_gate_inp.weight",       dev, false);
-                    L.ffn_gate_exps      = pool_.upload(sg, p + "ffn_gate_exps.weight",      dev, false);
-                    L.ffn_up_exps        = pool_.upload(sg, p + "ffn_up_exps.weight",        dev, false);
-                    L.ffn_down_exps      = pool_.upload(sg, p + "ffn_down_exps.weight",      dev, false);
-                    L.ffn_gate_inp_shexp = pool_.upload(sg, p + "ffn_gate_inp_shexp.weight", dev, false);
-                    L.ffn_gate_shexp     = pool_.upload(sg, p + "ffn_gate_shexp.weight",     dev, false);
-                    L.ffn_up_shexp       = pool_.upload(sg, p + "ffn_up_shexp.weight",       dev, false);
-                    L.ffn_down_shexp     = pool_.upload(sg, p + "ffn_down_shexp.weight",     dev, false);
+                    if (cfg_.is_dense) {
+                        L.ffn_gate = pool_.upload(sg, p + "ffn_gate.weight", dev, false);
+                        L.ffn_up   = pool_.upload(sg, p + "ffn_up.weight",   dev, false);
+                        L.ffn_down = pool_.upload(sg, p + "ffn_down.weight", dev, false);
+                    } else {
+                        L.ffn_gate_inp       = pool_.upload(sg, p + "ffn_gate_inp.weight",       dev, false);
+                        L.ffn_gate_exps      = pool_.upload(sg, p + "ffn_gate_exps.weight",      dev, false);
+                        L.ffn_up_exps        = pool_.upload(sg, p + "ffn_up_exps.weight",        dev, false);
+                        L.ffn_down_exps      = pool_.upload(sg, p + "ffn_down_exps.weight",      dev, false);
+                        L.ffn_gate_inp_shexp = pool_.upload(sg, p + "ffn_gate_inp_shexp.weight", dev, false);
+                        L.ffn_gate_shexp     = pool_.upload(sg, p + "ffn_gate_shexp.weight",     dev, false);
+                        L.ffn_up_shexp       = pool_.upload(sg, p + "ffn_up_shexp.weight",       dev, false);
+                        L.ffn_down_shexp     = pool_.upload(sg, p + "ffn_down_shexp.weight",     dev, false);
+                    }
                 }
 
                 if (gi + 1 == runtimes_.size() && has_mtp_) {
@@ -261,14 +279,20 @@ void Qwen35MoeModel::load(const std::string & gguf_path,
                     mtp_.attn_q_norm      = pool_.upload(sg, mtp_pfx + "attn_q_norm.weight",         dev, false);
                     mtp_.attn_k_norm      = pool_.upload(sg, mtp_pfx + "attn_k_norm.weight",         dev, false);
 
-                    mtp_.ffn_gate_inp       = pool_.upload(sg, mtp_pfx + "ffn_gate_inp.weight",       dev, false);
-                    mtp_.ffn_gate_exps      = pool_.upload(sg, mtp_pfx + "ffn_gate_exps.weight",      dev, false);
-                    mtp_.ffn_up_exps        = pool_.upload(sg, mtp_pfx + "ffn_up_exps.weight",        dev, false);
-                    mtp_.ffn_down_exps      = pool_.upload(sg, mtp_pfx + "ffn_down_exps.weight",      dev, false);
-                    mtp_.ffn_gate_inp_shexp = pool_.upload(sg, mtp_pfx + "ffn_gate_inp_shexp.weight", dev, false);
-                    mtp_.ffn_gate_shexp     = pool_.upload(sg, mtp_pfx + "ffn_gate_shexp.weight",     dev, false);
-                    mtp_.ffn_up_shexp       = pool_.upload(sg, mtp_pfx + "ffn_up_shexp.weight",       dev, false);
-                    mtp_.ffn_down_shexp     = pool_.upload(sg, mtp_pfx + "ffn_down_shexp.weight",     dev, false);
+                    if (cfg_.is_dense) {
+                        mtp_.ffn_gate = pool_.upload(sg, mtp_pfx + "ffn_gate.weight", dev, false);
+                        mtp_.ffn_up   = pool_.upload(sg, mtp_pfx + "ffn_up.weight",   dev, false);
+                        mtp_.ffn_down = pool_.upload(sg, mtp_pfx + "ffn_down.weight", dev, false);
+                    } else {
+                        mtp_.ffn_gate_inp       = pool_.upload(sg, mtp_pfx + "ffn_gate_inp.weight",       dev, false);
+                        mtp_.ffn_gate_exps      = pool_.upload(sg, mtp_pfx + "ffn_gate_exps.weight",      dev, false);
+                        mtp_.ffn_up_exps        = pool_.upload(sg, mtp_pfx + "ffn_up_exps.weight",        dev, false);
+                        mtp_.ffn_down_exps      = pool_.upload(sg, mtp_pfx + "ffn_down_exps.weight",      dev, false);
+                        mtp_.ffn_gate_inp_shexp = pool_.upload(sg, mtp_pfx + "ffn_gate_inp_shexp.weight", dev, false);
+                        mtp_.ffn_gate_shexp     = pool_.upload(sg, mtp_pfx + "ffn_gate_shexp.weight",     dev, false);
+                        mtp_.ffn_up_shexp       = pool_.upload(sg, mtp_pfx + "ffn_up_shexp.weight",       dev, false);
+                        mtp_.ffn_down_shexp     = pool_.upload(sg, mtp_pfx + "ffn_down_shexp.weight",     dev, false);
+                    }
 
                     cuda_ok(cudaMalloc(&mtp_k_cache_, kv_bytes), "qwen35 malloc mtp_k");
                     cuda_ok(cudaMalloc(&mtp_v_cache_, kv_bytes), "qwen35 malloc mtp_v");
@@ -313,10 +337,15 @@ void Qwen35MoeModel::load(const std::string & gguf_path,
         rt.d_k          = dev_alloc<float>(dev, B * d_kv);
         rt.d_v          = dev_alloc<float>(dev, B * d_kv);
         rt.d_attn_out   = dev_alloc<float>(dev, B * d_q);
-        rt.d_router     = dev_alloc<float>(dev, B * cfg_.n_expert);
-        rt.d_shexp_gate = dev_alloc<float>(dev, B);
-        rt.d_top_ids    = dev_alloc<int32_t>(dev, B * cfg_.n_expert_used);
-        rt.d_top_w      = dev_alloc<float>(dev, B * cfg_.n_expert_used);
+        if (cfg_.is_dense) {
+            rt.d_ff_gate = dev_alloc<float>(dev, B * cfg_.n_ff);
+            rt.d_ff_up   = dev_alloc<float>(dev, B * cfg_.n_ff);
+        } else {
+            rt.d_router     = dev_alloc<float>(dev, B * cfg_.n_expert);
+            rt.d_shexp_gate = dev_alloc<float>(dev, B);
+            rt.d_top_ids    = dev_alloc<int32_t>(dev, B * cfg_.n_expert_used);
+            rt.d_top_w      = dev_alloc<float>(dev, B * cfg_.n_expert_used);
+        }
         rt.d_pos        = dev_alloc<int32_t>(dev, B);
         if (gi == 0) rt.d_tokens = dev_alloc<int32_t>(dev, B);
         if (gi + 1 == runtimes_.size()) {
@@ -404,16 +433,31 @@ void Qwen35MoeModel::rollback_gdn_states() {
     }
 }
 
-void Qwen35MoeModel::run_gpu_segment(size_t gi, int T, bool run_argmax, bool save_gdn_snap, int kv_len_max) {
+void Qwen35MoeModel::run_gpu_segment(size_t gi, int T, bool run_argmax, bool save_gdn_snap,
+                                    int kv_len_max, bool compute_logits) {
     auto & rt = runtimes_[gi];
     cudaSetDevice(rt.device);
     cudaStream_t st = rt.stream;
 
+    const int sm       = device_sm_version(rt.device);
     const int H        = cfg_.n_embd;
     const int d_q      = cfg_.n_head * cfg_.head_dim;
     const int conv_dim = 2 * cfg_.ssm_n_group * cfg_.ssm_d_state + cfg_.ssm_d_inner;
     const float attn_scale = 1.0f / std::sqrt(static_cast<float>(cfg_.head_dim));
     const float gdn_scale  = 1.0f / std::sqrt(static_cast<float>(cfg_.ssm_d_state));
+
+    const bool do_prof = (!use_cuda_graphs_ && std::getenv("ROOKERY_PROFILE") != nullptr);
+    double ms_gdn_proj = 0, ms_gdn_core = 0, ms_gdn_out = 0;
+    double ms_gqa_qkv = 0, ms_gqa_attn = 0, ms_gqa_out = 0;
+    double ms_ffn = 0, ms_lm = 0;
+    auto prof_mark = [&](double & acc, auto && fn) {
+        if (!do_prof) { fn(); return; }
+        cudaStreamSynchronize(st);
+        const auto t0 = std::chrono::steady_clock::now();
+        fn();
+        cudaStreamSynchronize(st);
+        acc += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    };
 
     if (gi == 0) {
         launch_embedding_lookup(tok_embd_, rt.d_tokens, rt.d_cur, H, 1, T, st);
@@ -427,75 +471,170 @@ void Qwen35MoeModel::run_gpu_segment(size_t gi, int T, bool run_argmax, bool sav
 
         if (L.is_recr) {
             // 2A. Gated Delta Net linear attention
-            if (T < 16 && L.wqkv.dtype == DType::Q8_0) {
-                launch_quantize_q8_1(rt.d_x_norm, rt.d_scratch, H, T, st);
-                launch_linear_q8_0_prequant(L.wqkv,      rt.d_scratch, rt.d_qkv_raw, T, st);
-                launch_linear_q8_0_prequant(L.wqkv_gate, rt.d_scratch, rt.d_z,       T, st);
-                if (L.ssm_alpha.dtype == DType::Q8_0) launch_linear_q8_0_prequant(L.ssm_alpha, rt.d_scratch, rt.d_alpha, T, st);
-                else launch_linear(rt.cublas, L.ssm_alpha, rt.d_x_norm, rt.d_alpha, T, rt.d_scratch, rt.scratch_bytes, st);
-                if (L.ssm_beta.dtype == DType::Q8_0)  launch_linear_q8_0_prequant(L.ssm_beta,  rt.d_scratch, rt.d_beta,  T, st);
-                else launch_linear(rt.cublas, L.ssm_beta,  rt.d_x_norm, rt.d_beta,  T, rt.d_scratch, rt.scratch_bytes, st);
-            } else {
-                launch_linear(rt.cublas, L.wqkv,      rt.d_x_norm, rt.d_qkv_raw, T, rt.d_scratch, rt.scratch_bytes, st);
-                launch_linear(rt.cublas, L.wqkv_gate, rt.d_x_norm, rt.d_z,       T, rt.d_scratch, rt.scratch_bytes, st);
-                launch_linear(rt.cublas, L.ssm_alpha, rt.d_x_norm, rt.d_alpha,   T, rt.d_scratch, rt.scratch_bytes, st);
-                launch_linear(rt.cublas, L.ssm_beta,  rt.d_x_norm, rt.d_beta,    T, rt.d_scratch, rt.scratch_bytes, st);
-            }
+            prof_mark(ms_gdn_proj, [&]() {
+                if (T < 16 && sm == 60 && L.wqkv.dtype == DType::Q8_0 && L.wqkv.is_soa &&
+                    L.wqkv_gate.dtype == DType::Q8_0 && L.wqkv_gate.is_soa) {
+                    launch_q8_0_prep_x_sm60_h2(rt.d_x_norm, rt.d_scratch, H, T, st);
+                    launch_linear_q8_0_sm60_h2_prepped(L.wqkv,      rt.d_scratch, rt.d_qkv_raw, T, st);
+                    launch_linear_q8_0_sm60_h2_prepped(L.wqkv_gate, rt.d_scratch, rt.d_z,       T, st);
+                    const bool a_q8 = (L.ssm_alpha.dtype == DType::Q8_0 && L.ssm_alpha.is_soa);
+                    const bool b_q8 = (L.ssm_beta.dtype  == DType::Q8_0 && L.ssm_beta.is_soa);
+                    if (a_q8) launch_linear_q8_0_sm60_h2_prepped(L.ssm_alpha, rt.d_scratch, rt.d_alpha, T, st);
+                    if (b_q8) launch_linear_q8_0_sm60_h2_prepped(L.ssm_beta,  rt.d_scratch, rt.d_beta,  T, st);
+                    if (!a_q8) launch_linear(rt.cublas, L.ssm_alpha, rt.d_x_norm, rt.d_alpha, T, rt.d_scratch, rt.scratch_bytes, st);
+                    if (!b_q8) launch_linear(rt.cublas, L.ssm_beta,  rt.d_x_norm, rt.d_beta,  T, rt.d_scratch, rt.scratch_bytes, st);
+                } else if (T < 16 && sm == 60 && is_kquant_dtype(L.wqkv.dtype) && is_kquant_dtype(L.wqkv_gate.dtype)) {
+                    const bool b_kq = is_kquant_dtype(L.ssm_beta.dtype);
+                    const DeviceTensor * ws[3] = {&L.wqkv, &L.wqkv_gate, &L.ssm_beta};
+                    float * ys[3] = {rt.d_qkv_raw, rt.d_z, rt.d_beta};
+                    const int n_m = b_kq ? 3 : 2;
+                    if (!try_launch_linear_multi_sm60_h2(ws, ys, n_m, rt.d_x_norm, T, rt.d_scratch, rt.scratch_bytes, st)) {
+                        launch_linear(rt.cublas, L.wqkv,      rt.d_x_norm, rt.d_qkv_raw, T, rt.d_scratch, rt.scratch_bytes, st);
+                        launch_linear(rt.cublas, L.wqkv_gate, rt.d_x_norm, rt.d_z,       T, rt.d_scratch, rt.scratch_bytes, st);
+                        if (b_kq) launch_linear(rt.cublas, L.ssm_beta, rt.d_x_norm, rt.d_beta, T, rt.d_scratch, rt.scratch_bytes, st);
+                    }
+                    launch_linear(rt.cublas, L.ssm_alpha, rt.d_x_norm, rt.d_alpha, T, rt.d_scratch, rt.scratch_bytes, st);
+                    if (!b_kq) launch_linear(rt.cublas, L.ssm_beta, rt.d_x_norm, rt.d_beta, T, rt.d_scratch, rt.scratch_bytes, st);
+                } else if (T < 16 && sm != 60 && L.wqkv.dtype == DType::Q8_0 && L.wqkv_gate.dtype == DType::Q8_0) {
+                    launch_quantize_q8_1(rt.d_x_norm, rt.d_scratch, H, T, st);
+                    launch_linear_q8_0_prequant(L.wqkv,      rt.d_scratch, rt.d_qkv_raw, T, st);
+                    launch_linear_q8_0_prequant(L.wqkv_gate, rt.d_scratch, rt.d_z,       T, st);
+                    const bool a_q8 = (L.ssm_alpha.dtype == DType::Q8_0);
+                    const bool b_q8 = (L.ssm_beta.dtype  == DType::Q8_0);
+                    if (a_q8) launch_linear_q8_0_prequant(L.ssm_alpha, rt.d_scratch, rt.d_alpha, T, st);
+                    if (b_q8) launch_linear_q8_0_prequant(L.ssm_beta,  rt.d_scratch, rt.d_beta,  T, st);
+                    if (!a_q8) launch_linear(rt.cublas, L.ssm_alpha, rt.d_x_norm, rt.d_alpha, T, rt.d_scratch, rt.scratch_bytes, st);
+                    if (!b_q8) launch_linear(rt.cublas, L.ssm_beta,  rt.d_x_norm, rt.d_beta,  T, rt.d_scratch, rt.scratch_bytes, st);
+                } else if (T < 16 && sm != 60 && is_kquant_dtype(L.wqkv.dtype) && is_kquant_dtype(L.wqkv_gate.dtype)) {
+                    launch_quantize_q8_1(rt.d_x_norm, rt.d_scratch, H, T, st);
+                    const DeviceTensor * ws[2] = {&L.wqkv, &L.wqkv_gate};
+                    float * ys[2] = {rt.d_qkv_raw, rt.d_z};
+                    launch_linear_multi_prequant(ws, ys, 2, rt.d_scratch, T, st);
+                    launch_linear(rt.cublas, L.ssm_alpha, rt.d_x_norm, rt.d_alpha, T, rt.d_scratch, rt.scratch_bytes, st);
+                    launch_linear(rt.cublas, L.ssm_beta,  rt.d_x_norm, rt.d_beta,  T, rt.d_scratch, rt.scratch_bytes, st);
+                } else {
+                    launch_linear(rt.cublas, L.wqkv,      rt.d_x_norm, rt.d_qkv_raw, T, rt.d_scratch, rt.scratch_bytes, st);
+                    launch_linear(rt.cublas, L.wqkv_gate, rt.d_x_norm, rt.d_z,       T, rt.d_scratch, rt.scratch_bytes, st);
+                    launch_linear(rt.cublas, L.ssm_alpha, rt.d_x_norm, rt.d_alpha,   T, rt.d_scratch, rt.scratch_bytes, st);
+                    launch_linear(rt.cublas, L.ssm_beta,  rt.d_x_norm, rt.d_beta,    T, rt.d_scratch, rt.scratch_bytes, st);
+                }
+            });
 
-            launch_qwen_gdn_gate_and_beta(rt.d_alpha, static_cast<const float *>(L.ssm_dt.ptr),
-                                          static_cast<const float *>(L.ssm_a.ptr), rt.d_beta,
-                                          T, cfg_.ssm_dt_rank, st);
-            launch_ssm_conv1d_silu(rt.d_qkv_raw, static_cast<const float *>(L.ssm_conv1d.ptr),
-                                   gdn_conv_[il], rt.d_qkv_conv, T, conv_dim, st,
-                                   save_gdn_snap ? gdn_conv_snap_[il] : nullptr);
-            launch_qwen_gdn_packed_d128(rt.d_qkv_conv, rt.d_alpha, rt.d_beta,
-                                        gdn_state_[il], rt.d_gdn_out,
-                                        T, cfg_.ssm_n_group, cfg_.ssm_dt_rank, cfg_.rms_eps, gdn_scale, st,
-                                        save_gdn_snap ? gdn_state_snap_[il] : nullptr);
-            launch_rms_norm_silu_gate_d128(rt.d_gdn_out, static_cast<const float *>(L.ssm_norm.ptr),
-                                           rt.d_z, T, cfg_.ssm_dt_rank, cfg_.rms_eps, st);
-            launch_linear(rt.cublas, L.ssm_out, rt.d_gdn_out, rt.d_sub_out, T, rt.d_scratch, rt.scratch_bytes, st);
+            prof_mark(ms_gdn_core, [&]() {
+                launch_qwen_gdn_gate_and_beta(rt.d_alpha, static_cast<const float *>(L.ssm_dt.ptr),
+                                              static_cast<const float *>(L.ssm_a.ptr), rt.d_beta,
+                                              T, cfg_.ssm_dt_rank, st);
+                launch_ssm_conv1d_silu(rt.d_qkv_raw, static_cast<const float *>(L.ssm_conv1d.ptr),
+                                       gdn_conv_[il], rt.d_qkv_conv, T, conv_dim, st,
+                                       save_gdn_snap ? gdn_conv_snap_[il] : nullptr);
+                launch_qwen_gdn_packed_d128(rt.d_qkv_conv, rt.d_alpha, rt.d_beta,
+                                            gdn_state_[il], rt.d_gdn_out,
+                                            T, cfg_.ssm_n_group, cfg_.ssm_dt_rank, cfg_.rms_eps, gdn_scale, st,
+                                            save_gdn_snap ? gdn_state_snap_[il] : nullptr);
+                launch_rms_norm_silu_gate_d128(rt.d_gdn_out, static_cast<const float *>(L.ssm_norm.ptr),
+                                               rt.d_z, T, cfg_.ssm_dt_rank, cfg_.rms_eps, st);
+            });
+            prof_mark(ms_gdn_out, [&]() {
+                launch_linear(rt.cublas, L.ssm_out, rt.d_gdn_out, rt.d_sub_out, T, rt.d_scratch, rt.scratch_bytes, st);
+            });
         } else {
             // 2B. Full GQA attention (head_dim=256, partial NeoX RoPE=64, gated output)
-            if (T < 16 && L.wq.dtype == DType::Q8_0) {
-                launch_quantize_q8_1(rt.d_x_norm, rt.d_scratch, H, T, st);
-                launch_linear_q8_0_prequant(L.wq, rt.d_scratch, rt.d_q_full, T, st);
-                launch_linear_q8_0_prequant(L.wk, rt.d_scratch, rt.d_k,      T, st);
-                launch_linear_q8_0_prequant(L.wv, rt.d_scratch, rt.d_v,      T, st);
-            } else {
-                launch_linear(rt.cublas, L.wq, rt.d_x_norm, rt.d_q_full, T, rt.d_scratch, rt.scratch_bytes, st);
-                launch_linear(rt.cublas, L.wk, rt.d_x_norm, rt.d_k,      T, rt.d_scratch, rt.scratch_bytes, st);
-                launch_linear(rt.cublas, L.wv, rt.d_x_norm, rt.d_v,      T, rt.d_scratch, rt.scratch_bytes, st);
-            }
-            launch_qwen_qgate_split_norm_rope_d256(rt.d_q_full, static_cast<const float *>(L.attn_q_norm.ptr),
-                                                   rt.d_pos, rt.d_q, rt.d_gate,
-                                                   T, cfg_.n_head, cfg_.rope_dim, cfg_.rms_eps, cfg_.rope_freq_base, st);
-            launch_qwen_k_norm_rope_d256(rt.d_k, static_cast<const float *>(L.attn_k_norm.ptr),
-                                         rt.d_pos, T, cfg_.n_head_kv, cfg_.rope_dim, cfg_.rms_eps, cfg_.rope_freq_base, st);
-            launch_gqa_kv_write_d256(rt.d_k, rt.d_v, k_cache_[il], v_cache_[il], cfg_.kv_q8_0,
-                                     rt.d_pos, T, cfg_.n_head_kv, st);
-            launch_gqa_attn_d256(rt.d_q, k_cache_[il], v_cache_[il], cfg_.kv_q8_0,
-                                 rt.d_pos, rt.d_attn_out, rt.d_scratch, rt.scratch_bytes,
-                                 T, cfg_.n_head, cfg_.n_head_kv, attn_scale, rt.cublas, kv_len_max, st);
-            launch_inkling2_sigmoid_gate_mul(rt.d_attn_out, rt.d_gate, static_cast<int64_t>(T) * d_q, st);
-            launch_linear(rt.cublas, L.wo, rt.d_attn_out, rt.d_sub_out, T, rt.d_scratch, rt.scratch_bytes, st);
+            prof_mark(ms_gqa_qkv, [&]() {
+                if (T < 16 && sm == 60 && L.wq.dtype == DType::Q8_0 && L.wq.is_soa &&
+                    L.wk.dtype == DType::Q8_0 && L.wk.is_soa && L.wv.dtype == DType::Q8_0 && L.wv.is_soa) {
+                    launch_q8_0_prep_x_sm60_h2(rt.d_x_norm, rt.d_scratch, H, T, st);
+                    launch_linear_q8_0_sm60_h2_prepped(L.wq, rt.d_scratch, rt.d_q_full, T, st);
+                    launch_linear_q8_0_sm60_h2_prepped(L.wk, rt.d_scratch, rt.d_k,      T, st);
+                    launch_linear_q8_0_sm60_h2_prepped(L.wv, rt.d_scratch, rt.d_v,      T, st);
+                } else if (T < 16 && sm == 60 && is_kquant_dtype(L.wq.dtype) && is_kquant_dtype(L.wk.dtype) && is_kquant_dtype(L.wv.dtype)) {
+                    const DeviceTensor * ws[3] = {&L.wq, &L.wk, &L.wv};
+                    float * ys[3] = {rt.d_q_full, rt.d_k, rt.d_v};
+                    if (!try_launch_linear_multi_sm60_h2(ws, ys, 3, rt.d_x_norm, T, rt.d_scratch, rt.scratch_bytes, st)) {
+                        launch_linear(rt.cublas, L.wq, rt.d_x_norm, rt.d_q_full, T, rt.d_scratch, rt.scratch_bytes, st);
+                        launch_linear(rt.cublas, L.wk, rt.d_x_norm, rt.d_k,      T, rt.d_scratch, rt.scratch_bytes, st);
+                        launch_linear(rt.cublas, L.wv, rt.d_x_norm, rt.d_v,      T, rt.d_scratch, rt.scratch_bytes, st);
+                    }
+                } else if (T < 16 && sm != 60 && L.wq.dtype == DType::Q8_0 && L.wk.dtype == DType::Q8_0 && L.wv.dtype == DType::Q8_0) {
+                    launch_quantize_q8_1(rt.d_x_norm, rt.d_scratch, H, T, st);
+                    launch_linear_q8_0_prequant(L.wq, rt.d_scratch, rt.d_q_full, T, st);
+                    launch_linear_q8_0_prequant(L.wk, rt.d_scratch, rt.d_k,      T, st);
+                    launch_linear_q8_0_prequant(L.wv, rt.d_scratch, rt.d_v,      T, st);
+                } else if (T < 16 && sm != 60 && is_kquant_dtype(L.wq.dtype) && is_kquant_dtype(L.wk.dtype) && is_kquant_dtype(L.wv.dtype)) {
+                    launch_quantize_q8_1(rt.d_x_norm, rt.d_scratch, H, T, st);
+                    const DeviceTensor * ws[3] = {&L.wq, &L.wk, &L.wv};
+                    float * ys[3] = {rt.d_q_full, rt.d_k, rt.d_v};
+                    launch_linear_multi_prequant(ws, ys, 3, rt.d_scratch, T, st);
+                } else {
+                    launch_linear(rt.cublas, L.wq, rt.d_x_norm, rt.d_q_full, T, rt.d_scratch, rt.scratch_bytes, st);
+                    launch_linear(rt.cublas, L.wk, rt.d_x_norm, rt.d_k,      T, rt.d_scratch, rt.scratch_bytes, st);
+                    launch_linear(rt.cublas, L.wv, rt.d_x_norm, rt.d_v,      T, rt.d_scratch, rt.scratch_bytes, st);
+                }
+            });
+            prof_mark(ms_gqa_attn, [&]() {
+                launch_qwen_qgate_split_norm_rope_d256(rt.d_q_full, static_cast<const float *>(L.attn_q_norm.ptr),
+                                                       rt.d_pos, rt.d_q, rt.d_gate,
+                                                       T, cfg_.n_head, cfg_.rope_dim, cfg_.rms_eps, cfg_.rope_freq_base, st);
+                launch_qwen_k_norm_rope_d256(rt.d_k, static_cast<const float *>(L.attn_k_norm.ptr),
+                                             rt.d_pos, T, cfg_.n_head_kv, cfg_.rope_dim, cfg_.rms_eps, cfg_.rope_freq_base, st);
+                launch_gqa_kv_write_d256(rt.d_k, rt.d_v, k_cache_[il], v_cache_[il], cfg_.kv_q8_0,
+                                         rt.d_pos, T, cfg_.n_head_kv, st);
+                launch_gqa_attn_d256(rt.d_q, k_cache_[il], v_cache_[il], cfg_.kv_q8_0,
+                                     rt.d_pos, rt.d_attn_out, rt.d_scratch, rt.scratch_bytes,
+                                     T, cfg_.n_head, cfg_.n_head_kv, attn_scale, rt.cublas, kv_len_max, st);
+                launch_inkling2_sigmoid_gate_mul(rt.d_attn_out, rt.d_gate, static_cast<int64_t>(T) * d_q, st);
+            });
+            prof_mark(ms_gqa_out, [&]() {
+                launch_linear(rt.cublas, L.wo, rt.d_attn_out, rt.d_sub_out, T, rt.d_scratch, rt.scratch_bytes, st);
+            });
         }
 
-        // 3. Attention residual + Post-attention RMSNorm
-        launch_add_inplace(rt.d_cur, rt.d_sub_out, static_cast<int64_t>(T) * H, st);
-        launch_rmsnorm(rt.d_cur, static_cast<const float *>(L.post_attn_norm.ptr), rt.d_x_norm, H, T, cfg_.rms_eps, st);
+        // 3. Fused Attention residual + Post-attention RMSNorm
+        launch_add_rmsnorm(rt.d_cur, rt.d_sub_out, static_cast<const float *>(L.post_attn_norm.ptr),
+                           rt.d_x_norm, H, T, cfg_.rms_eps, st);
 
-        // 4. MoE FFN (Softmax top-8 + Gated Shared Expert) + Residual
-        launch_linear(rt.cublas, L.ffn_gate_inp,       rt.d_x_norm, rt.d_router,     T, rt.d_scratch, rt.scratch_bytes, st);
-        launch_linear(rt.cublas, L.ffn_gate_inp_shexp, rt.d_x_norm, rt.d_shexp_gate, T, rt.d_scratch, rt.scratch_bytes, st);
-        launch_moe_route_softmax(rt.d_router, rt.d_top_ids, rt.d_top_w,
-                                 T, cfg_.n_expert, cfg_.n_expert_used, true, cfg_.expert_weights_scale, st);
-        launch_qwen_moe_ffn_gated_shared(rt.cublas,
-                                         L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps,
-                                         L.ffn_gate_shexp, L.ffn_up_shexp, L.ffn_down_shexp,
-                                         rt.d_x_norm, rt.d_top_ids, rt.d_top_w, rt.d_shexp_gate,
-                                         rt.d_sub_out, rt.d_scratch, rt.scratch_bytes,
-                                         T, cfg_.n_expert_used, st);
+        // 4. Dense SwiGLU FFN (qwen35) or MoE FFN (qwen35moe) + Residual
+        prof_mark(ms_ffn, [&]() {
+            if (cfg_.is_dense) {
+                if (T < 16 && sm == 60 && L.ffn_gate.dtype == DType::Q8_0 && L.ffn_gate.is_soa &&
+                    L.ffn_up.dtype == DType::Q8_0 && L.ffn_up.is_soa) {
+                    launch_q8_0_prep_x_sm60_h2(rt.d_x_norm, rt.d_scratch, H, T, st);
+                    launch_linear_q8_0_sm60_h2_prepped(L.ffn_gate, rt.d_scratch, rt.d_ff_gate, T, st);
+                    launch_linear_q8_0_sm60_h2_prepped(L.ffn_up,   rt.d_scratch, rt.d_ff_up,   T, st);
+                } else if (T < 16 && sm == 60 && is_kquant_dtype(L.ffn_gate.dtype) && is_kquant_dtype(L.ffn_up.dtype)) {
+                    const DeviceTensor * ws[2] = {&L.ffn_gate, &L.ffn_up};
+                    float * ys[2] = {rt.d_ff_gate, rt.d_ff_up};
+                    if (!try_launch_linear_multi_sm60_h2(ws, ys, 2, rt.d_x_norm, T, rt.d_scratch, rt.scratch_bytes, st)) {
+                        launch_linear(rt.cublas, L.ffn_gate, rt.d_x_norm, rt.d_ff_gate, T, rt.d_scratch, rt.scratch_bytes, st);
+                        launch_linear(rt.cublas, L.ffn_up,   rt.d_x_norm, rt.d_ff_up,   T, rt.d_scratch, rt.scratch_bytes, st);
+                    }
+                } else if (T < 16 && sm != 60 && L.ffn_gate.dtype == DType::Q8_0 && L.ffn_up.dtype == DType::Q8_0) {
+                    launch_quantize_q8_1(rt.d_x_norm, rt.d_scratch, H, T, st);
+                    launch_linear_q8_0_prequant(L.ffn_gate, rt.d_scratch, rt.d_ff_gate, T, st);
+                    launch_linear_q8_0_prequant(L.ffn_up,   rt.d_scratch, rt.d_ff_up,   T, st);
+                } else if (T < 16 && sm != 60 && is_kquant_dtype(L.ffn_gate.dtype) && is_kquant_dtype(L.ffn_up.dtype)) {
+                    launch_quantize_q8_1(rt.d_x_norm, rt.d_scratch, H, T, st);
+                    const DeviceTensor * ws[2] = {&L.ffn_gate, &L.ffn_up};
+                    float * ys[2] = {rt.d_ff_gate, rt.d_ff_up};
+                    launch_linear_multi_prequant(ws, ys, 2, rt.d_scratch, T, st);
+                } else {
+                    launch_linear(rt.cublas, L.ffn_gate, rt.d_x_norm, rt.d_ff_gate, T, rt.d_scratch, rt.scratch_bytes, st);
+                    launch_linear(rt.cublas, L.ffn_up,   rt.d_x_norm, rt.d_ff_up,   T, rt.d_scratch, rt.scratch_bytes, st);
+                }
+                launch_silu_mul(rt.d_ff_gate, rt.d_ff_up, rt.d_ff_gate, static_cast<int64_t>(T) * cfg_.n_ff, st);
+                launch_linear(rt.cublas, L.ffn_down, rt.d_ff_gate, rt.d_sub_out, T, rt.d_scratch, rt.scratch_bytes, st);
+            } else {
+                launch_linear(rt.cublas, L.ffn_gate_inp,       rt.d_x_norm, rt.d_router,     T, rt.d_scratch, rt.scratch_bytes, st);
+                launch_linear(rt.cublas, L.ffn_gate_inp_shexp, rt.d_x_norm, rt.d_shexp_gate, T, rt.d_scratch, rt.scratch_bytes, st);
+                launch_moe_route_softmax(rt.d_router, rt.d_top_ids, rt.d_top_w,
+                                         T, cfg_.n_expert, cfg_.n_expert_used, true, cfg_.expert_weights_scale, st);
+                launch_qwen_moe_ffn_gated_shared(rt.cublas,
+                                                 L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps,
+                                                 L.ffn_gate_shexp, L.ffn_up_shexp, L.ffn_down_shexp,
+                                                 rt.d_x_norm, rt.d_top_ids, rt.d_top_w, rt.d_shexp_gate,
+                                                 rt.d_sub_out, rt.d_scratch, rt.scratch_bytes,
+                                                 T, cfg_.n_expert_used, st);
+            }
+        });
         launch_add_inplace(rt.d_cur, rt.d_sub_out, static_cast<int64_t>(T) * H, st);
         if (hook_ != nullptr && hook_->hooks_layer(il)) {
             hook_->on_post_layer(il, rt.device, rt.d_cur, T, H, 1, st);
@@ -503,18 +642,27 @@ void Qwen35MoeModel::run_gpu_segment(size_t gi, int T, bool run_argmax, bool sav
     }
 
     // 5. Final RMSNorm -> save h_nextn (post-norm!) -> LM head
-    if (gi + 1 == runtimes_.size()) {
-        launch_rmsnorm(rt.d_cur, static_cast<const float *>(output_norm_.ptr), rt.d_x_norm, H, T, cfg_.rms_eps, st);
-        if (has_mtp_ && rt.d_h_nextn) {
-            cudaMemcpyAsync(rt.d_h_nextn, rt.d_x_norm, static_cast<size_t>(T) * H * sizeof(float), cudaMemcpyDeviceToDevice, st);
-        }
-        if (run_argmax && T <= 2) {
-            launch_linear(rt.cublas, output_, rt.d_x_norm, rt.d_logits, T, rt.d_scratch, rt.scratch_bytes, st);
-            launch_argmax_f32_batch(rt.d_logits, rt.d_argmax, cfg_.n_vocab, T, st);
-        } else {
-            launch_linear(rt.cublas, output_, rt.d_x_norm + static_cast<size_t>(T - 1) * H,
-                          rt.d_logits, 1, rt.d_scratch, rt.scratch_bytes, st);
-        }
+    if (gi + 1 == runtimes_.size() && (compute_logits || has_mtp_)) {
+        prof_mark(ms_lm, [&]() {
+            launch_rmsnorm(rt.d_cur, static_cast<const float *>(output_norm_.ptr), rt.d_x_norm, H, T, cfg_.rms_eps, st);
+            if (has_mtp_ && rt.d_h_nextn) {
+                cudaMemcpyAsync(rt.d_h_nextn, rt.d_x_norm, static_cast<size_t>(T) * H * sizeof(float), cudaMemcpyDeviceToDevice, st);
+            }
+            if (compute_logits) {
+                if (run_argmax && T <= 2) {
+                    launch_linear(rt.cublas, output_, rt.d_x_norm, rt.d_logits, T, rt.d_scratch, rt.scratch_bytes, st);
+                    launch_argmax_f32_batch(rt.d_logits, rt.d_argmax, cfg_.n_vocab, T, st);
+                } else {
+                    launch_linear(rt.cublas, output_, rt.d_x_norm + static_cast<size_t>(T - 1) * H,
+                                  rt.d_logits, 1, rt.d_scratch, rt.scratch_bytes, st);
+                }
+            }
+        });
+    }
+
+    if (do_prof) {
+        std::printf("[PROF GPU%d T=%d] gdn_proj=%.2f gdn_core=%.2f gdn_out=%.2f gqa_qkv=%.2f gqa_attn=%.2f gqa_out=%.2f ffn=%.2f lm=%.2f ms\n",
+                    rt.device, T, ms_gdn_proj, ms_gdn_core, ms_gdn_out, ms_gqa_qkv, ms_gqa_attn, ms_gqa_out, ms_ffn, ms_lm);
     }
 }
 
@@ -523,6 +671,7 @@ void Qwen35MoeModel::run_mtp_layer(int T, bool run_argmax, int kv_len_max) {
     cudaSetDevice(rt.device);
     cudaStream_t st = rt.stream;
 
+    const int sm = device_sm_version(rt.device);
     const int H = cfg_.n_embd;
     const int d_q = cfg_.n_head * cfg_.head_dim;
     const float attn_scale = 1.0f / std::sqrt(static_cast<float>(cfg_.head_dim));
@@ -534,9 +683,15 @@ void Qwen35MoeModel::run_mtp_layer(int T, bool run_argmax, int kv_len_max) {
                          rt.d_mtp_eh, H, 1, T, cfg_.rms_eps, st);
     launch_linear(rt.cublas, mtp_.eh_proj, rt.d_mtp_eh, rt.d_mtp_cur, T, rt.d_scratch, rt.scratch_bytes, st);
 
-    // Full GQA block (blk.40)
+    // Full GQA block (MTP layer)
     launch_rmsnorm(rt.d_mtp_cur, static_cast<const float *>(mtp_.attn_norm.ptr), rt.d_x_norm, H, T, cfg_.rms_eps, st);
-    if (T < 16 && mtp_.wq.dtype == DType::Q8_0) {
+    if (T < 16 && sm == 60 && mtp_.wq.dtype == DType::Q8_0 && mtp_.wq.is_soa &&
+        mtp_.wk.dtype == DType::Q8_0 && mtp_.wk.is_soa && mtp_.wv.dtype == DType::Q8_0 && mtp_.wv.is_soa) {
+        launch_q8_0_prep_x_sm60_h2(rt.d_x_norm, rt.d_scratch, H, T, st);
+        launch_linear_q8_0_sm60_h2_prepped(mtp_.wq, rt.d_scratch, rt.d_q_full, T, st);
+        launch_linear_q8_0_sm60_h2_prepped(mtp_.wk, rt.d_scratch, rt.d_k,      T, st);
+        launch_linear_q8_0_sm60_h2_prepped(mtp_.wv, rt.d_scratch, rt.d_v,      T, st);
+    } else if (T < 16 && sm != 60 && mtp_.wq.dtype == DType::Q8_0 && mtp_.wk.dtype == DType::Q8_0 && mtp_.wv.dtype == DType::Q8_0) {
         launch_quantize_q8_1(rt.d_x_norm, rt.d_scratch, H, T, st);
         launch_linear_q8_0_prequant(mtp_.wq, rt.d_scratch, rt.d_q_full, T, st);
         launch_linear_q8_0_prequant(mtp_.wk, rt.d_scratch, rt.d_k,      T, st);
@@ -559,20 +714,34 @@ void Qwen35MoeModel::run_mtp_layer(int T, bool run_argmax, int kv_len_max) {
     launch_inkling2_sigmoid_gate_mul(rt.d_attn_out, rt.d_gate, static_cast<int64_t>(T) * d_q, st);
     launch_linear(rt.cublas, mtp_.wo, rt.d_attn_out, rt.d_sub_out, T, rt.d_scratch, rt.scratch_bytes, st);
 
-    launch_add_inplace(rt.d_mtp_cur, rt.d_sub_out, static_cast<int64_t>(T) * H, st);
-    launch_rmsnorm(rt.d_mtp_cur, static_cast<const float *>(mtp_.post_attn_norm.ptr), rt.d_x_norm, H, T, cfg_.rms_eps, st);
+    launch_add_rmsnorm(rt.d_mtp_cur, rt.d_sub_out, static_cast<const float *>(mtp_.post_attn_norm.ptr),
+                       rt.d_x_norm, H, T, cfg_.rms_eps, st);
 
-    // MoE FFN
-    launch_linear(rt.cublas, mtp_.ffn_gate_inp,       rt.d_x_norm, rt.d_router,     T, rt.d_scratch, rt.scratch_bytes, st);
-    launch_linear(rt.cublas, mtp_.ffn_gate_inp_shexp, rt.d_x_norm, rt.d_shexp_gate, T, rt.d_scratch, rt.scratch_bytes, st);
-    launch_moe_route_softmax(rt.d_router, rt.d_top_ids, rt.d_top_w,
-                             T, cfg_.n_expert, cfg_.n_expert_used, true, cfg_.expert_weights_scale, st);
-    launch_qwen_moe_ffn_gated_shared(rt.cublas,
-                                     mtp_.ffn_gate_exps, mtp_.ffn_up_exps, mtp_.ffn_down_exps,
-                                     mtp_.ffn_gate_shexp, mtp_.ffn_up_shexp, mtp_.ffn_down_shexp,
-                                     rt.d_x_norm, rt.d_top_ids, rt.d_top_w, rt.d_shexp_gate,
-                                     rt.d_sub_out, rt.d_scratch, rt.scratch_bytes,
-                                     T, cfg_.n_expert_used, st);
+    // Dense or MoE FFN
+    if (cfg_.is_dense) {
+        if (T < 16 && sm == 60 && mtp_.ffn_gate.dtype == DType::Q8_0 && mtp_.ffn_gate.is_soa &&
+            mtp_.ffn_up.dtype == DType::Q8_0 && mtp_.ffn_up.is_soa) {
+            launch_q8_0_prep_x_sm60_h2(rt.d_x_norm, rt.d_scratch, H, T, st);
+            launch_linear_q8_0_sm60_h2_prepped(mtp_.ffn_gate, rt.d_scratch, rt.d_ff_gate, T, st);
+            launch_linear_q8_0_sm60_h2_prepped(mtp_.ffn_up,   rt.d_scratch, rt.d_ff_up,   T, st);
+        } else {
+            launch_linear(rt.cublas, mtp_.ffn_gate, rt.d_x_norm, rt.d_ff_gate, T, rt.d_scratch, rt.scratch_bytes, st);
+            launch_linear(rt.cublas, mtp_.ffn_up,   rt.d_x_norm, rt.d_ff_up,   T, rt.d_scratch, rt.scratch_bytes, st);
+        }
+        launch_silu_mul(rt.d_ff_gate, rt.d_ff_up, rt.d_ff_gate, static_cast<int64_t>(T) * cfg_.n_ff, st);
+        launch_linear(rt.cublas, mtp_.ffn_down, rt.d_ff_gate, rt.d_sub_out, T, rt.d_scratch, rt.scratch_bytes, st);
+    } else {
+        launch_linear(rt.cublas, mtp_.ffn_gate_inp,       rt.d_x_norm, rt.d_router,     T, rt.d_scratch, rt.scratch_bytes, st);
+        launch_linear(rt.cublas, mtp_.ffn_gate_inp_shexp, rt.d_x_norm, rt.d_shexp_gate, T, rt.d_scratch, rt.scratch_bytes, st);
+        launch_moe_route_softmax(rt.d_router, rt.d_top_ids, rt.d_top_w,
+                                 T, cfg_.n_expert, cfg_.n_expert_used, true, cfg_.expert_weights_scale, st);
+        launch_qwen_moe_ffn_gated_shared(rt.cublas,
+                                         mtp_.ffn_gate_exps, mtp_.ffn_up_exps, mtp_.ffn_down_exps,
+                                         mtp_.ffn_gate_shexp, mtp_.ffn_up_shexp, mtp_.ffn_down_shexp,
+                                         rt.d_x_norm, rt.d_top_ids, rt.d_top_w, rt.d_shexp_gate,
+                                         rt.d_sub_out, rt.d_scratch, rt.scratch_bytes,
+                                         T, cfg_.n_expert_used, st);
+    }
     launch_add_inplace(rt.d_mtp_cur, rt.d_sub_out, static_cast<int64_t>(T) * H, st);
 
     // shared_head_norm + LM head on last token
@@ -657,7 +826,8 @@ void Qwen35MoeModel::warmup_decode_graphs() {
 
 void Qwen35MoeModel::forward(const std::vector<int32_t> & tokens,
                              const std::vector<int32_t> & positions,
-                             std::vector<float> & out_logits) {
+                             std::vector<float> & out_logits,
+                             bool compute_logits) {
     const int T = static_cast<int>(tokens.size());
     if (T == 0 || T != static_cast<int>(positions.size()) || T > max_batch_) {
         throw std::runtime_error("Qwen35MoeModel::forward invalid batch size");
@@ -677,13 +847,15 @@ void Qwen35MoeModel::forward(const std::vector<int32_t> & tokens,
             cuda_ok(cudaMemcpyPeerAsync(rt.d_cur, rt.device, runtimes_[gi - 1].d_cur, runtimes_[gi - 1].device, xfer_b, rt.stream), "fwd peer");
         }
         cuda_ok(cudaMemcpyAsync(rt.d_pos, positions.data(), T * sizeof(int32_t), cudaMemcpyHostToDevice, rt.stream), "fwd pos");
-        run_gpu_segment(gi, T, false, false, kv_len_max);
+        run_gpu_segment(gi, T, false, false, kv_len_max, compute_logits);
     }
 
     auto & rtl = runtimes_.back();
-    out_logits.resize(cfg_.n_vocab);
     cuda_ok(cudaSetDevice(rtl.device), "fwd readout");
-    cuda_ok(cudaMemcpyAsync(out_logits.data(), rtl.d_logits, static_cast<size_t>(cfg_.n_vocab) * sizeof(float), cudaMemcpyDeviceToHost, rtl.stream), "fwd logits");
+    if (compute_logits) {
+        out_logits.resize(cfg_.n_vocab);
+        cuda_ok(cudaMemcpyAsync(out_logits.data(), rtl.d_logits, static_cast<size_t>(cfg_.n_vocab) * sizeof(float), cudaMemcpyDeviceToHost, rtl.stream), "fwd logits");
+    }
     cuda_ok(cudaStreamSynchronize(rtl.stream), "fwd sync");
 }
 

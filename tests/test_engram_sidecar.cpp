@@ -1,10 +1,12 @@
 #include "engram/engram_sidecar.h"
 #include "gguf/reader.h"
 #include "models/bailingmoe3.h"
+#include "models/gemma4.h"
 #include "models/inkling2_loop.h"
 #include "models/maxwell_moe.h"
 #include "models/qwen35_moe.h"
 #include "models/qwen4exp.h"
+#include "models/sensenova_loop.h"
 #include "tokenizer/bpe.h"
 
 #include <algorithm>
@@ -26,6 +28,8 @@ struct HostEvalModel {
     std::unique_ptr<rookery::Qwen4ExpModel>     qwen4exp;
     std::unique_ptr<rookery::Inkling2LoopModel> inkling2;
     std::unique_ptr<rookery::BailingMoe3Model>  bailing3;
+    std::unique_ptr<rookery::Gemma4Model>       gemma4;
+    std::unique_ptr<rookery::SenseNovaLoopModel> sensenova;
 
     void load(const std::string & path, const std::vector<int> & gpus, const std::vector<float> & split, int max_ctx) {
         auto gguf = rookery::GgufFile::open(path);
@@ -42,6 +46,12 @@ struct HostEvalModel {
         } else if (arch == "bailingmoe3") {
             bailing3 = std::make_unique<rookery::BailingMoe3Model>();
             bailing3->load(path, gpus, split, max_ctx, true, false);
+        } else if (arch == "gemma4") {
+            gemma4 = std::make_unique<rookery::Gemma4Model>();
+            gemma4->load(path, gpus, split, max_ctx, rookery::KvCacheType::Q8_0, 1.0f);
+        } else if (arch == "sensenova_loop") {
+            sensenova = std::make_unique<rookery::SenseNovaLoopModel>();
+            sensenova->load(path, gpus, split, max_ctx, true, false);
         } else {
             maxwell = std::make_unique<rookery::MaxwellMoeModel>();
             maxwell->load(path, gpus, split, max_ctx, rookery::KvCacheType::Q8_0, false);
@@ -52,11 +62,13 @@ struct HostEvalModel {
         if (qwen4exp) return qwen4exp->config().n_embd;
         if (inkling2) return inkling2->config().n_embd;
         if (bailing3) return bailing3->config().n_embd;
+        if (gemma4) return gemma4->config().n_embd;
+        if (sensenova) return sensenova->config().n_embd;
         return maxwell->config().n_embd;
     }
     int hc_mult() const {
         if (qwen4exp) return qwen4exp->config().hc_mult;
-        if (qwen35 || inkling2 || bailing3) return 1;
+        if (qwen35 || inkling2 || bailing3 || gemma4 || sensenova) return 1;
         return maxwell->config().hc_mult;
     }
     std::vector<int> layer_devices() const {
@@ -64,6 +76,8 @@ struct HostEvalModel {
         if (qwen4exp) return qwen4exp->layer_devices();
         if (inkling2) return inkling2->layer_devices();
         if (bailing3) return bailing3->layer_devices();
+        if (gemma4) return gemma4->layer_devices();
+        if (sensenova) return sensenova->layer_devices();
         return maxwell->layer_devices();
     }
     void set_layer_hook(rookery::LayerHook * h) {
@@ -71,6 +85,8 @@ struct HostEvalModel {
         else if (qwen4exp) qwen4exp->set_layer_hook(h);
         else if (inkling2) inkling2->set_layer_hook(h);
         else if (bailing3) bailing3->set_layer_hook(h);
+        else if (gemma4) gemma4->set_layer_hook(h);
+        else if (sensenova) sensenova->set_layer_hook(h);
         else maxwell->set_layer_hook(h);
     }
     void set_use_cuda_graphs(bool en) {
@@ -78,6 +94,8 @@ struct HostEvalModel {
         else if (qwen4exp) qwen4exp->set_use_cuda_graphs(en);
         else if (inkling2) inkling2->set_use_cuda_graphs(en);
         else if (bailing3) bailing3->set_use_cuda_graphs(en);
+        else if (gemma4) gemma4->set_use_cuda_graphs(en);
+        else if (sensenova) sensenova->set_use_cuda_graphs(en);
         else maxwell->set_use_cuda_graphs(en);
     }
     void warmup_decode_graphs() {
@@ -85,6 +103,8 @@ struct HostEvalModel {
         else if (qwen4exp) qwen4exp->warmup_decode_graphs();
         else if (inkling2) inkling2->warmup_decode_graphs();
         else if (bailing3) bailing3->warmup_decode_graphs();
+        else if (gemma4) gemma4->warmup_decode_graphs();
+        else if (sensenova) sensenova->warmup_decode_graphs();
         else maxwell->warmup_decode_graphs();
     }
     void reset_state() {
@@ -92,12 +112,16 @@ struct HostEvalModel {
         else if (qwen4exp) qwen4exp->reset_state();
         else if (inkling2) inkling2->reset_state();
         else if (bailing3) bailing3->reset_state();
+        else if (gemma4) gemma4->reset_state();
+        else if (sensenova) sensenova->reset_state();
     }
     void forward(const std::vector<int32_t> & t, const std::vector<int32_t> & p, std::vector<float> & l) {
         if (qwen35) qwen35->forward(t, p, l);
         else if (qwen4exp) qwen4exp->forward(t, p, l);
         else if (inkling2) inkling2->forward(t, p, l);
         else if (bailing3) bailing3->forward(t, p, l);
+        else if (gemma4) gemma4->forward(t, p, l);
+        else if (sensenova) sensenova->forward(t, p, l);
         else maxwell->forward(t, p, l);
     }
     int32_t forward_decode_greedy(int32_t t, int32_t p) {
@@ -105,6 +129,8 @@ struct HostEvalModel {
         if (qwen4exp) return qwen4exp->forward_decode_greedy(t, p);
         if (inkling2) return inkling2->forward_decode_greedy(t, p);
         if (bailing3) return bailing3->forward_decode_greedy(t, p);
+        if (gemma4) return gemma4->forward_decode_greedy(t, p);
+        if (sensenova) return sensenova->forward_decode_greedy(t, p);
         return maxwell->forward_decode_greedy(t, p);
     }
     void forward_decode_logits(int32_t t, int32_t p, std::vector<float> & l) {
@@ -112,6 +138,8 @@ struct HostEvalModel {
         else if (qwen4exp) qwen4exp->forward_decode_logits(t, p, l);
         else if (inkling2) inkling2->forward_decode_logits(t, p, l);
         else if (bailing3) bailing3->forward_decode_logits(t, p, l);
+        else if (gemma4) gemma4->forward_decode_logits(t, p, l);
+        else if (sensenova) sensenova->forward_decode_logits(t, p, l);
         else maxwell->forward_decode_logits(t, p, l);
     }
 };
@@ -155,7 +183,7 @@ struct EvalMetrics {
 
 static EvalMetrics eval_token_ppl(
     HostEvalModel & model,
-    rookery::EngramSidecar * sidecar,
+    const std::vector<rookery::EngramSidecar *> & sidecars,
     const std::vector<int32_t> & ids) {
 
     EvalMetrics m;
@@ -166,7 +194,7 @@ static EvalMetrics eval_token_ppl(
     std::vector<float> logits;
 
     // Step 0: prime position 0
-    if (sidecar) sidecar->prepare_step({ids[0]}, 0);
+    for (auto * sc : sidecars) sc->prepare_step({ids[0]}, 0);
     model.forward_decode_logits(ids[0], 0, logits);
 
     double sum_nll = 0.0;
@@ -192,7 +220,7 @@ static EvalMetrics eval_token_ppl(
         if (better < 5)  ++hit5;
 
         if (i + 1 < n_eval) {
-            if (sidecar) sidecar->prepare_step({target}, i + 1);
+            for (auto * sc : sidecars) sc->prepare_step({target}, i + 1);
             model.forward_decode_logits(target, i + 1, logits);
         }
     }
@@ -211,6 +239,8 @@ int main(int argc, char ** argv) {
     std::string model_path;
     std::string engram_path;
     std::string adapter_path;
+    std::string engram2_path;
+    std::string adapter2_path;
     std::string inspect_adapter_path;
     std::string dump_path;
     std::string dump_probe_path;
@@ -221,8 +251,14 @@ int main(int argc, char ** argv) {
     std::vector<int>   gpus = {0, 1};
     std::vector<float> split = {24.0f, 32.0f};
     std::vector<int>   engram_layers;
+    std::vector<int>   engram2_layers;
     std::vector<float> scale_sweep;
     float    scale        = 0.0f;
+    float    scale2_ratio = 1.0f;
+    float    gate_bias    = 0.0f;
+    bool     gate_bias_set = false;
+    float    gate_bias2   = 0.0f;
+    bool     gate_bias2_set = false;
     int      n_gen        = 64;
     int      max_toks     = 20000;
     int      eval_toks    = 768;
@@ -242,8 +278,14 @@ int main(int argc, char ** argv) {
         if (a == "-m" || a == "--model")            model_path = next();
         else if (a == "--engram")                   engram_path = next();
         else if (a == "--engram-adapter")           adapter_path = next();
+        else if (a == "--engram2")                  engram2_path = next();
+        else if (a == "--engram-adapter2")          adapter2_path = next();
+        else if (a == "--engram-scale2-ratio")      scale2_ratio = std::strtof(next().c_str(), nullptr);
+        else if (a == "--engram-gate-bias2")        { gate_bias2 = std::strtof(next().c_str(), nullptr); gate_bias2_set = true; }
+        else if (a == "--engram-layers2")           engram2_layers = parse_csv_ints(next());
         else if (a == "--inspect-adapter")          inspect_adapter_path = next();
         else if (a == "--engram-scale")             scale = std::strtof(next().c_str(), nullptr);
+        else if (a == "--engram-gate-bias")         { gate_bias = std::strtof(next().c_str(), nullptr); gate_bias_set = true; }
         else if (a == "--scale-sweep")              scale_sweep = parse_csv_floats(next());
         else if (a == "--engram-layers")            engram_layers = parse_csv_ints(next());
         else if (a == "--dump-pairs")               dump_path = next();
@@ -560,9 +602,34 @@ int main(int argc, char ** argv) {
     sidecar.init(engram_path, &host_tok, model.layer_devices(),
                  model.n_embd(), model.hc_mult(),
                  512, adapter_path, scale, engram_layers, model.arch);
+    if (gate_bias_set) {
+        sidecar.set_gate_bias(gate_bias);
+        std::printf("GATE BIAS OVERRIDE: %.4f\n", gate_bias);
+    }
     if (shuffle_salt != 0) {
         sidecar.set_shuffle_salt(shuffle_salt);
         std::printf("CONTROL MODE: Engram hash shuffle_salt = 0x%llx\n", static_cast<unsigned long long>(shuffle_salt));
+    }
+
+    rookery::EngramSidecar sidecar2;
+    rookery::CompositeLayerHook composite_hook;
+    std::vector<rookery::EngramSidecar *> active_sidecars = {&sidecar};
+    rookery::LayerHook * active_hook = &sidecar;
+    if (!engram2_path.empty()) {
+        sidecar2.init(engram2_path, &host_tok, model.layer_devices(),
+                      model.n_embd(), model.hc_mult(),
+                      512, adapter2_path, scale * scale2_ratio, engram2_layers, model.arch);
+        if (gate_bias2_set) {
+            sidecar2.set_gate_bias(gate_bias2);
+            std::printf("GATE BIAS2 OVERRIDE: %.4f\n", gate_bias2);
+        }
+        if (shuffle_salt != 0) sidecar2.set_shuffle_salt(shuffle_salt);
+        active_sidecars.push_back(&sidecar2);
+        composite_hook.add(&sidecar);
+        composite_hook.add(&sidecar2);
+        active_hook = &composite_hook;
+        std::printf("DUAL-TABLE FUSION ACTIVE: table1=%s + table2=%s (scale2_ratio=%.3f)\n",
+                    sidecar.table().cfg().arch.c_str(), sidecar2.table().cfg().arch.c_str(), scale2_ratio);
     }
 
     // Mode A: Calibration pair dumping (state H_L OR delta H_{L+1} - H_L)
@@ -607,19 +674,29 @@ int main(int argc, char ** argv) {
 
         std::vector<float> logits;
         const size_t chunk = 256;
-        // Process in non-overlapping windows of up to doc_ctx tokens (resets position to 0 each window to keep KV small)
-        for (size_t win_start = 0; win_start + 1 < ids.size(); win_start += static_cast<size_t>(doc_ctx)) {
+        // Process in non-overlapping windows of up to doc_ctx tokens (resets position to 0 each window to keep KV small).
+        // For models that require BOS at position 0 (e.g. Gemma-4), prepend bos_id to every window so attention sinks stay valid.
+        const bool prepend_bos = host_tok.add_bos_default() && host_tok.bos_id() >= 0;
+        const size_t stride = prepend_bos ? static_cast<size_t>(std::max(2, doc_ctx - 1)) : static_cast<size_t>(doc_ctx);
+        for (size_t win_start = 0; win_start + 1 < ids.size(); win_start += stride) {
             model.reset_state();
-            const size_t win_end = std::min(ids.size(), win_start + static_cast<size_t>(doc_ctx));
-            const size_t win_len = win_end - win_start;
+            std::vector<int32_t> win;
+            win.reserve(static_cast<size_t>(doc_ctx));
+            if (prepend_bos && ids[win_start] != host_tok.bos_id()) {
+                win.push_back(host_tok.bos_id());
+            }
+            const size_t take = std::min(ids.size() - win_start, static_cast<size_t>(doc_ctx) - win.size());
+            win.insert(win.end(), ids.begin() + win_start, ids.begin() + win_start + take);
+            const size_t win_len = win.size();
+            if (win_len < 2) break;
             for (size_t off = 0; off < win_len; off += chunk) {
                 const size_t len = std::min(chunk, win_len - off);
-                std::vector<int32_t> pt(ids.begin() + win_start + off, ids.begin() + win_start + off + len);
+                std::vector<int32_t> pt(win.begin() + off, win.begin() + off + len);
                 std::vector<int32_t> pp(len);
                 std::iota(pp.begin(), pp.end(), static_cast<int32_t>(off));
                 std::vector<int32_t> tgts(len, -1);
                 for (size_t k = 0; k < len; ++k) {
-                    if (off + k + 1 < win_len) tgts[k] = ids[win_start + off + k + 1];
+                    if (off + k + 1 < win_len) tgts[k] = win[off + k + 1];
                 }
                 sidecar.set_tail_ce_targets(tgts, pt, static_cast<int>(off));
                 model.forward(pt, pp, logits);
@@ -644,7 +721,7 @@ int main(int argc, char ** argv) {
         }
         std::printf("Held-out factual QA file: %s (%zu items)\n", factual_path.c_str(), qa_pairs.size());
 
-        auto eval_factual_run = [&](rookery::EngramSidecar * sc) {
+        auto eval_factual_run = [&](const std::vector<rookery::EngramSidecar *> & scs) {
             double sum_nll = 0.0;
             int total_ans_toks = 0, hit1 = 0, hit5 = 0, exact_first1 = 0, exact_first5 = 0;
             std::vector<float> logits;
@@ -655,9 +732,9 @@ int main(int argc, char ** argv) {
                 if (q_ids.empty() || a_ids.empty()) continue;
 
                 // Prefill prompt causally
-                if (sc) {
+                if (!scs.empty()) {
                     for (size_t i = 0; i < q_ids.size(); ++i) {
-                        sc->prepare_step({q_ids[i]}, static_cast<int>(i));
+                        for (auto * sc : scs) sc->prepare_step({q_ids[i]}, static_cast<int>(i));
                         model.forward_decode_logits(q_ids[i], static_cast<int>(i), logits);
                     }
                 } else {
@@ -688,7 +765,7 @@ int main(int argc, char ** argv) {
                     }
                     if (k + 1 < a_ids.size()) {
                         int pos = static_cast<int>(q_ids.size() + k);
-                        if (sc) sc->prepare_step({target}, pos);
+                        for (auto * sc : scs) sc->prepare_step({target}, pos);
                         model.forward_decode_logits(target, pos, logits);
                     }
                 }
@@ -705,32 +782,32 @@ int main(int argc, char ** argv) {
 
         if (scale_sweep.empty()) scale_sweep = {0.5f, 1.0f, 1.5f};
 
-        sidecar.set_global_scale(0.0f);
-        sidecar.set_shuffle_salt(0);
+        for (auto * sc : active_sidecars) { sc->set_global_scale(0.0f); sc->set_shuffle_salt(0); }
         model.set_layer_hook(nullptr);
         model.warmup_decode_graphs();
-        auto base = eval_factual_run(nullptr);
+        auto base = eval_factual_run({});
         std::printf("  [BASE    ] (no hook)          | ans_NLL=%.5f | ans_PPL=%7.3f | first_top1=%5.1f%% | tok_top1=%5.1f%% | tok_top5=%5.1f%%\n",
                     base.nll, base.ppl, base.q1, base.tok1, base.tok5);
 
-        model.set_layer_hook(&sidecar);
+        model.set_layer_hook(active_hook);
         model.warmup_decode_graphs();
-        auto dis = eval_factual_run(&sidecar);
+        auto dis = eval_factual_run(active_sidecars);
         std::printf("  [DISABLED] global_scale= 0.000 | ans_NLL=%.5f | ans_PPL=%7.3f | delta vs base=%+.6f\n",
                     dis.nll, dis.ppl, dis.ppl - base.ppl);
 
         for (float s : scale_sweep) {
             if (s <= 0.0f) continue;
             sidecar.set_global_scale(s);
-            sidecar.set_shuffle_salt(0);
-            model.set_layer_hook(&sidecar);
+            if (!engram2_path.empty()) sidecar2.set_global_scale(s * scale2_ratio);
+            for (auto * sc : active_sidecars) sc->set_shuffle_salt(0);
+            model.set_layer_hook(active_hook);
             model.warmup_decode_graphs();
-            auto res = eval_factual_run(&sidecar);
+            auto res = eval_factual_run(active_sidecars);
             std::printf("  [REAL    ] global_scale=%6.3f | ans_NLL=%.5f | ans_PPL=%7.3f | first_top1=%5.1f%% | tok_top1=%5.1f%% | tok_top5=%5.1f%% (vs base=%+.4f)\n",
                         s, res.nll, res.ppl, res.q1, res.tok1, res.tok5, res.ppl - base.ppl);
             if (shuffle_salt != 0) {
-                sidecar.set_shuffle_salt(shuffle_salt);
-                auto ctl = eval_factual_run(&sidecar);
+                for (auto * sc : active_sidecars) sc->set_shuffle_salt(shuffle_salt);
+                auto ctl = eval_factual_run(active_sidecars);
                 std::printf("  [SHUFFLED] global_scale=%6.3f | ans_NLL=%.5f | ans_PPL=%7.3f | first_top1=%5.1f%% | tok_top1=%5.1f%% | tok_top5=%5.1f%% (shuf-real=%+.4f)\n",
                             s, ctl.nll, ctl.ppl, ctl.q1, ctl.tok1, ctl.tok5, ctl.ppl - res.ppl);
             }
@@ -749,36 +826,35 @@ int main(int argc, char ** argv) {
         if (scale_sweep.empty()) scale_sweep = {0.25f, 0.5f, 1.0f, 2.0f};
 
         // Control 1: Pure Base (no LayerHook, no prepare_step)
-        sidecar.set_global_scale(0.0f);
-        sidecar.set_shuffle_salt(0);
+        for (auto * sc : active_sidecars) { sc->set_global_scale(0.0f); sc->set_shuffle_salt(0); }
         model.set_layer_hook(nullptr);
         model.warmup_decode_graphs();
-        auto base_res = eval_token_ppl(model, nullptr, ids);
+        auto base_res = eval_token_ppl(model, {}, ids);
         std::printf("  [BASE    ] (no hook)          | NLL=%.5f | PPL=%7.3f | top1=%5.2f%% | top5=%5.2f%% (%.1f tok/s)\n",
                     base_res.nll, base_res.ppl, base_res.top1, base_res.top5, base_res.count * 1000.0 / base_res.ms);
 
         // Control 2: Bridge-Disabled (hook attached & prepare_step runs, scale=0.0)
-        sidecar.set_global_scale(0.0f);
-        sidecar.set_shuffle_salt(0);
-        model.set_layer_hook(&sidecar);
+        for (auto * sc : active_sidecars) { sc->set_global_scale(0.0f); sc->set_shuffle_salt(0); }
+        model.set_layer_hook(active_hook);
         model.warmup_decode_graphs();
-        auto dis_res = eval_token_ppl(model, &sidecar, ids);
+        auto dis_res = eval_token_ppl(model, active_sidecars, ids);
         std::printf("  [DISABLED] global_scale= 0.000 | NLL=%.5f | PPL=%7.3f | top1=%5.2f%% | top5=%5.2f%% (delta vs base=%+.6f)\n",
                     dis_res.nll, dis_res.ppl, dis_res.top1, dis_res.top5, dis_res.ppl - base_res.ppl);
 
         for (float s : scale_sweep) {
             if (s <= 0.0f) continue;
             sidecar.set_global_scale(s);
-            sidecar.set_shuffle_salt(0);
-            model.set_layer_hook(&sidecar);
+            if (!engram2_path.empty()) sidecar2.set_global_scale(s * scale2_ratio);
+            for (auto * sc : active_sidecars) sc->set_shuffle_salt(0);
+            model.set_layer_hook(active_hook);
             model.warmup_decode_graphs();
-            auto res = eval_token_ppl(model, &sidecar, ids);
+            auto res = eval_token_ppl(model, active_sidecars, ids);
             std::printf("  [REAL    ] global_scale=%6.3f | NLL=%.5f | PPL=%7.3f | top1=%5.2f%% | top5=%5.2f%% (vs base=%+.4f, %.1f tok/s)\n",
                         s, res.nll, res.ppl, res.top1, res.top5, res.ppl - base_res.ppl, res.count * 1000.0 / res.ms);
 
             if (shuffle_salt != 0) {
-                sidecar.set_shuffle_salt(shuffle_salt);
-                auto ctl = eval_token_ppl(model, &sidecar, ids);
+                for (auto * sc : active_sidecars) sc->set_shuffle_salt(shuffle_salt);
+                auto ctl = eval_token_ppl(model, active_sidecars, ids);
                 std::printf("  [SHUFFLED] global_scale=%6.3f | NLL=%.5f | PPL=%7.3f | top1=%5.2f%% | top5=%5.2f%% (shuf-real=%+.4f)\n",
                             s, ctl.nll, ctl.ppl, ctl.top1, ctl.top5, ctl.ppl - res.ppl);
             }

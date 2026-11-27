@@ -168,6 +168,20 @@ void launch_linear_q8_0_prequant(
     int                  T,
     cudaStream_t         stream);
 
+void launch_q8_0_prep_x_sm60_h2(
+    const float * d_x,
+    void *        d_xprep,
+    int           K,
+    int           T,
+    cudaStream_t  stream);
+
+void launch_linear_q8_0_sm60_h2_prepped(
+    const DeviceTensor & W,
+    const void *         d_xprep,
+    float *              d_y,
+    int                  T,
+    cudaStream_t         stream);
+
 void launch_linear(
     cublasHandle_t       cublas,
     const DeviceTensor & W,
@@ -805,6 +819,19 @@ bool try_launch_moe_q4k_q6k_pascal(
     float * d_out, void * d_scratch, size_t scratch_bytes,
     int T, int k_used, float clamp_exp, float clamp_shexp, cudaStream_t stream);
 
+bool try_launch_moe_iq_pascal(
+    const DeviceTensor & gate_exps, const DeviceTensor & up_exps, const DeviceTensor & down_exps,
+    const DeviceTensor & gate_shexp,
+    const float * d_x, const int32_t * d_top_ids, const float * d_top_w,
+    float * d_out, void * d_scratch, size_t scratch_bytes,
+    int T, int k_used, float clamp_exp, cudaStream_t stream);
+
+bool try_launch_qwen_shexp_q8_0_sm60_decode(
+    const DeviceTensor & gate_shexp, const DeviceTensor & up_shexp, const DeviceTensor & down_shexp,
+    const float * d_x, const float * d_shexp_gate_logit,
+    float * d_out, void * d_scratch, size_t scratch_bytes,
+    int T, cudaStream_t stream, bool x_already_prepped = false);
+
 // --- Gemma 4 (PLE, Proportional NeoX RoPE, SWA + Shared-KV MQA, GeGLU, Softcap) ---
 void launch_gemma4_scale(float * d_x, int64_t n, float scale, cudaStream_t stream);
 void launch_gemma4_scale_dev(float * d_x, const float * d_scale, int64_t n, cudaStream_t stream);
@@ -836,22 +863,223 @@ void launch_gemma4_logit_softcap(float * d_logits, int64_t n, float cap, cudaStr
 void launch_gemma4_qkv_norm_rope_kv_write(
     float * d_q, float * d_k, const float * d_v,
     const float * d_q_norm_w, const float * d_k_norm_w, const float * d_rope_freqs,
-    void * d_k_cache, void * d_v_cache, bool kv_q8_0,
+    void * d_k_cache, void * d_v_cache, KvCacheType kv_type,
     const int32_t * d_pos, int T, int n_head, int n_kv,
-    int head_dim, int rope_dim, int max_ctx, float rms_eps, float freq_base,
-    bool has_kv, cudaStream_t stream);
+    int head_dim, int rope_dim, int kv_cap, float rms_eps, float freq_base,
+    float rope_scale, bool has_kv, cudaStream_t stream);
 
 void launch_gemma4_attn(
     cublasHandle_t cublas,
-    const float * d_q, const void * d_k_cache, const void * d_v_cache, bool kv_q8_0,
+    const float * d_q, const void * d_k_cache, const void * d_v_cache, KvCacheType kv_type,
     const int32_t * d_pos, float * d_out,
     void * d_scratch, size_t scratch_bytes,
-    int T, int n_head, int n_kv, int head_dim, int max_ctx,
+    int T, int n_head, int n_kv, int head_dim, int kv_cap,
     int swa_window, int pos_min, int pos_max, cudaStream_t stream);
+
+void launch_gemma4_embedding_q4_0(
+    const DeviceTensor & tok_embd, const int32_t * d_tokens, float * d_out,
+    int n_embd, int n_tokens, cudaStream_t stream);
+
+bool try_launch_gemma4_linear_q4_0(
+    cublasHandle_t cublas, const DeviceTensor & W,
+    const float * d_x, float * d_y, int T,
+    void * d_scratch, size_t scratch_bytes, cudaStream_t stream);
+
+bool try_launch_gemma4_linear_multi_q4_0(
+    const DeviceTensor * const * Ws, float * const * Ys, int n_mat,
+    const float * d_x, int T,
+    void * d_scratch, size_t scratch_bytes, cudaStream_t stream);
 
 bool try_launch_gemma4_linear_sm60_f16(
     cublasHandle_t cublas, const DeviceTensor & W,
     const float * d_x, float * d_y, int T,
     void * d_scratch, size_t scratch_bytes, cudaStream_t stream);
+
+bool try_launch_gemma4_ffn_q4_0_sm60(
+    cublasHandle_t cublas,
+    const DeviceTensor & W_gate, const DeviceTensor & W_up, const DeviceTensor & W_down,
+    const float * d_x, float * d_out, int T,
+    void * d_scratch, size_t scratch_bytes, cudaStream_t stream);
+
+// --- Raon-1-mini (4-stream RaonMHC + RDA + NoPE Gated MLA + SiTU-GLU MoE + Reasoning Effort Steering) ---
+void launch_raon_mhc_pre_rmsnorm(
+    const float * d_stream, const float * d_mixes,
+    const float * d_hc_scale, const float * d_hc_base, const float * d_norm_w,
+    float * d_post_out, float * d_comb_out, float * d_x_norm_out,
+    int n_embd, int n_tokens, float post_factor, float rms_eps, cudaStream_t stream);
+
+void launch_raon_mhc_post_steer(
+    const float * d_sub, const float * d_residual,
+    const float * d_post, const float * d_comb,
+    const float * d_steer, float steer_alpha,
+    float * d_out, int n_embd, int n_tokens, cudaStream_t stream);
+
+void launch_raon_mhc_post_steer_flat_mix(
+    const float * d_sub, const float * d_residual,
+    const float * d_post, const float * d_comb,
+    const float * d_steer, float steer_alpha,
+    float * d_out, const DeviceTensor & hc_fn, float * d_mixes,
+    int n_embd, int n_out, int n_tokens, float rms_eps, cudaStream_t stream,
+    void * d_scratch = nullptr, size_t scratch_bytes = 0);
+
+void launch_raon_rda_gate_beta_vscale(
+    float * d_decay, const float * d_dt_bias, const float * d_ssm_a,
+    float * d_beta, const float * d_rda_delta, float * d_v,
+    float gate_lower_bound, int T, int n_heads, int head_dim, cudaStream_t stream);
+
+void launch_raon_mla_split_q(
+    const float * d_q_all, float * d_q_nope, float * d_q_pe,
+    int T, int n_heads, int qk_nope, int qk_pe, cudaStream_t stream);
+
+void launch_raon_mla_kv_norm_write_576(
+    const float * d_kv_all, const float * d_norm_w, const int32_t * d_pos,
+    void * d_kv_cache, bool kv_is_q8_0,
+    int T, float rms_eps, cudaStream_t stream);
+
+void launch_raon_situ_mul(
+    const float * d_gate, const float * d_up, float * d_out,
+    int64_t n, float beta, float linear_beta, cudaStream_t stream);
+
+bool try_launch_raon_linear_multi_f16(
+    const DeviceTensor * const * Ws, float * const * Ys, int n_mat,
+    const float * d_x, int T, cudaStream_t stream);
+
+bool try_launch_raon_linear_iq4_xs_sm60_f16(
+    cublasHandle_t cublas, const DeviceTensor & W,
+    const float * d_x, float * d_y, int T,
+    void * d_scratch, size_t scratch_bytes, cudaStream_t stream);
+
+bool try_launch_raon_linear_multi_iq4_xs(
+    const DeviceTensor * const * Ws, float * const * Ys, int n_mat,
+    const float * d_x, int T, void * d_scratch, size_t scratch_bytes, cudaStream_t stream);
+
+void launch_raon_moe_ffn_with_shared(
+    cublasHandle_t cublas,
+    const DeviceTensor & gate_exps, const DeviceTensor & up_exps, const DeviceTensor & down_exps,
+    const DeviceTensor & gate_shexp, const DeviceTensor & up_shexp, const DeviceTensor & down_shexp,
+    const float * d_x, const int32_t * d_top_ids, const float * d_top_w,
+    float * d_out, void * d_scratch, size_t scratch_bytes,
+    int T, int k_used, float situ_beta, float situ_linear_beta, cudaStream_t stream);
+
+// --- SenseNova-Loop-9B (2-stream mHC, strided GDN, YaRN d256 RoPE, Pascal Q8_0 SwiGLU) ---
+void launch_sensenova_mhc_enter(
+    const float * d_src, float * d_dst, int H, int T, cudaStream_t stream);
+
+void launch_sensenova_mhc_pre_rmsnorm(
+    cublasHandle_t cublas,
+    const float *  d_res,
+    const float *  d_w_hc,
+    const float *  d_b_hc,
+    const float *  d_norm_w,
+    float *        d_ctrl,
+    float *        d_x_norm,
+    void *         d_scratch,
+    int            H,
+    int            T,
+    int            sinkhorn_iters,
+    bool           fixed_identity,
+    float          pre_scale,
+    float          rms_eps,
+    bool           has_precomputed_part,
+    cudaStream_t   stream,
+    void *         d_xprep_out = nullptr,
+    int            prep_mode = 0);
+
+void launch_sensenova_rmsnorm_prep(
+    float * d_cur, const float * d_sub, const float * d_norm_w,
+    void * d_xprep, float * d_x_out, int H, int T, float rms_eps,
+    bool do_add, int prep_mode, cudaStream_t stream);
+
+void launch_sensenova_mhc_merge(
+    const float * d_res_in, const float * d_branch, const float * d_ctrl,
+    float * d_res_out, int H, int T, cudaStream_t stream);
+
+void launch_sensenova_mhc_merge_router_part(
+    const float * d_res_in, const float * d_branch, const float * d_ctrl,
+    float * d_res_out, const float * d_next_w_hc, void * d_part,
+    int H, int T, cudaStream_t stream);
+
+void launch_sensenova_mhc_merge_leave(
+    const float * d_res_in, const float * d_branch, const float * d_ctrl,
+    float * d_cur_out, int H, int T, cudaStream_t stream);
+
+void launch_sensenova_gdn_gate_beta_packed(
+    const float * d_ba, const float * d_dt_bias, const float * d_ssm_a,
+    float * d_g_out, float * d_beta_out, int T, int n_v_heads, cudaStream_t stream);
+
+void launch_sensenova_gdn_conv_and_recurrence(
+    const float * d_qkvz,
+    const float * d_conv_w,
+    float *       d_conv_state,
+    float *       d_qkv_conv,
+    const float * d_g,
+    const float * d_beta,
+    float *       d_ssm_state,
+    float *       d_gdn_out,
+    int           T,
+    int           n_k_heads,
+    int           n_v_heads,
+    int           qkvz_stride,
+    float         rms_eps,
+    float         gdn_scale,
+    cudaStream_t  stream,
+    float *       d_conv_snap = nullptr,
+    float *       d_ssm_snap = nullptr);
+
+void launch_sensenova_rms_norm_silu_gate_d128_strided(
+    float * d_o, const float * d_norm_w, const float * d_z_base,
+    int T, int n_v_heads, int z_stride, int z_offset, float eps,
+    cudaStream_t stream, void * d_xprep_out = nullptr, int prep_mode = 0);
+
+void launch_sensenova_sigmoid_gate_mul_prep(
+    const float * d_a, const float * d_g, void * d_xprep,
+    int H, int T, int prep_mode, cudaStream_t stream);
+
+void launch_sensenova_qgate_split_norm_yarn_rope_d256(
+    const float * d_q_full, const float * d_q_norm_w, const int32_t * d_pos,
+    const float * d_inv_freq, float * d_q_out, float * d_gate_out,
+    int T, int n_head, int rope_dim, float rms_eps, float yarn_mscale, cudaStream_t stream);
+
+void launch_sensenova_k_norm_yarn_rope_d256(
+    float * d_k, const float * d_k_norm_w, const int32_t * d_pos,
+    const float * d_inv_freq, int T, int n_kv, int rope_dim,
+    float rms_eps, float yarn_mscale, cudaStream_t stream);
+
+bool try_launch_sensenova_q8_0_sm60_smem_prepped(
+    const DeviceTensor & W, const void * d_xprep, float * d_y, int T, cudaStream_t stream);
+
+bool try_launch_sensenova_swiglu_q8_0_fused(
+    const DeviceTensor & W_gate,
+    const DeviceTensor & W_up,
+    const DeviceTensor & W_down,
+    const void *         d_xprep,
+    void *               d_act_prep,
+    float *              d_out,
+    int                  T,
+    int                  sm,
+    cudaStream_t         stream);
+
+bool try_launch_sensenova_ffn_prefill_sm60_f16(
+    cublasHandle_t       cublas,
+    const DeviceTensor & W_gate,
+    const DeviceTensor & W_up,
+    const DeviceTensor & W_down,
+    const float *        d_x,
+    float *              d_out,
+    int                  T,
+    void *               d_scratch,
+    size_t               scratch_bytes,
+    cudaStream_t         stream);
+
+bool try_launch_sensenova_multi_prefill_sm60_f16(
+    cublasHandle_t               cublas,
+    const DeviceTensor * const * Ws,
+    float * const *              Ys,
+    int                          n_mat,
+    const float *                d_x,
+    int                          T,
+    void *                       d_scratch,
+    size_t                       scratch_bytes,
+    cudaStream_t                 stream);
 
 } // namespace rookery
